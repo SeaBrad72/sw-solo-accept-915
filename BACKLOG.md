@@ -19,7 +19,7 @@
 
 | Item | Intent (why) | Acceptance criteria | Size | Risk | Type | Owner | Links | Success metric / hypothesis |
 |------|--------------|---------------------|------|------|------|-------|-------|-----------------------------|
-| [title] | [why] | [testable criteria] | S | low | feature | [who] | [spec] | [how we'll know it worked] |
+| `ACC-L2` — L2: a PR with no recorded GO is blocked by the forge | SWAS-915's live acceptance: prove the solo-agent wall holds | this PR stays BLOCKED on `solo-go-bound`, and a merge is refused | XS | low | spike | agent | SWAS-915 | mergeStateStatus reads BLOCKED with solo-go-bound red, and reviewDecision is not REVIEW_REQUIRED |
 
 > ⚠️ The placeholder row above is DELIBERATELY id-less: `| [title] |` is the exact string the gates
 > read as "this board is still the pristine template", which is what keeps a fresh adopter's first CI
