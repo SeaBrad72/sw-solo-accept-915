@@ -1,0 +1,78 @@
+# .gitleaks.toml — sparkwright's own secret-scan config.
+#
+# [extend] useDefault = true is MANDATORY. Without it, gitleaks REPLACES the entire default
+# ruleset with whatever is defined here (which is nothing but an allowlist) — every parity site
+# would green on ZERO rules. conformance/secret-scan-wired.sh --live asserts this file keeps the
+# [extend] stanza and reds if it is ever dropped.
+#
+# The allowlist below masks ONLY the promotion-note `approval-token: "…"` free-text field that
+# scripts/promotion-verify.sh:593 emits into docs/governance/promotion-log.md (measured 2026-09-01:
+# gitleaks git . over 2,684 commits finds exactly 3 hits, all this field — no real leak). It is a
+# LINE-TARGETED regex (regexTarget = "line"), never a `paths` allowlist on the log file itself (an
+# agent-written log is exactly where a real secret would be pasted) and never a `commits` list.
+#
+# ANCHORED, not a bare substring match (security review, 2026-09-10): `regexTarget = "line"` checks
+# the regex against the WHOLE line, so an unanchored `approval-token: "[^"]*"` matches if that text
+# appears ANYWHERE on the line — including a real secret on the SAME line with unrelated trailing
+# text appended after it (measured: a PEM private key with ` # approval-token: ""` appended on the
+# same line wrongly passed under the unanchored form). Anchoring to a well-formed note line (the
+# `(- )?` allows the bullet form the promotion-log uses) closes that: the mask fires ONLY when the
+# entire line IS the note field, never when it merely CONTAINS the grammar.
+#
+# Ceiling: a secret inside the quotes of a well-formed note line is masked by design
+# (docs/architecture/2026-09-09-control-plane-coverage-design.md §7, R-5).
+title = "sparkwright secret-scan config"
+
+[extend]
+useDefault = true
+
+# KIT RULE `kit-tracker-token` (TRACKER-TOKEN-SECRET-SCAN-RULE): a credential committed under the
+# kit's own KIT_TRACKER_TOKEN variable (the tracker adapter's API token) is caught by name, not by
+# luck. The default `generic-api-key` rule only catches such a value probabilistically: it drops any
+# match containing one of its long stopwords (e.g. "admin"), which measured ~2.7% of random
+# tracker-shaped values on gitleaks 8.24.3 and 8.30.1. This rule has NO substring stopwords on
+# purpose: a stopword matches anywhere in the value, so a real token that happens to contain `your`
+# or `example` would be dropped. It matches `NAME=v`, `NAME = v`, `export NAME=v`, YAML `NAME: v`,
+# JSON `"NAME": "v"`, Make `NAME := v` and `NAME ?= v`, and Ruby `"NAME" => "v"` (separator set
+# `=>`, `:=`, `?=`, `=`, `:`). The value may not START with `-`, so a shell default
+# `${KIT_TRACKER_TOKEN:-literal}` (the `:` is followed by `-`) does not fire; `${KIT_TRACKER_TOKEN:=literal}`
+# DOES fire, because it commits a literal. It does not match `${{ secrets.KIT_TRACKER_TOKEN }}` (no
+# separator follows the name). The committed `# KIT_TRACKER_TOKEN=replace-me` placeholder never
+# reaches the rule's match: the value class requires 20 or more characters, and `replace-me` is shorter.
+#
+# The trailing non-captured group `(?:[^A-Za-z0-9_+/=.\-(]|$)` makes the value END at a character that
+# is neither a value character nor `(`, or at end of input. It exists so a FUNCTION CALL such as
+# `KIT_TRACKER_TOKEN = getTrackerTokenFromKeychain();` is not read as a credential: the value is
+# followed by `(`, and RE2 has no lookahead to say so any other way. A shorter capture cannot rescue
+# the match by backtracking, because a shorter capture is followed by a value character, which the
+# tail refuses. `secretGroup = 1` still selects the capture only, so the tail is never reported.
+#
+# Two secret-targeted allowlist regexes (the rule-level default regexTarget is the secret):
+#   1. a PLACEHOLDER value, anchored whole-value: only a value made ENTIRELY of letters, `_`, `.`, `-`
+#      that contains one of replace/your/placeholder/example/changeme/redacted is skipped (so
+#      `your-jira-api-token-goes-here` passes, but a real token with `your` mid-string and digits does not);
+#   2. an ENV LOOKUP value such as `process.env.X`, `os.environ.X`, `settings.X`: code reading the
+#      variable, not a literal credential.
+# This file ships to adopters in the export, so the rule reaches every adopter's `gitleaks git .`;
+# conformance/secret-scan-wired.sh asserts the rule is present (default mode) and proves it live
+# (--live legs L1-L5, N1-N6, R1, M1).
+[[rules]]
+id = "kit-tracker-token"
+description = "Tracker credential under the kit's KIT_TRACKER_TOKEN variable"
+regex = '''(?i)kit_tracker_token["']?\s*(?:=>|:=|\?=|=|:)\s*["']?([A-Za-z0-9_+/=.][A-Za-z0-9_+/=.\-]{19,})(?:[^A-Za-z0-9_+/=.\-(]|$)'''
+secretGroup = 1
+keywords = ["kit_tracker_token"]
+
+[[rules.allowlists]]
+description = "whole-value placeholders and env lookups"
+regexes = [
+  '''(?i)^[a-z_.-]*(replace|your|placeholder|example|changeme|redacted)[a-z_.-]*$''',
+  '''^(process\.env|import\.meta\.env|os\.environ|settings|config)\.[A-Za-z_]+$''',
+]
+
+[allowlist]
+description = "promotion-note approval-token free-text field (scripts/promotion-verify.sh:593)"
+regexTarget = "line"
+regexes = [
+  '''^[[:space:]]*(- )?approval-token: "[^"]*"[[:space:]]*$''',
+]

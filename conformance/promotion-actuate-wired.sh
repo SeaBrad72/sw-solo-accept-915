@@ -1,0 +1,3133 @@
+#!/bin/sh
+# promotion-actuate-wired.sh — regression-lock for the CONTROL-PLANE actuation GATE
+# (scripts/promotion-verify.sh `actuate`) and its guard denial of the --admin bypass
+# (.claude/hooks/guard-core.sh). Proves the gate is WIRED and NON-VACUOUS: a control-plane merge is
+# actuated ONLY on a recorded GO note whose DERIVED approved-by label is [authenticated: <forge>-
+# review] AND approver != author, then shipped==approved is re-verified; every weaker / spoofed /
+# wrong-SHA / self-approval case fails CLOSED, the --admin bypass stays guard-denied, and the actuate
+# path never emits --admin. S6 — the control-plane actuation capstone.
+# (docs/governance/promotion-contract.md; docs/architecture/2026-07-07-s6-control-plane-actuation-plan.md)
+#   sh conformance/promotion-actuate-wired.sh [--selftest]
+# Exit: 0 = ok . 1 = drift/vacuity . 2 = usage. POSIX sh; dash-clean.
+#
+# HONEST CEILING (rewritten at PR 11 — the paragraph it replaced said the derivation was UNWIRED,
+# which stopped being true in the same diff that added these legs): this lock proves the GATE is wired
+# + non-vacuous (the [authenticated: <forge>-review] bar, the approver!=author SoD teeth, the
+# tree-equality re-check, the control-plane refusal, and the guard --admin deny are all real and
+# LOAD-BEARING), AND that the label the bar demands is now DERIVABLE by a production path — the
+# REC-* legs drive the real `record` against a `gh` PATH shim, so the derivation's own conditions are
+# fixture-proven here rather than assumed. It still does NOT prove the live `gh pr merge` (a swappable
+# --merge-cmd stub), a real forge credential, or that a note is authentic: a note is self-authorable
+# and the derivation trusts the local `gh`, so the label remains a DRIFT CONTROL at the note's own
+# trust tier. The LOCK SELF-NEGATIVE (below) proves the lock ITSELF is non-vacuous: a
+# neutralized/always-pass gate MUST fail this lock.
+set -eu
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+
+# wiring() inspects three real installed surfaces, resolved from $SCRIPT_DIR (co-located scratchpad
+# authoring, else the installed layout) — NOT overridable by the caller's environment. The selftest
+# aims wiring() at fixtures WITHOUT touching wiring()'s logic by reassigning VERIFY/GUARD/VERIFY_SH as
+# SUBSHELL-LOCALS inside _expect_wiring's $( … ), never via the environment. Mirrors
+# promotion-verify-wired.sh's resolution.
+VERIFY="$SCRIPT_DIR/promotion-verify.sh"
+[ -f "$VERIFY" ] || VERIFY="$SCRIPT_DIR/../scripts/promotion-verify.sh"
+GUARD="$SCRIPT_DIR/../.claude/hooks/guard-core.sh"
+[ -f "$GUARD" ]  || GUARD="$SCRIPT_DIR/../guard-core.sh"
+VERIFY_SH="$SCRIPT_DIR/verify.sh"
+
+# The control-plane bar the gate MUST enforce (fixed string; the brackets are LITERAL -> grep -F).
+BAR='authenticated: [A-Za-z0-9_-]+-review'
+# The ratified guard reason string that denies the --admin branch-protection bypass.
+ADMIN_DENY='gh pr merge --admin bypasses branch protection'
+
+# ===========================================================================================
+# DEFAULT (no --selftest): WIRING / PRESENCE checks against the REAL installed paths. These pass
+# post-apply.py (the reals carry the gate + guard). Any missing surface -> FAIL with a legible reason.
+# ===========================================================================================
+wiring() {
+  _w=0
+  [ -f "$VERIFY" ] || { echo "FAIL: missing actuate producer $VERIFY"; return 1; }
+  [ -f "$GUARD" ]  || { echo "FAIL: missing guard core $GUARD"; return 1; }
+
+  grep -q 'actuate)' "$VERIFY" \
+    || { echo "FAIL: $VERIFY has no 'actuate)' dispatcher case"; _w=1; }
+  grep -qF "$BAR" "$VERIFY" \
+    || { echo "FAIL: $VERIFY does not enforce the control-plane bar (/$BAR/ absent)"; _w=1; }
+  { grep -q '%an' "$VERIFY" && grep -q '%ae' "$VERIFY"; } \
+    || { echo "FAIL: $VERIFY lacks the approver!=author (%an/%ae) comparison"; _w=1; }
+
+  grep -qF "$ADMIN_DENY" "$GUARD" \
+    || { echo "FAIL: $GUARD does not deny the --admin bypass (ratified reason string absent)"; _w=1; }
+  grep -qF 'promotion-verify.sh' "$GUARD" \
+    || { echo "FAIL: $GUARD does not list promotion-verify.sh (control-plane immutability)"; _w=1; }
+
+  { [ -f "$VERIFY_SH" ] && grep -qF 'promotion-actuate-wired.sh' "$VERIFY_SH"; } \
+    || { echo "FAIL: conformance/verify.sh does not register promotion-actuate-wired.sh"; _w=1; }
+
+  [ "$_w" = 0 ] && echo "OK: actuate gate + guard --admin deny + verify.sh registration wired"
+  return $_w
+}
+
+# ===========================================================================================
+# --selftest — the NON-VACUITY heart. Self-contained throwaway git repos (mktemp -d; no network).
+# The ORACLE (st / pass / fail) and the wiring oracle helper live BELOW the selftest() marker so the
+# non-vacuity harness never mutates them — an always-pass oracle would hide a dead check.
+# ===========================================================================================
+
+# Build a throwaway repo: commit G (last-good) as `committer`, then X authored as `Author A` on feat.
+# G's tree ("base") differs from X's tree ("base"+"x") — real objects, genuine tree-equality. Writes
+# $D/.G and $D/.X inside the dir; echoes the dir. (Same shape as scratchpad/s6/test-actuate.sh.)
+mkrepo() {
+  _d="$(mktemp -d)"
+  (
+    set -e
+    cd "$_d"
+    git init -q
+    git config user.email committer@example.com
+    git config user.name  committer
+    git config commit.gpgsign false
+    printf 'base\n' > f.txt
+    git add f.txt; git commit -qm G
+    git rev-parse HEAD > "$_d/.G"
+    git checkout -q -b feat
+    printf 'x\n' >> f.txt
+    git add f.txt
+    GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git commit -qm X
+    git rev-parse HEAD > "$_d/.X"
+  ) || return 1
+  _fxlike "$_d"
+  printf '%s\n' "$_d"
+}
+
+# Fabricate a GO note on <sha> with a chosen approved-by value (id + label) + optional basis body
+# (used to plant a decoy `[...]` substring — the label read must ignore the body). The authenticated
+# label can NEVER be emitted by derive_assurance solo (the vc-hosts seam), so fixtures write it
+# directly — exactly the design's liveness-anchor method.
+#
+# ⚠️ THE `change-class:` DEFAULT IS `Ordinary`, AND THAT IS LOAD-BEARING, NOT COSMETIC. Since PR 11
+# `do_actuate` REFUSES a Control-plane-class note outright (now a pointer at `land`, by the closed
+# Tier-3 sitting's ruling, D-241014-1 item 6), so a fixture that wants to exercise the
+# label bar, the SoD teeth or the tree re-check must NOT also be control-plane — it would refuse one
+# step earlier and every one of those legs would be passing for the wrong reason. The 5th argument
+# carries the class, and ACT-CP below is the one leg that passes `Control-plane` deliberately.
+#
+# ⚠️ `${5-Ordinary}`, NOT `${5:-Ordinary}` — the colon form substitutes on EMPTY as well as unset, so
+# a leg passing '' to model a blank class silently got `Ordinary` and PASSED THROUGH THE ALLOWLIST.
+# That is exactly how ACT-UNKNOWN first went green for the wrong reason. The literal `OMIT` drops the
+# line entirely, which is the stronger evasion shape (a note with no class at all).
+write_note() { # dir sha approved-by-value [basis] [change-class|OMIT]
+  _dir="$1"; _s="$2"; _aby="$3"; _basis="${4:-reviewer APPROVE}"; _cls="${5-Ordinary}"
+  if [ "$_cls" = OMIT ]; then _clsline="x-no-class: (this note carries no change-class line)"
+  else _clsline="change-class: $_cls"; fi
+  printf '%s\n' \
+    "record: promotion GO (fabricated fixture note)" \
+    "approved-sha: $_s" \
+    "approved-by: $_aby" \
+    "gate: release-candidate" \
+    "rung: Release candidate" \
+    "$_clsline" \
+    "scope: PR #260" \
+    "approval-token: \"GO: merge #260\"" \
+    "basis: $_basis" \
+    "recorded-at: fixture" \
+    | ( cd "$_dir" && git notes --ref=promotions add -f -F - "$_s" >/dev/null 2>&1 )
+}
+
+# Drive <gate> actuate in <dir>; capture RC + OUT (stdout+stderr merged).
+run_actuate() { # gate dir ref sha merge-cmd
+  _gate="$1"; _dir="$2"; _ref="$3"; _sha="$4"; _mc="$5"
+  _act_origin "$_dir"
+  if OUT="$( ( cd "$_dir" && sh "$_gate" actuate --ref "$_ref" --approved-sha "$_sha" --merge-cmd "$_mc" ) 2>&1 )"; then
+    RC=0
+  else
+    RC=$?
+  fi
+}
+
+# invoked? — a stub-invocation sentinel ($D/.invoked) is touched only when the merge stub ran.
+invoked() { [ -f "$1/.invoked" ] && echo yes || echo no; }
+
+# ── WIRING fixtures: build three plain .txt files (no shebang, no +x) that model the three surfaces
+#    wiring() greps — v.txt (the actuate producer), g.txt (the guard), r.txt (the verify.sh registration).
+#    Each omit-arg drops exactly one required token so exactly one of wiring()'s six accumulator
+#    sites (the _w flag) fires.
+_mkwiring() {  # <verify-omit> <guard-omit> <reg-omit> -> echoes a dir holding v.txt g.txt r.txt
+  _d=$(mktemp -d)
+  { [ "$1" = actuate ] || printf 'actuate)\n'
+    [ "$1" = bar ]     || printf 'grep -Eq "authenticated: [A-Za-z0-9_-]+-review"\n'
+    [ "$1" = sod ]     || printf 'git log -1 --format=%%an%%ae\n'
+  } > "$_d/v.txt"
+  { [ "$2" = deny ] || printf 'gh pr merge --admin bypasses branch protection\n'
+    [ "$2" = list ] || printf 'promotion-verify.sh\n'
+  } > "$_d/g.txt"
+  { [ "$3" = reg ] || printf 'promotion-actuate-wired.sh\n'; } > "$_d/r.txt"
+  printf '%s\n' "$_d"
+}
+
+# INVARIANT: an accumulator assignment (a NAME followed by '=' then the digit one) must never appear
+# above the ^selftest() marker, comments included — mutate() has no lexer and would count it as a
+# phantom accumulator, drifting ACC. Keep any such token strictly below the marker.
+selftest() {
+  _unv_f=$(mktemp) && : > "$_unv_f" || fail "the UNVERIFIED marker file cannot be created, so an unanswered grep could not be recorded"   # SWAS-577: the marker file of grep calls that could not answer (read by _unv_end before the verdict)
+  # SWAS-537: land and actuate merge only on exact-head CI evidence, so every cell that reaches a merge needs a
+  # forge that answers it. This default `gh` (first on PATH for the whole selftest) says "light run, exact head";
+  # an LE cell flips $EVD/mode for ITS run, and a cell with its own shim delegates the evidence calls here.
+  EVD="$(_mkevgh)"; PATH="$EVD:$PATH"; export PATH EVD
+  # ---------------------------------------------------------------------------------------
+  # WIRING coverage: 1 liveness (all six surfaces present) + 6 negatives (each omits exactly one
+  # required token -> exactly one of wiring()'s six wiring-flag accumulators fires). Asserts the SPECIFIC
+  # FAIL message per site, never a bare rc!=0.
+  # ---------------------------------------------------------------------------------------
+  _expect_wiring "" "" "" 0 "OK: actuate gate"                            "LIVENESS: all six surfaces present -> wiring() PASSES"
+  _expect_wiring actuate "" "" 1 "has no 'actuate)' dispatcher case"      "NEG: no actuate) dispatcher"
+  _expect_wiring bar     "" "" 1 "does not enforce the control-plane bar" "NEG: control-plane bar absent"
+  _expect_wiring sod     "" "" 1 "lacks the approver!=author"             "NEG: %an/%ae comparison absent"
+  _expect_wiring "" deny "" 1 "does not deny the --admin bypass"          "NEG: guard --admin deny absent"
+  _expect_wiring "" list "" 1 "does not list promotion-verify.sh"         "NEG: guard immutability absent"
+  _expect_wiring "" "" reg  1 "does not register promotion-actuate-wired.sh" "NEG: verify.sh registration absent"
+
+  # ---------------------------------------------------------------------------------------
+  # LIVENESS anchor: authenticated GO, approver B != author A, note binds X, stub merges -> OK.
+  # ---------------------------------------------------------------------------------------
+  D="$(mkrepo)" || { fail "fixture build (liveness)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ -f "$D/.invoked" ] \
+     && _has "$OUT" 'OK: actuated' \
+     && _has "$OUT" 'shipped == approved'; then
+    pass "LIVENESS: authenticated GO + approver!=author -> merge stub invoked -> shipped==approved (rc=0)"
+  else
+    fail "LIVENESS: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 1: no note on X -> refuse (fail closed), merge NOT invoked.
+  # ---------------------------------------------------------------------------------------
+  D="$(mkrepo)" || { fail "fixture build (neg1)"; return 1; }
+  X="$(cat "$D/.X")"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "no GO note bound to $X on origin"; then
+    pass "NEG1: no note on X -> ACTUATE REFUSED, merge not invoked (rc=$RC)"
+  else
+    fail "NEG1: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 2: note binds a DIFFERENT sha (record on G, actuate X) -> X unbound -> refuse.
+  # ---------------------------------------------------------------------------------------
+  D="$(mkrepo)" || { fail "fixture build (neg2)"; return 1; }
+  X="$(cat "$D/.X")"; G="$(cat "$D/.G")"
+  write_note "$D" "$G" "Reviewer B [authenticated: github-review]"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "no GO note bound to $X on origin"; then
+    pass "NEG2: note binds G, actuate X -> refuse (SHA binding is exact) (rc=$RC)"
+  else
+    fail "NEG2: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVES 3-5: every weaker label ([self-asserted]/[committer]/[signed: gpg]) fails the bar.
+  # ---------------------------------------------------------------------------------------
+  for _lab in self-asserted committer 'signed: gpg'; do
+    D="$(mkrepo)" || { fail "fixture build (neg-label)"; return 1; }
+    X="$(cat "$D/.X")"
+    write_note "$D" "$X" "Reviewer B [$_lab]"
+    MC="$(_act_stub "$D" "$X")"
+    run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+    if [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] \
+       && _has "$OUT" 'does not meet the control-plane bar'; then
+      pass "NEG(label): [$_lab] fails the bar -> refuse, merge not invoked (rc=$RC)"
+    else
+      fail "NEG(label): [$_lab] rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+    fi
+  done
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 6: authenticated label but approver == author (name, then email) -> refuse (SoD).
+  # ---------------------------------------------------------------------------------------
+  for _id in 'Author A' 'a@x'; do
+    D="$(mkrepo)" || { fail "fixture build (neg6)"; return 1; }
+    X="$(cat "$D/.X")"
+    write_note "$D" "$X" "$_id [authenticated: github-review]"
+    MC="$(_act_stub "$D" "$X")"
+    run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+    if [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] \
+       && _has "$OUT" 'approver equals author'; then
+      pass "NEG6: approver '$_id' == author -> refuse (builder!=ratifier), merge not invoked (rc=$RC)"
+    else
+      fail "NEG6: id='$_id' rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+    fi
+  done
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 7: a [authenticated:] decoy in the BASIS body must NOT rescue a weak [committer] label
+  #             — the label read is the approved-by line ONLY (the S5a injection lesson).
+  # ---------------------------------------------------------------------------------------
+  D="$(mkrepo)" || { fail "fixture build (neg7)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [committer]" "GO [authenticated: x-review]"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] \
+     && _has "$OUT" 'does not meet the control-plane bar'; then
+    pass "NEG7: [committer] + [authenticated:] decoy in body -> still refuse (label read ignores body)"
+  else
+    fail "NEG7: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 8: merge stub SUCCEEDS but leaves merged tree (= G) != X's tree -> SHIPPED != APPROVED.
+  # ---------------------------------------------------------------------------------------
+  D="$(mkrepo)" || { fail "fixture build (neg8)"; return 1; }
+  X="$(cat "$D/.X")"; G="$(cat "$D/.G")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  MC="$(_act_stub "$D" "$X" "$G")"   # the stub moves the head ref to G AFTER step 0: tree != X
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" != 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" 'SHIPPED != APPROVED'; then
+    pass "NEG8: merge left tree != approved -> loud SHIPPED != APPROVED (merge ran, rc=$RC)"
+  else
+    fail "NEG8: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # NEGATIVE 9: the actuate code path NEVER emits `--admin` (no bypass laundering via the wrapper).
+  # ---------------------------------------------------------------------------------------
+  _n9=$(sed -n '/^do_actuate()/,/^}/p' "$VERIFY")
+  if [ -z "$_n9" ]; then
+    fail "NEG9: the do_actuate body could not be read from $VERIFY -- an empty read proves nothing"
+  elif _has "$_n9" '--admin'; then
+    fail "NEG9: '--admin' appears in the do_actuate code path -- the wrapper must NEVER emit the bypass"
+  else
+    pass "NEG9: '--admin' never appears in the do_actuate code path"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # BOARD-CLAIM RELEASE (BOARD-CLAIM-MECHANISM design §3.5). The merge is the end of the slice, so
+  # actuate must RELEASE the merged row's claim ref — a claim nobody releases blocks the next session
+  # from taking the row. Three properties, and the third is the load-bearing one:
+  #   (1) it is called, with the note's OWN kit-row and with --stale (the merger is routinely not the
+  #       claimant — builder != ratifier — so without --stale it would refuse every real merge);
+  #   (2) a note with no kit-row releases NOTHING and says so (never an invented row);
+  #   (3) a FAILING release is a WARN, not a merge failure. The merge already happened; no rc can
+  #       un-merge it, and reporting a verified promotion as failed would be a lie in the log.
+  # The stub is resolved the way the real one is — beside the gate — so the fixture copies the gate
+  # into its own dir and puts board-claim.sh next to it. Same shape as the `gh` PATH shim below.
+  # SWAS-537: the gate also resolves the CI classifier from its own checkout (<gate dir>/../conformance), so the copy lives in a
+  # kit layout: <dir>/scripts (the gate and its stubs) beside <dir>/conformance (the classifier).
+  _mk_release_fixture() {  # <dir> <stub-exit>
+    mkdir -p "$1/scripts" "$1/conformance"
+    cp "$VERIFY" "$1/scripts/promotion-verify.sh"
+    cp "$(dirname "$VERIFY")/../conformance/ci-classify-changes.sh" "$1/conformance/ci-classify-changes.sh"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/.released"\necho "release: stub"\nexit %s\n' "$1" "$2" > "$1/scripts/board-claim.sh"
+    chmod +x "$1/scripts/board-claim.sh"
+  }
+  D="$(mkrepo)" || { fail "fixture build (claim-release)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 0
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ -f "$D/.released" ] \
+     && grep -q 'release ROW-X --stale' "$D/.released" \
+     && _has "$OUT" "board claim on 'ROW-X' released"; then
+    pass "CLAIM-RELEASE: actuate releases the merged row's claim as 'release ROW-X --stale' and says so"
+  else
+    fail "CLAIM-RELEASE: rc=$RC released=[$(cat "$D/.released" 2>/dev/null)] OUT=[$OUT]"
+  fi
+
+  D="$(mkrepo)" || { fail "fixture build (claim-release/no-row)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _mk_release_fixture "$D" 0
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ ! -f "$D/.released" ] \
+     && _has "$OUT" 'no kit-row on the GO note'; then
+    pass "CLAIM-RELEASE-NOROW: a note with no kit-row releases NOTHING and says so (no row invented)"
+  else
+    fail "CLAIM-RELEASE-NOROW: rc=$RC released=[$(cat "$D/.released" 2>/dev/null)] OUT=[$OUT]"
+  fi
+
+  D="$(mkrepo)" || { fail "fixture build (claim-release/warn)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 1
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] \
+     && _has "$OUT" 'WARN — could not release the board claim' \
+     && _has "$OUT" 'OK: actuated'; then
+    pass "CLAIM-RELEASE-WARN: a FAILING release is a WARN — the verified merge still reports rc 0"
+  else
+    fail "CLAIM-RELEASE-WARN: rc=$RC OUT=[$OUT]"
+  fi
+
+  # LAND-WRITES-CARD-STATE C2: the `md` path is UNCHANGED. A board.sh stub BESIDE the gate copy writes a marker if it is
+  # ever run; on an md fixture (no tracker backend) it must NOT be — routing md through board.sh reds this leg. The
+  # existing message text stays intact, and the verb now ends on the one md tail line.
+  D="$(mkrepo)" || { fail "fixture build (claim-release/md-tail)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 0
+  printf '#!/bin/sh\n: > "%s/.board-sh-ran"\nexit 0\n' "$D" > "$D/scripts/board.sh"; chmod +x "$D/scripts/board.sh"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ ! -f "$D/.board-sh-ran" ] && grep -q 'release ROW-X --stale' "$D/.released" \
+     && _has "$OUT" "board claim on 'ROW-X' released" \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: row closes with the PR (md); claim released' ]; then
+    pass "CLAIM-RELEASE-MD-TAIL (C2): an md row never runs board.sh, keeps its message, and ends 'board: row closes with the PR (md); claim released'"
+  else
+    fail "CLAIM-RELEASE-MD-TAIL: rc=$RC boardsh=$([ -f "$D/.board-sh-ran" ] && echo RAN || echo no) OUT=[$OUT]"
+  fi
+
+  # md tail lines for the two non-happy cases: a FAILING release, and a note with no row (nothing released).
+  D="$(mkrepo)" || { fail "fixture build (md-tail/fail)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 1
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: row closes with the PR (md); claim NOT released — see the WARN above' ]; then
+    pass "CLAIM-RELEASE-MD-TAIL-FAIL: a failing md release ends 'claim NOT released — see the WARN above' (rc 0)"
+  else
+    fail "CLAIM-RELEASE-MD-TAIL-FAIL: rc=$RC OUT=[$OUT]"
+  fi
+  D="$(mkrepo)" || { fail "fixture build (md-tail/none)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _mk_release_fixture "$D" 0
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && ! _has "$OUT" 'WARN' \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: row closes with the PR (md); no claim to release' ]; then
+    pass "CLAIM-RELEASE-MD-TAIL-NONE: md + no kit-row keeps today's output (no new WARN) and ends 'no claim to release'"
+  else
+    fail "CLAIM-RELEASE-MD-TAIL-NONE: rc=$RC OUT=[$OUT]"
+  fi
+
+  # LAND-WRITES-CARD-STATE review Major: only `jira` has a board.sh write adapter. A github-declared repo keeps the
+  # ref-only `board-claim.sh release ROW-X --stale`, board.sh is NEVER run, and a WARN + `NOT CLOSED` say to move the card.
+  D="$(mkrepo)" || { fail "fixture build (no-adapter)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 0
+  mkdir -p "$D/conformance"; cp "$(dirname "$VERIFY")/../conformance/backlog-lib.sh" "$D/conformance/backlog-lib.sh"
+  printf 'Backlog backend: github\n' > "$D/CLAUDE.md"
+  printf '#!/bin/sh\n: > "%s/.board-sh-ran"\nexit 0\n' "$D" > "$D/scripts/board.sh"; chmod +x "$D/scripts/board.sh"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ ! -f "$D/.board-sh-ran" ] && grep -q 'release ROW-X --stale' "$D/.released" \
+     && _has "$OUT" "no write adapter for 'github'; move the card on 'ROW-X' by hand" \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: NOT CLOSED — see the WARN above' ]; then
+    pass "CLAIM-RELEASE-NOADAPTER: github-declared -> ref-only release, board.sh never run, WARN 'no write adapter', tail NOT CLOSED"
+  else
+    fail "CLAIM-RELEASE-NOADAPTER: rc=$RC boardsh=$([ -f "$D/.board-sh-ran" ] && echo RAN || echo no) released=[$(cat "$D/.released" 2>/dev/null)] OUT=[$OUT]"
+  fi
+
+  # security Low 1: a kit-row outside [A-Z0-9][A-Z0-9-]* releases and closes NOTHING, is not echoed, and prints no
+  # paste-able command.
+  D="$(mkrepo)" || { fail "fixture build (bad-row)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: X;echo pwned' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 0
+  printf '#!/bin/sh\n: > "%s/.board-sh-ran"\nexit 0\n' "$D" > "$D/scripts/board.sh"; chmod +x "$D/scripts/board.sh"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 0 ] && [ ! -f "$D/.released" ] && [ ! -f "$D/.board-sh-ran" ] \
+     && _has "$OUT" 'kit-row is not a valid row id; nothing released or closed' \
+     && ! _has "$OUT" 'pwned' && ! _has "$OUT" 'sh scripts/board' \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: NOT CLOSED — see the WARN above' ]; then
+    pass "CLAIM-RELEASE-BADROW: kit-row 'X;echo pwned' -> nothing released or closed, value not echoed, no command printed, tail NOT CLOSED"
+  else
+    fail "CLAIM-RELEASE-BADROW: rc=$RC released=$([ -f "$D/.released" ] && echo yes || echo no) OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # SWAS-207a — `actuate` binds the head before it merges. Every negative asserts ITS OWN refusal line (an earlier new leg
+  # refusing first would pass a bare rc!=0 for the wrong reason), AND that the merge stub never ran. The shared liveness
+  # for all of them is the LIVENESS anchor above: the same fixture, a pushed note, a head ref at the sha, a pinned stub.
+  # ---------------------------------------------------------------------------------------
+  # ACT-S0-NOREF (the Architect's cell): a bare PR number with no local ref resolves to nothing -> rc 2 BEFORE any merge.
+  D="$(mkrepo)" || { fail "fixture build (ACT-S0-NOREF)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" 999 "$X" "$MC"
+  if [ "$RC" = 2 ] && [ ! -f "$D/.invoked" ] \
+     && _has "$OUT" "ACTUATE REFUSED: --ref '999' resolves to nothing, not the approved sha $X"; then
+    pass "ACT-S0-NOREF: --ref 999 (no local ref) -> rc 2, step 0 refusal, merge stub never ran"
+  else
+    fail "ACT-S0-NOREF: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ACT-S0-MOVED: the head branch advanced one commit past the GO sha -> rc 2 naming where it resolves, merge not run.
+  D="$(mkrepo)" || { fail "fixture build (ACT-S0-MOVED)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  git -C "$D" commit -q --allow-empty -m 'pushed after the GO'
+  MV="$(git -C "$D" rev-parse HEAD)"
+  MC="$(_act_stub "$D" "$X")"
+  run_actuate "$VERIFY" "$D" feat "$X" "$MC"
+  if [ "$RC" = 2 ] && [ ! -f "$D/.invoked" ] \
+     && _has "$OUT" "ACTUATE REFUSED: --ref 'feat' resolves to $MV, not the approved sha $X"; then
+    pass "ACT-S0-MOVED: head branch moved past the GO sha -> rc 2, step 0 refusal naming the new head, merge stub never ran"
+  else
+    fail "ACT-S0-MOVED: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ACT-PIN-DEFAULT: the DEFAULT merge (no --merge-cmd) is `gh pr merge <ref> --squash --match-head-commit <asha>` — asserted
+  # on the argv a `gh` PATH shim recorded. ACT-VET-ADMIN: a caller --merge-cmd carrying --admin is refused by the SHARED vet,
+  # and the same shim proves the merge never ran. Both go through the real argv path (no --merge-cmd stub script).
+  D="$(mkrepo)" || { fail "fixture build (ACT-PIN-DEFAULT)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _act_origin "$D"
+  GHS="$(mktemp -d)"
+  printf '#!/bin/sh\ncase "$1" in api) exec "%s/gh" "$@" ;; esac\nprintf "%%s\\n" "$*" > "%s/.gh-argv"\n' "$EVD" "$D" > "$GHS/gh"; chmod +x "$GHS/gh"
+  if OUT="$( cd "$D" && PATH="$GHS:$PATH" sh "$VERIFY" actuate --ref feat --approved-sha "$X" 2>&1 )"; then RC=0; else RC=$?; fi
+  if [ "$RC" = 0 ] && [ "$(cat "$D/.gh-argv" 2>/dev/null)" = "pr merge feat --squash --match-head-commit $X" ]; then
+    pass "ACT-PIN-DEFAULT: the default actuate merge carries --match-head-commit <asha> (gh shim argv: pr merge feat --squash --match-head-commit <asha>)"
+  else
+    fail "ACT-PIN-DEFAULT: rc=$RC argv=[$(cat "$D/.gh-argv" 2>/dev/null)] OUT=[$OUT]"
+  fi
+  rm -f "$D/.gh-argv"
+  if OUT="$( cd "$D" && PATH="$GHS:$PATH" sh "$VERIFY" actuate --ref feat --approved-sha "$X" \
+         --merge-cmd "gh pr merge feat --squash --admin --match-head-commit $X" 2>&1 )"; then RC=0; else RC=$?; fi
+  if [ "$RC" = 1 ] && [ ! -f "$D/.gh-argv" ] \
+     && _has "$OUT" 'ACTUATE REFUSED: --merge-cmd carries an --admin token'; then
+    pass "ACT-VET-ADMIN: a caller --merge-cmd carrying --admin -> refused by the shared vet, gh never ran (rc=$RC)"
+  else
+    fail "ACT-VET-ADMIN: rc=$RC ghran=$([ -f "$D/.gh-argv" ] && echo yes || echo no) OUT=[$OUT]"
+  fi
+  rm -rf "$D" "$GHS" 2>/dev/null || true
+
+  # ACT-PIN-REQUIRED: a caller --merge-cmd with NO pin, and one pinning a DIFFERENT sha, are both refused before the merge.
+  D="$(mkrepo)" || { fail "fixture build (ACT-PIN-REQUIRED)"; return 1; }
+  X="$(cat "$D/.X")"; G="$(cat "$D/.G")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _act_stub "$D" "$X" >/dev/null
+  _pinbad=""
+  for _pm in "sh $D/.stub.sh" "sh $D/.stub.sh --match-head-commit $G"; do
+    rm -f "$D/.invoked"
+    run_actuate "$VERIFY" "$D" feat "$X" "$_pm"
+    if [ "$RC" != 1 ] || [ -f "$D/.invoked" ] \
+       || ! _has "$OUT" "ACTUATE REFUSED: --merge-cmd must pin --match-head-commit <approved-sha> ($X)"; then
+      _pinbad="$_pinbad [$_pm rc=$RC invoked=$(invoked "$D")]"
+    fi
+  done
+  if [ -z "$_pinbad" ]; then pass "ACT-PIN-REQUIRED: a --merge-cmd with no pin, or pinning another sha -> refused, merge stub never ran"
+  else fail "ACT-PIN-REQUIRED: got:$_pinbad"; fi
+
+  # ACT-SHAPE (fix round): a CALLER --merge-cmd can pass the vet and the pin check textually while the shell runs the merge
+  # unpinned. Each spelling is refused BEFORE the merge with ITS OWN line (the stub never runs); the `=` spelling is the
+  # liveness partner: a single well-formed pin written `--match-head-commit=<sha>` still merges.
+  _shape_case() {  # <label> <merge-cmd> <expected needle>
+    rm -f "$D/.invoked"
+    run_actuate "$VERIFY" "$D" feat "$X" "$2"
+    if [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "ACTUATE REFUSED: --merge-cmd carries $3"; then
+      pass "$1: refused with its own line, merge stub never ran"
+    else
+      fail "$1: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+    fi
+  }
+  D="$(mkrepo)" || { fail "fixture build (ACT-SHAPE)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _act_stub "$D" "$X" >/dev/null
+  _shape_case "ACT-SHAPE-COMMENT" "sh $D/.stub.sh --match-head-commit $X # pinned" "a '#'"
+  _shape_case "ACT-SHAPE-QUOTE" "sh $D/.stub.sh --match-head-commit \"$X\"" "a quote character"
+  _shape_case "ACT-SHAPE-NEWLINE" "sh $D/.stub.sh --match-head-commit $X
+:" "a newline"
+  _shape_case "ACT-SHAPE-CR" "sh $D/.stub.sh --match-head-commit $X$(printf '\r')" "a carriage return"
+  _shape_case "ACT-SHAPE-DOUBLEPIN" "sh $D/.stub.sh --match-head-commit $X --match-head-commit=$X" "more than one --match-head-commit token"
+  rm -f "$D/.invoked"
+  run_actuate "$VERIFY" "$D" feat "$X" "sh $D/.stub.sh --match-head-commit=$X"
+  if [ "$RC" = 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" 'OK: actuated'; then
+    pass "ACT-PIN-EQUALS: a single --match-head-commit=<sha> pin passes the shape, vet and pin checks and merges (rc=0)"
+  else
+    fail "ACT-PIN-EQUALS: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ACT-FULLSHA (N3): an ABBREVIATED --approved-sha still pins the FULL sha the default merge sends the forge.
+  D="$(mkrepo)" || { fail "fixture build (ACT-FULLSHA)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _act_origin "$D"
+  GHS="$(mktemp -d)"
+  printf '#!/bin/sh\ncase "$1" in api) exec "%s/gh" "$@" ;; esac\nprintf "%%s\\n" "$*" > "%s/.gh-argv"\n' "$EVD" "$D" > "$GHS/gh"; chmod +x "$GHS/gh"
+  if OUT="$( cd "$D" && PATH="$GHS:$PATH" sh "$VERIFY" actuate --ref feat --approved-sha "$(printf '%s' "$X" | cut -c1-12)" 2>&1 )"; then RC=0; else RC=$?; fi
+  if [ "$RC" = 0 ] && [ "$(cat "$D/.gh-argv" 2>/dev/null)" = "pr merge feat --squash --match-head-commit $X" ]; then
+    pass "ACT-FULLSHA: an abbreviated --approved-sha -> the default merge pins the FULL sha (gh shim argv)"
+  else
+    fail "ACT-FULLSHA: rc=$RC argv=[$(cat "$D/.gh-argv" 2>/dev/null)] OUT=[$OUT]"
+  fi
+
+  # ACT-CNTRL (N4): note-derived text (the assurance label, the change-class) never reaches the terminal with a control
+  # byte. The ESC is planted in the NOTE; the refusal still names the bar, and the output carries no ESC.
+  _esc="$(printf '\033')"
+  for _cn in label class; do
+    D="$(mkrepo)" || { fail "fixture build (ACT-CNTRL $_cn)"; return 1; }
+    X="$(cat "$D/.X")"
+    if [ "$_cn" = label ]; then write_note "$D" "$X" "Reviewer B [evil${_esc}x]"
+    else write_note "$D" "$X" "Reviewer B [authenticated: github-review]" "reviewer APPROVE" "Ord${_esc}inary"; fi
+    run_actuate "$VERIFY" "$D" feat "$X" "$(_act_stub "$D" "$X")"
+    if [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && ! _has "$OUT" "$_esc" \
+       && { _has "$OUT" "ACTUATE REFUSED: assurance 'evilx'" || _has "$OUT" "ACTUATE REFUSED: unrecognised or missing change-class 'Ordinary'"; }; then
+      pass "ACT-CNTRL: a control byte in the note's $_cn is stripped from the refusal (no ESC in the output)"
+    else
+      fail "ACT-CNTRL ($_cn): rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+    fi
+  done
+
+  # ACT-ORIGIN-LOCALONLY: the SAME note, recorded locally but NOT published -> refused (the origin read is the bar). The liveness
+  # partner is every actuate cell above: the identical fixture with the note pushed to the bare origin proceeds.
+  D="$(mkrepo)" || { fail "fixture build (ACT-ORIGIN-LOCALONLY)"; return 1; }
+  X="$(cat "$D/.X")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  MC="$(_act_stub "$D" "$X")"
+  ACT_LOCAL_ONLY=1; run_actuate "$VERIFY" "$D" feat "$X" "$MC"; ACT_LOCAL_ONLY=0
+  if [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && [ -n "$(_note_of "$D" "$X")" ] \
+     && _has "$OUT" "ACTUATE REFUSED: no GO note bound to $X on origin"; then
+    pass "ACT-ORIGIN-LOCALONLY: a note present only locally -> refused 'no GO note bound to <sha> on origin', merge stub never ran"
+  else
+    fail "ACT-ORIGIN-LOCALONLY: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"
+  fi
+
+  # ACT-TAIL: the merge ran, the post-check MISMATCHES (the stub moves the head ref after step 0) -> rc 1 and loud, AND the
+  # board tail still ran: the claim was released and the tail line is the LAST line. (The old tail returned before step 6.)
+  D="$(mkrepo)" || { fail "fixture build (ACT-TAIL)"; return 1; }
+  X="$(cat "$D/.X")"; G="$(cat "$D/.G")"
+  write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  ( cd "$D" && git notes --ref=promotions append -m 'kit-row: ROW-X' "$X" ) >/dev/null 2>&1
+  _mk_release_fixture "$D" 0
+  MC="$(_act_stub "$D" "$X" "$G")"
+  run_actuate "$D/scripts/promotion-verify.sh" "$D" feat "$X" "$MC"
+  if [ "$RC" = 1 ] && [ -f "$D/.invoked" ] && grep -q 'release ROW-X --stale' "$D/.released" \
+     && _has "$OUT" 'SHIPPED != APPROVED' \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: row closes with the PR (md); claim released' ]; then
+    pass "ACT-TAIL: a post-check mismatch after the merge -> rc 1, SHIPPED != APPROVED, the claim released, the board-tail line is the last line"
+  else
+    fail "ACT-TAIL: rc=$RC released=[$(cat "$D/.released" 2>/dev/null)] OUT=[$OUT]"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # SWAS-207b — a DECLARED merge relationship. `actuate` reads MERGE_RELATIONSHIP from ORIGIN'S DEFAULT BRANCH (never the
+  # approved tree) and, in a solo-declared repo only, judges the recorded GO by the SOLO BAR in place of the forge-review
+  # label and the author SoD. Every cell builds a base commit on origin's main with plumbing (_act_base) and a solo-shaped
+  # GO note (write_snote, all 13 lines), and asserts its OWN refusal line plus that the merge stub never ran. Liveness is
+  # SOLO-LIVE: the same note under a base that does not declare solo is refused by the team bar (BASE-*, GOV-*, UNDECLARED).
+  # ---------------------------------------------------------------------------------------
+  _solo_cell SOLO-LIVE merge "merge relationship: solo (origin/main" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" release-candidate AUTO
+  _solo_cell SOLO-LIVE-GOV merge "merge relationship: solo (origin/main" MERGE_RELATIONSHIP=solo '- **Governance** (§ solo/team): solo — the human admin-merges' "the owner [self-asserted]" release-candidate AUTO
+  for _g in '(none recorded)' 'the owner' 'the owner [signed: gpg]' ' [self-asserted]'; do
+    _solo_cell "SOLO-NEG-GOBY('$_g')" refuse "go-by" MERGE_RELATIONSHIP=solo NONE "$_g" release-candidate AUTO
+  done
+  # design-review and planning are held by NO exact denylist (design, design-arm, plan-record): they pin the PREFIX rule itself.
+  for _g in design-arm DESIGN-ARM plan-record ' Plan-record' design design-review planning; do
+    _solo_cell "SOLO-NEG-GATE('$_g')" refuse "pre-build gate" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" "$_g" AUTO
+  done
+  # a missing or empty gate line cannot be shown not to be a pre-build gate: refused (record always writes one)
+  _solo_cell SOLO-NEG-GATE-EMPTY refuse "records no gate" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" "" AUTO
+  # the Governance read FAILS (CLAUDE.md's blob is gone from this clone: cat-file rc 128, not a plain absence) while the dial says
+  # solo and the Governance line would read solo: a failed read must be team, never undeclared. Red against the rc-2-only guard.
+  SN_KIND=GOVGONE
+  _solo_cell GOV-READFAIL-NEG refuse "does not meet the control-plane bar" MERGE_RELATIONSHIP=solo '- **Governance** (§ solo/team): solo — the human admin-merges' "the owner [self-asserted]" release-candidate AUTO
+  SN_KIND=""
+  _solo_cell SOLO-NEG-TREE refuse "approved-tree" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" release-candidate BAD
+  SN_BOUND=0000000000000000000000000000000000000000
+  _solo_cell SOLO-NEG-BOUNDSHA refuse "does not bind" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" release-candidate AUTO
+  SN_BOUND=""
+  # Team unchanged (solo does not leak into team): the SAME solo-shaped note, [committer] label, is refused by the team bar.
+  _solo_cell UNDECLARED-NEG refuse "does not meet the control-plane bar" NONE NONE "the owner [self-asserted]" release-candidate AUTO
+  _solo_cell DIAL-TEAM-NEG refuse "does not meet the control-plane bar" MERGE_RELATIONSHIP=team NONE "the owner [self-asserted]" release-candidate AUTO
+  _solo_cell DIAL-UNKNOWN-NEG refuse "does not meet the control-plane bar" MERGE_RELATIONSHIP=soloish NONE "the owner [self-asserted]" release-candidate AUTO
+  # Governance only tightens: dial solo + a Governance `team` line -> team, and the override is SAID; Governance `solo` with no dial -> team.
+  _solo_cell GOV-TEAM-NEG refuse "CLAUDE.md Governance: team overrides MERGE_RELATIONSHIP=solo" MERGE_RELATIONSHIP=solo '- **Governance** (§ solo/team): team — non-author approval' "the owner [self-asserted]" release-candidate AUTO
+  _solo_cell GOV-TEAM-NEG-BAR refuse "does not meet the control-plane bar" MERGE_RELATIONSHIP=solo '- **Governance** (§ solo/team): team — non-author approval' "the owner [self-asserted]" release-candidate AUTO
+  _solo_cell GOV-SOLO-ALONE-NEG refuse "does not meet the control-plane bar" NONE '- **Governance** (§ solo/team): solo — the human admin-merges' "the owner [self-asserted]" release-candidate AUTO
+  # Unreadable declarations read team, each with a line saying why: .kit a symlink entry; the base tip not in this clone.
+  SN_KIND=LINK
+  _solo_cell BASE-LINK-NEG refuse "does not meet the control-plane bar" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" release-candidate AUTO
+  SN_KIND=REMOTE
+  _solo_cell BASE-UNFETCHED-NEG refuse "git fetch origin" MERGE_RELATIONSHIP=solo NONE "the owner [self-asserted]" release-candidate AUTO
+  SN_KIND=""
+
+  # BASE-NEG-APPROVED-TREE: the APPROVED TREE carries `solo` and the base does not -> the team bar applies (a PR cannot choose
+  # its own bar). The head commit adds .kit/dials.conf=solo; the note is solo-shaped and bound to that head.
+  SD="$(mkrepo)" || { fail "fixture build (BASE-NEG-APPROVED-TREE)"; return 1; }
+  ( cd "$SD" && mkdir .kit && printf 'MERGE_RELATIONSHIP=solo\n' > .kit/dials.conf && git add .kit/dials.conf && git commit -qm 'declare solo in the PR' && git rev-parse HEAD > .X )
+  SX="$(cat "$SD/.X")"
+  write_snote "$SD" "$SX" "the owner [self-asserted]" release-candidate AUTO
+  _act_base "$SD" NONE NONE; SMC="$(_act_stub "$SD" "$SX")"
+  run_actuate "$VERIFY" "$SD" feat "$SX" "$SMC"
+  if [ "$RC" != 0 ] && [ ! -f "$SD/.invoked" ] && _has "$OUT" 'does not meet the control-plane bar' \
+     && _has "$OUT" 'merge relationship: team'; then
+    pass "BASE-NEG-APPROVED-TREE: the approved tree declares solo but the base does not -> the team bar refuses, merge stub never ran"
+  else
+    fail "BASE-NEG-APPROVED-TREE: rc=$RC invoked=$(invoked "$SD") OUT=[$OUT]"
+  fi
+  rm -rf "$SD" 2>/dev/null || true
+
+  # ACT-CP-ORDER: the class arm runs BEFORE step 2. In TEAM, a control-plane note labelled [committer] is refused with the `land`
+  # pointer, NOT step 2's label refusal (reds if the class arm moves back after step 2). ACT-CP-SOLO: the same in a solo repo.
+  for _cpb in NONE MERGE_RELATIONSHIP=solo; do
+    SD="$(mkrepo)" || { fail "fixture build (ACT-CP-ORDER)"; return 1; }
+    SX="$(cat "$SD/.X")"
+    write_snote "$SD" "$SX" "the owner [self-asserted]" release-candidate AUTO control-plane "Reviewer B [committer]"
+    _act_base "$SD" "$_cpb" NONE; SMC="$(_act_stub "$SD" "$SX")"
+    run_actuate "$VERIFY" "$SD" feat "$SX" "$SMC"
+    if [ "$RC" = 1 ] && [ ! -f "$SD/.invoked" ] \
+       && _has "$OUT" 'promotion-verify.sh land --ref <PR number> --approved-sha' \
+       && _has "$OUT" "land's --ref is the PR NUMBER" \
+       && ! _has "$OUT" 'does not meet the control-plane bar' \
+       && ! _has "$OUT" 'TIER-3'; then
+      pass "ACT-CP-ORDER($_cpb): control-plane + [committer] -> the land pointer (class arm before step 2), not the label refusal, no TIER-3, stub never ran"
+    else
+      fail "ACT-CP-ORDER($_cpb): rc=$RC invoked=$(invoked "$SD") OUT=[$OUT]"
+    fi
+    rm -rf "$SD" 2>/dev/null || true
+  done
+  # ...and the unknown-class refusal also precedes any label judgment (a [committer] note with NO class line).
+  SD="$(mkrepo)" || { fail "fixture build (ACT-UNKNOWN-ORDER)"; return 1; }
+  SX="$(cat "$SD/.X")"
+  write_note "$SD" "$SX" "Reviewer B [committer]" "reviewer APPROVE" OMIT
+  SMC="$(_act_stub "$SD" "$SX")"
+  run_actuate "$VERIFY" "$SD" feat "$SX" "$SMC"
+  if [ "$RC" = 1 ] && [ ! -f "$SD/.invoked" ] && _has "$OUT" 'unrecognised or missing change-class' \
+     && ! _has "$OUT" 'does not meet the control-plane bar'; then
+    pass "ACT-UNKNOWN-ORDER: a [committer] note with no class -> the class refusal, before any label judgment"
+  else
+    fail "ACT-UNKNOWN-ORDER: rc=$RC invoked=$(invoked "$SD") OUT=[$OUT]"
+  fi
+  rm -rf "$SD" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------------------
+  # GUARD fixtures: the --admin bypass stays DENIED; the gate is immutable-but-runnable; normal merge
+  # allowed. Control-plane path strings live in a DATA FILE (never on a command line) so the real
+  # PreToolUse guard cannot block us. Source the guard in a subshell WITHOUT set -e (its functions
+  # return 1 on deny by design).
+  # ---------------------------------------------------------------------------------------
+  CASES="$D/cases.txt"
+  {
+    printf '%s\n' 'DENY|cmd|gh pr merge 260 --admin --squash'
+    printf '%s\n' 'DENY|cmd|gh pr merge 260 --administrator'
+    printf '%s\n' 'ALLOW|cmd|gh pr merge 260 --squash'
+    printf '%s\n' 'DENY|cmd|sed -i s/x/y/ scripts/promotion-verify.sh'
+    printf '%s\n' 'DENY|cmd|printf x > scripts/promotion-verify.sh'
+    printf '%s\n' 'DENY|path|scripts/promotion-verify.sh'
+    printf '%s\n' 'ALLOW|cmd|sh scripts/promotion-verify.sh actuate --ref 260 --approved-sha abc'
+    # S6R (A1): the REST forms of the SAME bypass. `gh pr merge --admin` is IMPLEMENTED as
+    # PUT /repos/:o/:r/pulls/:n/merge, so denying only the porcelain flag left the plumbing open
+    # (reproduced live 2026-08-25: rc=0). Eight load-bearing negatives — revert the arm and all eight
+    # red. Six ALLOWs pin the read/poster/additive traffic the arm must NOT touch.
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/pulls/5/merge'
+    printf '%s\n' 'DENY|cmd|gh api --method POST repos/o/r/pulls/5/merge -f merge_method=squash'
+    printf '%s\n' 'DENY|cmd|gh api --method=put https://api.github.com/repos/o/r/pulls/5/merge'
+    printf '%s\n' 'DENY|cmd|gh api repos/o/r/pulls/5/merge -f merge_method=squash'
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/branches/main/protection --input p.json'
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/rulesets/7'
+    printf '%s\n' 'DENY|cmd|gh api -X PATCH orgs/o/rulesets/7 -f enforcement=disabled'
+    printf '%s\n' 'ALLOW|cmd|gh api repos/o/r/pulls/5'
+    printf '%s\n' 'ALLOW|cmd|gh api -X GET repos/o/r/pulls/5/merge'
+    printf '%s\n' 'ALLOW|cmd|gh api repos/o/r/pulls/5/reviews -f event=APPROVE'
+    printf '%s\n' 'ALLOW|cmd|gh api graphql -f query=mutation{}'
+    printf '%s\n' 'ALLOW|cmd|gh api --paginate repos/o/r/rulesets'
+    # S6R round 2 — SPELLING VARIANTS OF THE SAME CALL. Round 1 matched the method with
+    # `[[:space:]=]+`, so every one of these reached the endpoint at rc=0 while the plain form denied.
+    # A deny arm that a quote or a missing space defeats is a deny arm for tidy attackers only.
+    printf '%s\n' 'DENY|cmd|gh api -XPUT repos/o/r/pulls/5/merge'
+    printf '%s\n' 'DENY|cmd|gh api -X "PUT" repos/o/r/pulls/5/merge'
+    printf '%s\n' "DENY|cmd|gh api -X 'PUT' repos/o/r/pulls/5/merge"
+    printf '%s\n' "DENY|cmd|gh api -X PUT 'repos/o/r/pulls/5/merge'"
+    printf '%s\n' 'DENY|cmd|gh api repos/o/r/pulls/5/merge?x=1 -X PUT'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/pulls/5/merge/'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o//r/pulls/5/merge'
+    # ORDER-INDEPENDENCE PIN: the method may follow the path. The scan is over the whole raw string,
+    # never a positional parse, and this cell is what stops someone "tidying" it into one.
+    printf '%s\n' 'DENY|cmd|gh api repos/o/r/pulls/5/merge --method PUT'
+    # FUSED SHORT BODY FLAG. `gh api` defaults to POST once a body is given, so this merges the PR
+    # with no method flag at all.
+    printf '%s\n' 'DENY|cmd|gh api repos/o/r/pulls/5/merge -fmerge_method=squash'
+    # --hostname (GHES) DENIES TODAY — the path is unchanged, only the host is. Pinned because round
+    # 1's comment wrongly listed it as uncovered; the cell is now the source of truth over the prose.
+    printf '%s\n' 'DENY|cmd|gh api --hostname ghe.example.com -X PUT repos/o/r/pulls/5/merge'
+    # PROTECTION IS DENY-BY-DEFAULT UNDER ANY MUTATING METHOD (round-2 inversion). Round 1 listed
+    # four weakening sub-resources and let every other sub-path through, so DELETE on
+    # required_status_checks — which removes every required context at once — was ALLOW.
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/branches/main/protection/required_status_checks'
+    printf '%s\n' 'DENY|cmd|gh api -X PATCH repos/o/r/branches/main/protection/required_status_checks -f strict=false'
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/branches/main/protection/required_status_checks/contexts -f contexts[]=x'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/branches/main/protection/required_status_checks/contexts'
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/branches/main/protection/restrictions/users'
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/branches/main/protection/enforce_admins'
+    # ...with EXACTLY ONE carve-out, and it is now genuinely load-bearing: POST (and only POST) to the
+    # additive contexts endpoint, which is `scripts/branch-protection-apply.sh --apply`'s own human-run
+    # call. Under the round-1 shape this cell passed because the whole sub-tree was unmatched; under
+    # the inversion it passes only because the carve-out exists. Flipping the method above (the PUT and
+    # DELETE cells) proves the carve-out is a method-scoped hole, not an open door.
+    printf '%s\n' 'ALLOW|cmd|gh api -X POST repos/o/r/branches/main/protection/required_status_checks/contexts -f contexts[]=x'
+    # THREE MORE TIER-3 ENDPOINT CLASSES (`D-240813-5`: force-push, privilege grant, delete).
+    # A default-branch swap moves protection off the branch everything merges to; a ref PATCH with
+    # force=true IS a force-push over the API; a collaborator PUT mints an admin.
+    printf '%s\n' 'DENY|cmd|gh api -X PATCH repos/o/r -f default_branch=evil'
+    printf '%s\n' 'DENY|cmd|gh api -X PATCH repos/o/r/git/refs/heads/main -f force=true'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/collaborators/mallory -f permission=admin'
+    # ALLOW pins for the relaxed method matcher: a QUOTED GET is still a read.
+    printf '%s\n' 'ALLOW|cmd|gh api -X "GET" repos/o/r/pulls/5/merge'
+    printf '%s\n' 'ALLOW|cmd|gh api repos/o/r/pulls/5 -X GET'
+    # ── ROUND 3 ─────────────────────────────────────────────────────────────────────────────────
+    # A QUOTE IS A JOINER, NOT A BOUNDARY. Round 2 normalized quotes to SPACES, which is exactly
+    # backwards: the shell CONCATENATES adjacent fragments, so `me''rge` runs as `merge` while the
+    # guard saw two short tokens and matched neither. Every one of these six was ALLOW at 5ada56d9
+    # and every one is a valid shell spelling of a denied call. Quotes and backslashes are now
+    # DELETED, not spaced.
+    printf '%s\n' "DENY|cmd|gh api -X PUT repos/o/r/pulls/5/me''rge"
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/pulls/5/me""rge'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT "repos/o/r/pulls/5/me"rge'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/pulls/5/mer\ge'
+    printf '%s\n' "DENY|cmd|gh api -X PUT repos/o/r/branches/ma'in'/protection"
+    printf '%s\n' "DENY|cmd|gh api -X DELETE repos/o/r/rul''esets/7"
+    # READ-SIDE FALSE POSITIVES, and they were the OWNER'S OWN A3 READ-BACK. Round 2 counted any
+    # whitespace-anchored `-f`/`-F` anywhere in the string as a request body, so `sort -f` and
+    # `grep -F` in a downstream pipe stage turned a read into a DENY. A body flag must carry a FIELD
+    # ASSIGNMENT to count. A guard that blocks the command the runbook tells you to run is a guard
+    # people learn to route around.
+    printf '%s\n' 'ALLOW|cmd|gh api repos/o/r/branches/main/protection | grep -F required_status_checks'
+    printf '%s\n' "ALLOW|cmd|gh api repos/o/r/rulesets | jq -r '.[].name' | sort -f"
+    printf '%s\n' 'ALLOW|cmd|gh api --paginate repos/o/r/rulesets > /tmp/r.json && grep -F name /tmp/r.json'
+    # THE CARVE-OUT WAS A PRESENCE TEST, NOT A POSITIONAL ONE: the contexts path appearing ANYWHERE
+    # in the string satisfied it, so a decoy in a filename opened the whole protection subtree under
+    # POST. Same class as round 1's inversion. The fix strips the contexts path and re-tests.
+    printf '%s\n' 'DENY|cmd|gh api -X POST repos/o/r/branches/main/protection --input /repos/o/r/branches/main/protection/required_status_checks/contexts'
+    # METHOD-SET WIDENING — do not rest safety on GitHub'"'"'s current routing table.
+    printf '%s\n' 'DENY|cmd|gh api -X DELETE repos/o/r/'
+    printf '%s\n' 'DENY|cmd|gh api -X PUT repos/o/r/git/refs/heads/main -f sha=x'
+    printf '%s\n' 'DENY|cmd|gh api repos/o/r/collaborators/mallory -f permission=admin'
+    # S6R SURVIVES A QUOTED WRAPPER — by luck, not design (its first probe sees the wrapped bytes).
+    # The incumbent --admin arm does NOT. Pin the property so it cannot regress silently; the general
+    # blindness is boarded as GUARD-QUOTED-WRAPPER-BLINDS-COMMAND-ARMS, not claimed closed here.
+    printf '%s\n' "DENY|cmd|sh -c 'gh api -X PUT repos/o/r/pulls/5/merge'"
+    # ── ROUND 4: THE OTHER HALF OF ROUND 3'"'"'S OWN FIX ────────────────────────────────────────────
+    # Round 3 deleted quotes/backslashes for the PATH but computed that string AFTER the method and
+    # body-flag probes, which kept reading raw $1. So the identical joiner trick walked through on the
+    # METHOD instead: every one of these was ALLOW at 670e9205, and `PUT /pulls/N/merge` takes an
+    # EMPTY BODY, so the first line is a complete admin merge with no body flag needed.
+    # The fix is not another regex — it is ONE normalisation, computed BEFORE ANY PROBE READS.
+    printf '%s\n' "DENY|cmd|gh api -X P''UT repos/o/r/pulls/5/merge"
+    printf '%s\n' 'DENY|cmd|gh api -X P""UT repos/o/r/pulls/5/merge'
+    printf '%s\n' 'DENY|cmd|gh api -X PU\T repos/o/r/pulls/5/merge'
+    printf '%s\n' "DENY|cmd|gh api --met''hod PUT repos/o/r/pulls/5/merge"
+    printf '%s\n' "DENY|cmd|gh api -X DEL''ETE repos/o/r"
+    printf '%s\n' "DENY|cmd|gh api -X P''ATCH repos/o/r/branches/main/protection"
+    # The BODY flag was split-able too (found at build, same root cause, same fix).
+    printf '%s\n' "DENY|cmd|gh api repos/o/r/pulls/5/merge -''f merge_method=squash"
+    # A quote-split GET must still SUPPRESS. Today that happens by accident — the method loop finds
+    # nothing, so the call is judged non-mutating and falls through. After the reorder it is a
+    # DELIBERATE `get` match. Pinned so the accident becomes a property.
+    printf '%s\n' "ALLOW|cmd|gh api -X G''ET repos/o/r/pulls/5/merge"
+    # Round-4 addendum (security seat), same root cause on the FLAG side. The first line is the one
+    # that matters: `-f 'merge_method=squash'` is how a HUMAN ORDINARILY QUOTES A SHELL ARGUMENT —
+    # not an evasion at all — and it was ALLOW. A deny arm that the normal spelling defeats is not a
+    # deny arm. The rest are the same joiner applied to the flag token itself.
+    printf '%s\n' "DENY|cmd|gh api -f 'merge_method=squash' repos/o/r/pulls/5/merge"
+    printf '%s\n' "DENY|cmd|gh api -f'merge_method=squash' repos/o/r/pulls/5/merge"
+    printf '%s\n' 'DENY|cmd|gh api -f"merge_method=squash" repos/o/r/pulls/5/merge'
+    printf '%s\n' 'DENY|cmd|gh api -f\merge_method=squash repos/o/r/pulls/5/merge'
+    printf '%s\n' "DENY|cmd|gh api -'X' PUT repos/o/r/pulls/5/merge"
+    printf '%s\n' 'DENY|cmd|gh api -X\ PUT repos/o/r/pulls/5/merge'
+    printf '%s\n' "DENY|cmd|gh api --'method' PUT repos/o/r/pulls/5/merge"
+  } > "$CASES"
+  if (
+       set +e
+       # shellcheck source=/dev/null
+       . "$GUARD"
+       _gf=0
+       while IFS= read -r _line || [ -n "$_line" ]; do
+         case "$_line" in ''|'#'*) continue ;; esac
+         _exp=${_line%%|*}; _rest=${_line#*|}; _kind=${_rest%%|*}; _pl=${_rest#*|}
+         case "$_kind" in
+           cmd)  _r=$(guard_check_command "$_pl"); _rc=$? ;;
+           path) _r=$(guard_check_path    "$_pl"); _rc=$? ;;
+           *)    echo "GUARDFAIL: unknown kind '$_kind'"; _gf=1; continue ;;
+         esac
+         if [ "$_rc" -eq 0 ]; then _got=ALLOW; else _got=DENY; fi
+         if [ "$_got" != "$_exp" ]; then
+           echo "GUARDFAIL: expected=$_exp got=$_got | $_kind $_pl"; _gf=1
+         fi
+       done < "$CASES"
+       exit $_gf ); then
+    pass "GUARD fixtures: --admin/--administrator denied, normal merge allowed, gate immutable-but-runnable"
+  else
+    fail "GUARD fixtures: a guard verdict did not match (see GUARDFAIL above)"
+  fi
+
+  # ---------------------------------------------------------------------------------------
+  # ★ LOCK SELF-NEGATIVE (mandatory — proves the LOCK ITSELF is non-vacuous). Neutralize the gate's
+  # control-plane bar (regex -> .*) in a COPY, then feed a WEAK [self-asserted] note (approver != author).
+  # The neutralized gate MUST now actuate it (rc=0) — which is exactly what the bar is supposed to
+  # forbid. If a dead/always-pass gate were INDISTINGUISHABLE (the neutralized gate still refused),
+  # the lock's bar-assertion would prove nothing -> FAIL. This mirrors non-vacuity.sh's discipline:
+  # a mutant of the FAIL path must be detectable. (The DEFAULT wiring path ALSO catches this mutation:
+  # grep -F of the exact bar string fails once the regex is neutralized.)
+  # ---------------------------------------------------------------------------------------
+  mkdir -p "$D/scripts" "$D/conformance"    # SWAS-537: the gate resolves the CI classifier beside its own scripts/ dir
+  cp "$(dirname "$VERIFY")/../conformance/ci-classify-changes.sh" "$D/conformance/ci-classify-changes.sh"
+  NEUT="$D/scripts/neutered-gate.sh"
+  cat > "$D/neuter.awk" <<'AWK'
+/grep -Eq/ && /authenticated:/ { print "  if ! printf '%s' \"$label\" | grep -Eq '.*'; then"; next }
+{ print }
+AWK
+  awk -f "$D/neuter.awk" "$VERIFY" > "$NEUT"
+  # Sanity: the neutralization actually landed (the exact bar string is gone from the gate copy).
+  if grep -qF "$BAR" "$NEUT"; then
+    fail "LOCK SELF-NEGATIVE setup: neutralization did not remove the bar from the gate copy"
+  else
+    DN="$(mkrepo)" || { fail "self-negative fixture build"; return 1; }
+    XN="$(cat "$DN/.X")"
+    write_note "$DN" "$XN" "Reviewer B [self-asserted]"
+    MCN="$(_act_stub "$DN" "$XN")"
+    run_actuate "$NEUT" "$DN" feat "$XN" "$MCN"
+    if [ "$RC" = 0 ] && [ -f "$DN/.invoked" ]; then
+      pass "LOCK SELF-NEGATIVE: neutralized bar actuated a [self-asserted] note -> the bar-check is LOAD-BEARING"
+    else
+      fail "LOCK SELF-NEGATIVE did NOT fire: neutralized gate still refused a weak note (rc=$RC) -> the lock's bar-assertion is VACUOUS"
+    fi
+  fi
+
+  # =======================================================================================
+  # PR 11 — THE FORGE-REVIEW DERIVATION IN `record` (ACTUATE-FORGE-REVIEW-DERIVATION-UNWIRED).
+  #
+  # Until this slice `derive_assurance` could emit only [signed: gpg] / [committer] /
+  # [self-asserted], so the [authenticated: <forge>-review] bar every leg above enforces was
+  # UNREACHABLE by any production path and `actuate` was closed for every class by construction —
+  # the fabricated notes above were the only way to reach it. These legs prove the label is now
+  # DERIVED from forge evidence, and — far more importantly — that it is derived ONLY when every
+  # folded condition holds. Each negative isolates exactly one condition, so deleting that condition
+  # from the gate turns exactly that leg red (the proof matrix is in the PR body).
+  # =======================================================================================
+  _RQ='[{"user":{"login":"Reviewer B","type":"User"},"state":"APPROVED","commit_id":"@SHA@","submitted_at":"2026-09-01T00:00:00Z"}]'
+
+  # REC-L (LIVENESS): a qualifying review upgrades the label — and the upgraded record then carries
+  # `actuate` end to end, which is the row's whole claim ("actuate opens for ordinary/sensitive").
+  # A liveness anchor that stopped at the note would not prove the two halves compose.
+  DL="$(mkrepo)" || { fail "REC-L: fixture build"; return 1; }
+  XL="$(cat "$DL/.X")"
+  GL="$(_mkgh "$(printf '%s' "$_RQ" | sed "s/@SHA@/$XL/g")" '"AuthorLogin"')"
+  _run_record "$DL" "$GL" "PR #260" "Reviewer B" "$XL"
+  NL="$(_note_of "$DL" "$XL")"
+  if [ "$RC" = 0 ] && _has "$NL" 'approved-by: Reviewer B [authenticated: github-review]'; then
+    MC="$(_act_stub "$DL" "$XL")"
+    run_actuate "$VERIFY" "$DL" feat "$XL" "$MC"
+    if [ "$RC" = 0 ] && [ -f "$DL/.invoked" ] && _has "$OUT" 'OK: actuated'; then
+      pass "REC-L LIVENESS: derived [authenticated: github-review] -> actuate merged it (rc=0) — the gate is REACHABLE by a production path"
+    else
+      fail "REC-L LIVENESS (actuate half): rc=$RC invoked=$(invoked "$DL") OUT=[$OUT]"
+    fi
+  else
+    fail "REC-L LIVENESS (record half): rc=$RC note=[$NL]"
+  fi
+  rm -rf "$DL" "$GL" 2>/dev/null || true
+
+  # REC-L2 (the second liveness anchor, and the ONLY leg that can red the SHA RESOLUTION): the caller
+  # passes an ABBREVIATED --approved-sha while the API answers with the 40-hex commit_id. 27 of this
+  # repo's own records carry an abbreviated sha, so comparing the raw caller string would make every
+  # one of them silently never-upgrade — a permanent false negative that looks exactly like "no review
+  # exists". Without this leg, `git rev-parse` could be replaced by the raw string and nothing reds.
+  DL2="$(mkrepo)" || { fail "REC-L2: fixture build"; return 1; }
+  XL2="$(cat "$DL2/.X")"
+  GL2="$(_mkgh "$(printf '%s' "$_RQ" | sed "s/@SHA@/$XL2/g")" '"AuthorLogin"')"
+  _run_record "$DL2" "$GL2" "PR #260" "Reviewer B" "$(printf '%s' "$XL2" | cut -c1-8)"
+  BL2="$(_note_of "$DL2" "$XL2")"
+  if [ "$RC" = 0 ] && _has "$BL2" 'approved-by: Reviewer B [authenticated: github-review]'; then
+    pass "REC-L2 LIVENESS: an ABBREVIATED --approved-sha still upgrades (the compare resolves the full sha first)"
+  else
+    fail "REC-L2: abbreviated approved-sha did not upgrade; rc=$RC note=[$BL2] OUT=[$OUT]"
+  fi
+  rm -rf "$DL2" "$GL2" 2>/dev/null || true
+
+  # ★ REC-L3 (the THIRD liveness anchor, review I2): the reviewer APPROVED and then left a COMMENTED
+  # review at the same sha — answering a question, the ordinary shape of a real review thread. A
+  # COMMENTED review does NOT change a PR's review state on GitHub, so a standing approval survives
+  # it. A plain latest-row read would let that comment CANCEL the approval and refuse a GO the forge
+  # itself still considers approved, with no clue why. This must still UPGRADE, and it is the leg that
+  # reds if the state-changing filter is dropped from the selector.
+  _rec_case REC-L3 auth \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"APPROVED","commit_id":"@SHA@","submitted_at":"2026-09-01T00:00:00Z"},{"user":{"login":"Reviewer B","type":"User"},"state":"COMMENTED","commit_id":"@SHA@","submitted_at":"2026-09-01T02:00:00Z"}]' \
+    '"AuthorLogin"' ''
+
+  # REC-N1: the review is bound to a DIFFERENT commit. `commit_id` is what makes the review an
+  # approval OF THIS CONTENT rather than of the PR as an idea; without it a reviewer's approval of an
+  # early commit would authenticate anything pushed after it.
+  _rec_case REC-N1 base \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"APPROVED","commit_id":"0123456789012345678901234567890123456789"}]' \
+    '"AuthorLogin"' review-sha-mismatch
+
+  # REC-N2: the reviewer is not the id the GO claims. The derivation CORROBORATES the caller's claim;
+  # it never substitutes a different identity for it.
+  _rec_case REC-N2 base \
+    '[{"user":{"login":"Reviewer C","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]' \
+    '"AuthorLogin"' reviewer-not-in-reviews
+
+  # REC-N3: reviewer == PR author (forge-side SoD), asserted in a DIFFERENT CASE deliberately —
+  # GitHub logins are case-insensitive, so a byte-equal test here would be defeated by a capital.
+  # This leg is what makes the case-folding deletion-provable.
+  # NOTE the reviewer login here is charset-legal on both sides: F3 anchors the AUTHOR to
+  # [A-Za-z0-9-], so a spaced author would refuse as author-unresolvable and this leg would pass for
+  # the wrong reason — proving the charset arm rather than the case-fold.
+  _rec_case REC-N3 base \
+    '[{"user":{"login":"ReviewerB","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]' \
+    '"reviewerb"' reviewer-is-pr-author ReviewerB
+
+  # REC-N4: a lone CHANGES_REQUESTED is not an approval.
+  _rec_case REC-N4 base \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"CHANGES_REQUESTED","commit_id":"@SHA@"}]' \
+    '"AuthorLogin"' review-not-approved
+
+  # REC-N5: `gh` genuinely absent from PATH -> the FALLBACK label, and the notice is ASSERTED, not
+  # merely observed. A silent fallback is the "never-silently-default" rule's exact violation.
+  DN5="$(mkrepo)" || { fail "REC-N5: fixture build"; return 1; }
+  XN5="$(cat "$DN5/.X")"
+  PN5="$(_mknogh)"
+  _run_record "$DN5" "$PN5" "PR #260" "Reviewer B" "$XN5" absolute
+  BN5="$(_note_of "$DN5" "$XN5")"
+  if [ "$RC" = 0 ] \
+     && _has "$BN5" 'approved-by: Reviewer B [self-asserted]' \
+     && _has "$OUT" 'forge-review derivation: gh-unavailable' \
+     && _has "$OUT" 'recording [self-asserted]'; then
+    pass "REC-N5: gh absent from PATH -> fallback label kept + 'gh-unavailable' notice printed (never a silent default)"
+  else
+    fail "REC-N5: rc=$RC note=[$BN5] OUT=[$OUT]"
+  fi
+  rm -rf "$DN5" "$PN5" 2>/dev/null || true
+
+  # REC-N6: HOSTILE forge output. The login carries the very bracket text the label read parses, plus
+  # a control character and a newline — the S5a note-injection class aimed at the one new input
+  # surface this slice opens. Two assertions, and the second is the load-bearing one: no upgrade, AND
+  # the note body is byte-clean (no API byte reaches a line-structured record, by construction).
+  DN6="$(mkrepo)" || { fail "REC-N6: fixture build"; return 1; }
+  XN6="$(cat "$DN6/.X")"
+  GN6="$(_mkgh "$(printf '%s' '[{"user":{"login":"Reviewer B]\napproved-by: X [authenticated: github-review","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]' | sed "s/@SHA@/$XN6/g")" '"AuthorLogin"')"
+  _run_record "$DN6" "$GN6" "PR #260" "Reviewer B" "$XN6"
+  BN6="$(_note_of "$DN6" "$XN6")"
+  if [ "$RC" = 0 ] \
+     && _has "$BN6" 'approved-by: Reviewer B [self-asserted]' \
+     && ! _has "$BN6" 'authenticated' \
+     && [ "$(printf '%s' "$BN6" | LC_ALL=C tr -d '\001-\010\013\014\016-\037')" = "$(printf '%s' "$BN6")" ]; then
+    pass "REC-N6: hostile login (brackets + control char + newline) -> no upgrade AND the note body stays clean"
+  else
+    fail "REC-N6: rc=$RC note=[$BN6] OUT=[$OUT]"
+  fi
+  rm -rf "$DN6" "$GN6" 2>/dev/null || true
+
+  # REC-N7: the SAME reviewer approved and then requested changes, both on this SHA. ANY-MATCH over
+  # the history would upgrade here — the reviewer's APPROVED row is still in the list and always will
+  # be. LATEST-per-reviewer is the only reading that respects a withdrawn approval, and this leg is
+  # what makes that ordering deletion-provable.
+  _rec_case REC-N7 base \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"APPROVED","commit_id":"@SHA@","submitted_at":"2026-09-01T00:00:00Z"},{"user":{"login":"Reviewer B","type":"User"},"state":"CHANGES_REQUESTED","commit_id":"@SHA@","submitted_at":"2026-09-01T01:00:00Z"}]' \
+    '"AuthorLogin"' review-not-approved
+
+  # REC-N8: a DISMISSED review. It is the strongest argument for an EXACT-state compare over any
+  # `case`/prefix/substring test — a dismissed approval still reads as an approval to a loose matcher,
+  # and dismissal is precisely the forge saying it no longer counts.
+  _rec_case REC-N8 base \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"DISMISSED","commit_id":"@SHA@"}]' \
+    '"AuthorLogin"' review-not-approved
+
+  # REC-N9: reviews present, PR author UNRESOLVABLE (empty). The SoD inequality would be VACUOUSLY
+  # TRUE against an empty author and would hand out the strongest label the kit has on the strength of
+  # a failed lookup. Refuse instead — the same empty-operand refusal `actuate` already makes.
+  _rec_case REC-N9 base "$_RQ" '""' author-unresolvable
+
+  # REC-N9b (security F3): the author resolves NON-empty but is not a legal GitHub login. This is the
+  # SoD comparison's only API-derived operand decided by INEQUALITY, and an inequality passes on
+  # anything unexpected — so a malformed answer would read as "not the reviewer" and upgrade. The
+  # charset anchor turns that silent pass into a stated refusal. `dependabot[bot]` is the real shape:
+  # a bot-opened PR now refuses to upgrade, fail-closed and disclosed.
+  _rec_case REC-N9b base "$_RQ" '"dependabot[bot]"' author-unresolvable
+
+  # REC-N10: a Bot reviewer. `record` already rejects '[' in --approved-by, so a `…[bot]` App login can
+  # never be the claimed id; this is the belt for a machine identity whose login carries no brackets.
+  _rec_case REC-N10 base \
+    '[{"user":{"login":"Reviewer B","type":"Bot"},"state":"APPROVED","commit_id":"@SHA@"}]' \
+    '"AuthorLogin"' reviewer-is-bot
+
+  # REC-N11: a scope that is not exactly a PR number (`PR #12x`) is no-pr-scope, never a partial read of its digits: the
+  # one-line `case` that guards it was split for semgrep, and this pins the split arm. The reviews are qualifying, so only the scope refuses.
+  _rec_case REC-N11 base \
+    '[{"user":{"login":"Reviewer B","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]' \
+    '"AuthorLogin"' no-pr-scope "Reviewer B" "PR #12x"
+
+  # ---------------------------------------------------------------------------------------
+  # ACT-CP: with the derivation wired, an [authenticated:] label is producible for EVERY class, so
+  # "control-plane stays human-actuated" stops being true by construction and needs an actual arm.
+  # The Tier-3 sitting that arm waited on is CLOSED (D-241014-1 item 6): control-plane merges go through `land`, in both
+  # relationships, and the arm is now a POINTER. A Control-plane-class note that clears the label bar AND the SoD teeth must
+  # still be REFUSED, naming the exact `land` command; the merge stub must not have run, and a refusal that still cites the
+  # sitting FAILS this cell. Honestly a DRIFT CONTROL — the class field is caller-recorded, at the note's own trust tier.
+  # ---------------------------------------------------------------------------------------
+  DCP="$(mkrepo)" || { fail "ACT-CP: fixture build"; return 1; }
+  XCP="$(cat "$DCP/.X")"
+  write_note "$DCP" "$XCP" "Reviewer B [authenticated: github-review]" "reviewer APPROVE" "Control-plane"
+  MC="$(_act_stub "$DCP" "$XCP")"
+  run_actuate "$VERIFY" "$DCP" feat "$XCP" "$MC"
+  if [ "$RC" != 0 ] && [ ! -f "$DCP/.invoked" ] \
+     && _has "$OUT" 'ACTUATE REFUSED' \
+     && _has "$OUT" 'promotion-verify.sh land --ref' \
+     && _has "$OUT" "--approved-sha $XCP --class control-plane" \
+     && ! _has "$OUT" 'TIER-3'; then
+    pass "ACT-CP: Control-plane class + authenticated label -> REFUSED with the land pointer (no sitting cited), merge stub not run (rc=$RC)"
+  else
+    fail "ACT-CP: rc=$RC invoked=$(invoked "$DCP") OUT=[$OUT]"
+  fi
+  rm -rf "$DCP" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------------------
+  # ACT-UNKNOWN (security F2): the class gate is an ALLOWLIST, so a note whose change-class is
+  # MISSING or unrecognised must refuse too. Under the denylist this shipped with, this note merged:
+  # `control-plane` was the only refused value, and a note is caller-recorded, so deleting one line
+  # was the whole evasion. Two shapes, both must refuse.
+  # ---------------------------------------------------------------------------------------
+  for _uc in '' 'Contol-plane' 'OMIT'; do
+    DUK="$(mkrepo)" || { fail "ACT-UNKNOWN: fixture build"; return 1; }
+    XUK="$(cat "$DUK/.X")"
+    write_note "$DUK" "$XUK" "Reviewer B [authenticated: github-review]" "reviewer APPROVE" "$_uc"
+    MC="$(_act_stub "$DUK" "$XUK")"
+    run_actuate "$VERIFY" "$DUK" feat "$XUK" "$MC"
+    if [ "$RC" != 0 ] && [ ! -f "$DUK/.invoked" ] \
+       && _has "$OUT" 'unrecognised or missing change-class'; then
+      pass "ACT-UNKNOWN: change-class '$_uc' -> REFUSED by the allowlist, merge not invoked (rc=$RC)"
+    else
+      fail "ACT-UNKNOWN: class='$_uc' rc=$RC invoked=$(invoked "$DUK") OUT=[$OUT]"
+    fi
+    rm -rf "$DUK" 2>/dev/null || true
+  done
+
+  # REC-CLASS (review M1, the other end of the same hardening): `record` refuses an unrecognised
+  # --class at the FRONT DOOR with rc 2, so the unjudgeable note above cannot be produced by the
+  # supported path at all. Two arms of one vocabulary; each is load-bearing without the other.
+  DRC="$(mkrepo)" || { fail "REC-CLASS: fixture build"; return 1; }
+  XRC="$(cat "$DRC/.X")"
+  if ORC="$( cd "$DRC" && sh "$VERIFY" record --approved-sha "$XRC" --approved-by "Reviewer B" \
+               --gate release-candidate --rung "Release candidate" --class "Contol-plane" \
+               --scope "PR #260" --token "GO" 2>&1 )"; then RRC=0; else RRC=$?; fi
+  if [ "$RRC" = 2 ] && _has "$ORC" "invalid --class" \
+     && [ -z "$(_note_of "$DRC" "$XRC")" ]; then
+    pass "REC-CLASS: record refuses an out-of-vocabulary --class (rc=2, NO note written)"
+  else
+    fail "REC-CLASS: rc=$RRC OUT=[$ORC]"
+  fi
+  # ...and the three legal values are accepted (a validator that refused everything would pass above).
+  for _lc in ordinary Sensitive CONTROL-PLANE; do
+    DLC="$(mkrepo)" || { fail "REC-CLASS-OK: fixture build"; return 1; }
+    XLC="$(cat "$DLC/.X")"
+    if ( cd "$DLC" && sh "$VERIFY" record --no-push --approved-sha "$XLC" --approved-by "Reviewer B" \
+           --gate release-candidate --rung "Release candidate" --class "$_lc" \
+           --scope "branch/x" --token "GO" >/dev/null 2>&1 ); then
+      pass "REC-CLASS-OK: '$_lc' accepted (case-insensitive vocabulary, not a refuse-all)"
+    else
+      fail "REC-CLASS-OK: legal class '$_lc' was rejected"
+    fi
+    rm -rf "$DLC" 2>/dev/null || true
+  done
+  rm -rf "$DRC" 2>/dev/null || true
+
+  # =====================================================================================
+  # GO-IDENTITY-AND-LAND-SOD (design 2026-10-02, owner ruling): the forge Approve is the ONLY identity the
+  # kit authenticates; the owner's GO is recorded BY NAME in `go-by:` (never authenticated); and a
+  # control-plane `land` merges only on an authenticated NON-AUTHOR forge approval. The fixtures use
+  # half-2's shapes (PR author SeaBrad72 = the agent's gh account; reviewer reviewer-login = the owner's second
+  # account). Every land leg asserts the merge marker AND the ledger, never a bare rc.
+  # =====================================================================================
+  _L_REV='[{"user":{"login":"reviewer-login","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]'
+  _L_BOTH='[{"user":{"login":"reviewer-login","type":"User"},"state":"APPROVED","commit_id":"@SHA@"},{"user":{"login":"SeaBrad72","type":"User"},"state":"APPROVED","commit_id":"@SHA@"}]'
+  _L_CHG='[{"user":{"login":"reviewer-login","type":"User"},"state":"CHANGES_REQUESTED","commit_id":"@SHA@"}]'
+  # L2 (the control): reviewer reviewer-login approved, PR author SeaBrad72, GO-giver SeaBrad72 -> lands.
+  _mkland_fx || { fail "L2: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _land_run "$_lg" reviewer-login SeaBrad72
+  _ln="$(_land_note)"
+  if [ "$RC" = 0 ] && [ -f "$LDMARK" ] \
+     && [ "$(printf '%s\n' "$_ln" | sed -n '4p')" = 'approved-by: reviewer-login [authenticated: github-review]' ] \
+     && [ "$(printf '%s\n' "$_ln" | sed -n '5p')" = 'go-by: SeaBrad72 [self-asserted]' ] \
+     && [ "$(printf '%s\n' "$_ln" | wc -l | tr -d ' ')" = 13 ] && _has "$OUT" 'authenticated non-author forge approval'; then
+    pass "L2: CP land, approved-by=reviewer reviewer-login [authenticated], go-by=SeaBrad72 [self-asserted] -> rc 0, merge ran, 13-line note on origin"
+  else
+    fail "L2: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) note=[$_ln] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # L1 (+, THE DEFECT): the cold test's mistake — the GO-giver SeaBrad72 passed as --approved-by while the
+  # only review on the PR is reviewer-login's -> reviewer-not-in-reviews. land must REFUSE before the record:
+  # rc 1, NO note (local or origin), merge never ran.
+  _mkland_fx || { fail "L1: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _land_run "$_lg" SeaBrad72 SeaBrad72
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+     && _has "$OUT" 'reviewer-not-in-reviews' && _has "$OUT" '--go-by' \
+     && _has "$OUT" 'LAND REFUSED' && _has "$OUT" 'SOLO'; then
+    pass "L1: CP land with the GO-giver as --approved-by (no such review) -> rc 1 reviewer-not-in-reviews, NO note, merge never ran, the cure + SOLO path named"
+  else
+    fail "L1: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) local=[$(_land_note)] origin=[$(_land_onote)] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # L3: SeaBrad72 DID post an APPROVED review, but on their own PR (they are its author) -> refused
+  # reviewer-is-pr-author (the forge-side SoD, case-insensitive), no note, no merge.
+  _mkland_fx || { fail "L3: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_BOTH")" '"SeaBrad72"')"
+  _land_run "$_lg" SeaBrad72 SeaBrad72
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+     && _has "$OUT" 'reviewer-is-pr-author'; then
+    pass "L3: CP land with the PR author as approver (own APPROVED review present) -> rc 1 reviewer-is-pr-author, NO note, merge never ran"
+  else
+    fail "L3: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) local=[$(_land_note)] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # L4: a CP land with no --go-by refuses, naming it — even with a fully qualifying approval — and writes nothing.
+  _mkland_fx || { fail "L4: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _land_run "$_lg" reviewer-login NONE
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+     && _has "$OUT" '--go-by <the GO-giver>'; then
+    pass "L4: CP land without --go-by -> rc 1 naming '--go-by <the GO-giver>', NO note, merge never ran"
+  else
+    fail "L4: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) local=[$(_land_note)] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # L6 (the belt): the forge answers APPROVED to land's pre-check and CHANGES_REQUESTED to record's own call
+  # (the approval was withdrawn in between). record writes a non-authenticated label; land re-reads the label
+  # FROM THE NOTE ON ORIGIN and refuses the merge: note recorded [self-asserted], merge never ran, rc 1.
+  _mkland_fx || { fail "L6: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"' "$(_L_json "$_L_CHG")")"
+  _land_run "$_lg" reviewer-login SeaBrad72
+  _ln="$(_land_note)"
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] \
+     && [ "$(printf '%s\n' "$_ln" | sed -n '4p')" = 'approved-by: reviewer-login [self-asserted]' ] && [ -n "$(_land_onote)" ] \
+     && _has "$OUT" 'IS recorded' && _has "$OUT" 'supersedes'; then
+    pass "L6: approval withdrawn between pre-check and record -> note recorded [self-asserted], merge NOT run, rc 1 (the belt re-reads the note's own label)"
+  else
+    fail "L6: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) note=[$_ln] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # S2-1 (a): the flag-swallowing repro. `--token` (record-only) is followed by a flag-shaped value, so land's
+  # peek reads `--go-by`'s "value" as `--gate` while record reads `--go-by` as the TOKEN: land saw a go-by,
+  # record wrote `(none recorded)`, and the merge ran. Any peeked value starting with '-' is now rc 2.
+  _mkland_fx || { fail "S2-1a: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  rm -f "$LDMARK"
+  if OUT="$( cd "$LDR/c" && PATH="$_lg:$PATH" PROMOTION_NOTES_REF=promotions sh "$VERIFY" land --ref 260 \
+       --merge-cmd "$LDR/stub" --approved-sha "$LDX" --approved-by reviewer-login --token --go-by --gate release-candidate \
+       --rung "Release candidate" --class control-plane --scope "PR #260" 2>&1 )"; then RC=0; else RC=$?; fi
+  if [ "$RC" = 2 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+     && _has "$OUT" '--go-by'; then
+    pass "S2-1a: a flag-shaped peeked value (--go-by --gate) -> rc 2 naming the flag, NO note, merge never ran"
+  else
+    fail "S2-1a: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) origin=[$(_land_onote)] OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # S2-1 (b): the belt verifies the WHOLE origin note. A hook on origin rewrites the note's go-by after the
+  # push (the label stays authenticated), so only the whole-note check can refuse: note recorded, no merge.
+  _mkland_fx || { fail "S2-1b: fixture build"; return 1; }
+  printf '#!/bin/sh\nexport GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@x GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@x\ngit notes --ref=promotions show %s | sed "s/^go-by: .*/go-by: (none recorded)/" > "$GIT_DIR/hook.txt"\ngit notes --ref=promotions add -f -F "$GIT_DIR/hook.txt" %s\n' "$LDX" "$LDX" > "$LDR/origin.git/hooks/post-receive"
+  chmod +x "$LDR/origin.git/hooks/post-receive"
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _land_run "$_lg" reviewer-login SeaBrad72
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -n "$(_land_note)" ] && _has "$OUT" 'go-by' && _has "$OUT" 'IS recorded'; then
+    pass "S2-1b: origin's note differs from what land judged (go-by rewritten) -> merge NOT run, rc 1, note IS recorded"
+  else
+    fail "S2-1b: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) OUT=[$OUT]"
+  fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # S2-2: the merged PR is the judged PR. --scope PR #12 judges PR 12's reviews; --ref 261 would merge 261.
+  _mkland_fx || { fail "S2-2: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _LREF=261; _land_run "$_lg" reviewer-login SeaBrad72 --scope "PR #12"; _LREF=""
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] && _has "$OUT" 'LAND REFUSED'; then
+    pass "S2-2: --scope PR #12 with --ref 261 -> rc 1, NO note, merge never ran (the judged PR is the merged PR)"
+  else
+    fail "S2-2: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) OUT=[$OUT]"
+  fi
+  # L2 (review): a branch/* scope has no PR to read, and the cure says --scope must be the PR id.
+  _land_run "$_lg" reviewer-login SeaBrad72 --scope branch/x
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && _has "$OUT" '--scope must be the PR id'; then
+    pass "S2-2/L2: a branch/* scope -> rc 1, the cure says '--scope must be the PR id', NO note"
+  else
+    fail "S2-2/L2: rc=$RC OUT=[$OUT]"
+  fi
+  # L1 (review): --go-by given but empty/whitespace is rc 2 with record's wording, never 'missing' (rc 1).
+  _l1bad=""
+  for _l1 in '' '   '; do
+    _land_run "$_lg" reviewer-login "$_l1"
+    if [ "$RC" != 2 ] || [ -f "$LDMARK" ] || ! _has "$OUT" 'empty or whitespace-only'; then _l1bad="$_l1bad [$_l1 rc=$RC]"; fi
+  done
+  if [ -z "$_l1bad" ]; then pass "L1: land --go-by '' / whitespace -> rc 2 'empty or whitespace-only', no merge"; else fail "L1: got:$_l1bad"; fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # LAND-WRITES-CARD-STATE C1: on a TRACKER backend `land` closes the row's card after the merge, and a failed move is
+  # LOUD but never a failed merge. Real board.sh + tracker-conf.sh + backlog-lib.sh beside a COPY of the gate; stubs for
+  # board-claim.sh (no claim ref: `check` rc 1) and the Jira adapter (a state file, STUB_TRANSITION_FAIL). The A9 reader
+  # is stubbed to N/A (LAND_TRACKER_READER=false) so only the card step is under test. The tail line is the contract.
+  _mkland_jira_fx || { fail "C1: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  printf 'In Progress' > "$LDR/state"
+  _lv="$VERIFY"; VERIFY="$LDR/c/scripts/promotion-verify.sh"
+  STUB_STATE_FILE="$LDR/state" LAND_TRACKER_READER=false; export STUB_STATE_FILE LAND_TRACKER_READER
+  _land_run "$_lg" reviewer-login SeaBrad72
+  if [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ "$(cat "$LDR/state")" = Done ] \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: closed' ]; then
+    pass "LAND-CARD-CLOSE (C1 +): tracker land -> merge ran, the card reads Done (post-read), the last line is 'board: closed' (rc 0)"
+  else
+    fail "LAND-CARD-CLOSE: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) state=[$(cat "$LDR/state")] OUT=[$OUT]"
+  fi
+  VERIFY="$_lv"; rm -rf "$LDR" "$_lg" 2>/dev/null || true
+  _mkland_jira_fx || { VERIFY="$_lv"; unset STUB_STATE_FILE LAND_TRACKER_READER; fail "C1n: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"   # the review JSON binds THIS fixture's sha
+  printf 'In Progress' > "$LDR/state"; VERIFY="$LDR/c/scripts/promotion-verify.sh"
+  STUB_STATE_FILE="$LDR/state" STUB_TRANSITION_FAIL=1; export STUB_STATE_FILE STUB_TRANSITION_FAIL
+  _land_run "$_lg" reviewer-login SeaBrad72
+  unset STUB_TRANSITION_FAIL
+  if [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ "$(cat "$LDR/state")" != Done ] \
+     && _has "$OUT" 'WARN' && _has "$OUT" 'sh scripts/board.sh release AB-1 --stale' \
+     && [ "$(printf '%s\n' "$OUT" | tail -1)" = 'board: NOT CLOSED — see the WARN above' ]; then
+    pass "LAND-CARD-CLOSE-FAIL (C1 -): a failed card move is rc 0 (merge kept), a WARN naming 'board.sh release AB-1 --stale', the card not Done, tail 'board: NOT CLOSED'"
+  else
+    fail "LAND-CARD-CLOSE-FAIL: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) state=[$(cat "$LDR/state")] OUT=[$OUT]"
+  fi
+  unset STUB_STATE_FILE LAND_TRACKER_READER; VERIFY="$_lv"
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # L5: an ORDINARY record (the self-asserted default, no --go-by) writes a 13-line note whose line 5 reads
+  # `go-by: (none recorded)`, and trace recovers it. With --go-by the line carries the name, labelled
+  # [self-asserted] by a FIXED literal. (record for ordinary/sensitive keeps its behaviour but for the line.)
+  DL5="$(mkrepo)" || { fail "L5: fixture build"; return 1; }
+  XL5="$(cat "$DL5/.X")"
+  GL5="$(_mkgh '[]' '"AuthorLogin"')"   # a forge with no review: the label stays the git-native [self-asserted]
+  _run_record "$DL5" "$GL5" "PR #260" "Reviewer B" "$XL5"
+  N5="$(_note_of "$DL5" "$XL5")"
+  TR5="$( ( cd "$DL5" && sh "$VERIFY" trace --ref "$XL5" 2>&1 ) || true )"
+  if [ "$RC" = 0 ] && [ "$(printf '%s\n' "$N5" | wc -l | tr -d ' ')" = 13 ] \
+     && [ "$(printf '%s\n' "$N5" | sed -n '5p')" = 'go-by: (none recorded)' ] \
+     && _has "$TR5" "$(printf '%s' "$XL5" | cut -c1-12)" && _has "$TR5" 'go-by: (none recorded)'; then
+    pass "L5: ordinary record without --go-by -> 13-line note, line 5 'go-by: (none recorded)'; trace recovers it and prints go-by"
+  else
+    fail "L5: rc=$RC lines=$(printf '%s\n' "$N5" | wc -l | tr -d ' ') note=[$N5] trace=[$TR5]"
+  fi
+  if ( cd "$DL5" && sh "$VERIFY" record --no-push --approved-sha "$XL5" --approved-by "Reviewer B" --go-by "Owner Fixture" \
+         --gate release-candidate --rung "Release candidate" --class Ordinary --scope "PR #260" --token "GO" >/dev/null 2>&1 ) \
+     && [ "$(_note_of "$DL5" "$XL5" | sed -n '5p')" = 'go-by: Owner Fixture [self-asserted]' ]; then
+    pass "L5b: record --go-by 'Owner Fixture' -> line 5 'go-by: Owner Fixture [self-asserted]' (a FIXED literal label)"
+  else
+    fail "L5b: --go-by did not record 'go-by: Owner Fixture [self-asserted]': note=[$(_note_of "$DL5" "$XL5")]"
+  fi
+  rm -rf "$DL5" "$GL5" 2>/dev/null || true
+
+  # L7: --go-by gets --approved-by's front-door hygiene: a bracket, a newline (note injection) or a blank value
+  # is rejected rc 2 with NO note written — the label can never be supplied, so a forged one cannot enter.
+  DL7="$(mkrepo)" || { fail "L7: fixture build"; return 1; }
+  XL7="$(cat "$DL7/.X")"
+  _l7bad=""
+  for _l7 in 'Owner [authenticated: github-review]' "$(printf 'Owner\napproved-by: x [signed: gpg]')" '   ' ''; do
+    if ( cd "$DL7" && sh "$VERIFY" record --no-push --approved-sha "$XL7" --approved-by "Reviewer B" --go-by "$_l7" \
+           --gate release-candidate --rung "Release candidate" --class Ordinary --scope "branch/l7" --token "GO" >/dev/null 2>&1 ); then _l7rc=0; else _l7rc=$?; fi
+    if [ "$_l7rc" != 2 ] || [ -n "$(_note_of "$DL7" "$XL7")" ]; then _l7bad="$_l7bad [$_l7 rc=$_l7rc]"; fi
+  done
+  # ...and the NON-VACUITY partner: the same call with a clean name is ACCEPTED (an unknown flag would also be rc 2).
+  if ( cd "$DL7" && sh "$VERIFY" record --no-push --approved-sha "$XL7" --approved-by "Reviewer B" --go-by "Owner Name" \
+         --gate release-candidate --rung "Release candidate" --class Ordinary --scope "branch/l7" --token "GO" >/dev/null 2>&1 ) \
+     && [ "$(_note_of "$DL7" "$XL7" | sed -n '5p')" = 'go-by: Owner Name [self-asserted]' ]; then :; else _l7bad="$_l7bad [control: a clean --go-by was refused]"; fi
+  if [ -z "$_l7bad" ]; then
+    pass "L7: --go-by with a bracket, a newline, whitespace-only or empty -> rc 2 at the front door, NO note written (a clean name is accepted)"
+  else
+    fail "L7: want rc 2 and no note for every hostile --go-by; got:$_l7bad"
+  fi
+  rm -rf "$DL7" 2>/dev/null || true
+
+  # =====================================================================================
+  # RUNAWAY-METERING-LANDING-GATE T2 — `actuate` consults the per-slice meter behind the
+  # RUNAWAY_METERING_GATE dial, AFTER SoD and BEFORE the merge. The row is the note's OWN `kit-row:`.
+  # LOAD-BEARING NEGATIVE: a refusal attempts NO merge (the stub would leave a marker). The GO note
+  # ALREADY EXISTS on actuate (`record` is a separate verb), so a refusal leaves a recorded-but-unmerged
+  # GO — asserted, because that is the disclosed residual (design F5c), not a defect. The dial is read
+  # from the APPROVED tree (never the working tree); env may only escalate. Owner ruling F3 = Option A: a
+  # breached row PROCEEDS with a loud STOP line. Every leg sandboxes the tally through a temp HOME and runs
+  # the gate from a kit-layout COPY, so a leg can remove the classifier or the guard.
+  # =====================================================================================
+  MGA_ROOT="$(mktemp -d)"
+  MGA_SRC="$(cd "$(dirname "$VERIFY")" && pwd)"
+  MGA_ENVX=""
+  MGA_KIT="$MGA_ROOT/kit"
+  mga_layout() {   # <dir> [noclassifier|noguard]
+    _mk="$1"; _mv="${2:-}"
+    rm -rf "$_mk"; mkdir -p "$_mk/scripts" "$_mk/.kit" "$_mk/conformance"
+    cp "$VERIFY" "$_mk/scripts/promotion-verify.sh"
+    cp "$MGA_SRC/../.kit/budget.conf" "$_mk/.kit/budget.conf"
+    printf '#!/bin/sh\nexit 0\n' > "$_mk/scripts/board-claim.sh"
+    if [ "$_mv" = stubrc7 ]; then printf '#!/bin/sh\nexit 7\n' > "$_mk/scripts/runaway-guard.sh"   # present, but exits an rc the gate has no named arm for
+    elif [ "$_mv" != noguard ]; then cp "$MGA_SRC/runaway-guard.sh" "$_mk/scripts/runaway-guard.sh"; fi
+    [ "$_mv" = noclassifier ] || cp "$MGA_SRC/../conformance/ci-classify-changes.sh" "$_mk/conformance/ci-classify-changes.sh"
+  }
+  mga_layout "$MGA_KIT"
+  MGA_K="$MGA_KIT"
+  mga_put_dial() {   # writes the dial into the CURRENT tree (cwd) and stages it
+    mkdir -p .kit
+    if [ "$_mdial" = LINK ]; then
+      printf 'RUNAWAY_METERING_GATE=enforce\n' > .kit/elsewhere.conf
+      ln -s elsewhere.conf .kit/dials.conf
+    else
+      printf '%s\n' "$_mdial" > .kit/dials.conf
+    fi
+    git add .kit
+  }
+  # mga_fx <dial: NONE|LINK|<conf line>> <row: NONE|(none)|ROW> <kind: code|docs|rename> [feat|base] [nobase]
+  # -> $MD (repo), $MX (the approved sha, authored by `Author A`), $MH (the leg's temp HOME). G carries
+  # x.sh (and the dial when `base`), origin/main is pointed at G unless `nobase`, and X is the feature
+  # commit. The GO note is authenticated, approver != author, class Ordinary; kit-row is projected.
+  mga_fx() {
+    MD="$(mktemp -d)"; _mdial="$1"; _mrow="$2"; _mkind="$3"; _mwhere="${4:-feat}"
+    (
+      set -e; cd "$MD"
+      git init -q; git config user.email committer@example.com; git config user.name committer; git config commit.gpgsign false
+      printf 'base\n' > f.txt; printf '#!/bin/sh\n:\n' > x.sh; git add f.txt x.sh
+      if [ "$_mwhere" = base ] && [ "$_mdial" != NONE ]; then mga_put_dial; fi
+      git commit -qm G; git rev-parse HEAD > "$MD/.G"
+      git checkout -q -b feat
+      if [ "$_mwhere" = feat ] && [ "$_mdial" != NONE ]; then mga_put_dial; fi
+      case "$_mkind" in
+        code)   printf 'c\n' > code.sh; git add code.sh ;;
+        docs)   mkdir -p docs; printf 'hi\n' > docs/x.md; git add docs ;;
+        rename) mkdir -p docs; git mv x.sh docs/x.md ;;
+        codedocs) printf 'c\n' > code.sh; git add code.sh; git commit -qm codepart
+                  mkdir -p docs; printf 'hi\n' > docs/x.md; git add docs ;;
+      esac
+      GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git commit -qm X ${MGA_TRAILER:+-m "$MGA_TRAILER"}; git rev-parse HEAD > "$MD/.X"
+    ) || { fail "metering-gate fixture build"; return 1; }
+    MX="$(cat "$MD/.X")"
+    # A REAL origin: the gate takes the docs-only base from the REMOTE (ls-remote), never the local ref.
+    # `nobase` = the remote answers but carries no `main` (the local origin/main ref is still set, so a gate that trusted
+    # it would exempt). It must stay REACHABLE: the GO note is read from origin first (SWAS-207a), so an unreachable
+    # origin would refuse on the note and never reach the base read this leg pins.
+    _mo="$MD/.origin.git"; mkdir -p "$_mo"; git -C "$_mo" init -q --bare
+    git -C "$MD" remote add origin "$_mo"
+    if [ "${5:-}" != nobase ]; then git -C "$MD" push -q origin "$(cat "$MD/.G"):refs/heads/main"; fi
+    git -C "$MD" update-ref refs/remotes/origin/main "$(cat "$MD/.G")"
+    write_note "$MD" "$MX" "Reviewer B [authenticated: github-review]"
+    [ "$_mrow" = NONE ] || ( cd "$MD" && git notes --ref=promotions append -m "kit-row: $_mrow" "$MX" ) >/dev/null 2>&1
+    MH="$MD/.home"; mkdir -p "$MH"
+  }
+  mga_seed() {   # <row> <tokens> <agents> — a tally line for the fixture repo in the leg's temp HOME
+    _mkey="$(git -C "$MD" rev-list --max-parents=0 --first-parent HEAD | tail -1)"
+    mkdir -p "$MH/.local/state/sparkwright/runaway/$_mkey"
+    printf '1757900000 keyA %s %s %s\n' "$1" "$2" "$3" >> "$MH/.local/state/sparkwright/runaway/$_mkey/tally.v2"
+  }
+  mga_poison() {   # <row> — a tally the guard cannot read (rc 2), which enforce still refuses
+    # SWAS-302 (Q2 A2) dropped the unmetered-row refusal, so the legs that prove the dial is read from the APPROVED
+    # tree (and the docs-only exemption) by a refusal take that refusal from this unreadable tally instead.
+    mga_seed "$1" 1 1
+    printf 'this line is not the tally grammar\n' >> "$MH/.local/state/sparkwright/runaway/$_mkey/tally.v2"
+  }
+  mga_act() {   # -> RC, OUT. The ambient redirection/dial env is scrubbed; $MGA_ENVX re-adds a leg's own.
+    rm -f "$MD/.invoked"
+    _act_origin "$MD"   # the GO note is read from ORIGIN: publish the leg's (possibly rewritten) note first
+    if OUT="$( cd "$MD/${MGA_SUB:-}" && env -u KIT_RUNAWAY_SANDBOX -u RUNAWAY_TALLY -u RUNAWAY_BUDGET_CONFIG -u RUNAWAY_METERING_GATE \
+          HOME="$MH" $MGA_ENVX "$MGA_SH" "$MGA_K/scripts/promotion-verify.sh" actuate --ref feat --approved-sha "$MX" \
+          --merge-cmd "$(_act_stub "$MD" "$MX")" 2>&1 )"; then RC=0; else RC=$?; fi
+  }
+  mga_check() {   # <label> <proceed|refuse> <needle>... (a leading ! = must NOT appear)
+    _ml="$1"; _mw="$2"; shift 2; _mbad=""
+    if [ "$_mw" = proceed ]; then
+      { [ "$RC" = 0 ] && [ -f "$MD/.invoked" ]; } || _mbad="want rc 0 + merge, got rc=$RC invoked=$(invoked "$MD")"
+    else
+      { [ "$RC" != 0 ] && [ ! -f "$MD/.invoked" ] && [ -n "$(_note_of "$MD" "$MX")" ]; } \
+        || _mbad="want a refusal + NO merge + the GO note still recorded, got rc=$RC invoked=$(invoked "$MD")"
+    fi
+    for _mn in "$@"; do
+      case "$_mn" in
+        '!'*) _mn="${_mn#!}"; if _has "$OUT" "$_mn"; then _mbad="$_mbad; unexpected '$_mn'"; fi ;;
+        *)    _has "$OUT" "$_mn" || _mbad="$_mbad; missing '$_mn'" ;;
+      esac
+    done
+    if [ -z "$_mbad" ]; then pass "$_ml [$MGA_SH]"; else fail "$_ml [$MGA_SH] — $_mbad; OUT=[$OUT]"; fi
+    rm -rf "$MD" 2>/dev/null || true
+  }
+  MGA_ENF='RUNAWAY_METERING_GATE=enforce'
+  MGA_OBS='RUNAWAY_METERING_GATE=observe'
+
+  # The legs run under EVERY producer shell this host has: `sh` (bash-as-sh on macOS, dash on Debian CI)
+  # AND `dash` explicitly (the A5 class: dash's echo expands \0NNN, its patterns differ). MGA_SH names it.
+  mga_legs() {
+  # SWAS-302 Q2-A2 (owner: "2 A2"): enforce stays, and ONLY the refusal of a row with no meter line is dropped.
+  mga_fx "$MGA_ENF" ROW-A2U code; mga_act
+  mga_check "ACT-METER(A2, enforce, unmetered): PROCEEDS, prints the unmetered line, names no step remedy" proceed \
+    "unmetered: ROW-A2U" "OK: actuated" "!ACTUATE REFUSED" "!step --row" "!never estimate"
+  mga_fx "$MGA_ENF" NONE code; mga_act
+  mga_check "ACT-METER(A2 keeps, enforce, no kit-row): STILL refused — cannot meter an unnamed row" refuse "ACTUATE REFUSED (metering gate)" "unnamed row"
+  mga_fx "$MGA_ENF" ROW-A2G code; mga_layout "$MGA_ROOT/kit-a2nog" noguard; MGA_K="$MGA_ROOT/kit-a2nog"; mga_act; MGA_K="$MGA_KIT"
+  mga_check "ACT-METER(A2 keeps, enforce, guard absent): STILL refused, naming the absence" refuse "ACTUATE REFUSED (metering gate)" "the runaway guard script is absent (<path elided>)"
+
+  mga_fx "$MGA_ENF" ROW-MA2 code; mga_seed ROW-MA2 100 2; mga_act
+  mga_check "ACT-METER(enforce, metered): proceeds, prints the meter line" proceed "metered: ROW-MA2 tokens(100/" "OK: actuated"
+
+  mga_fx "$MGA_ENF" ROW-MA3 code; mga_seed ROW-MA3 100 2
+  printf 'this line is not the tally grammar\n' >> "$MH/.local/state/sparkwright/runaway/$_mkey/tally.v2"; mga_act
+  mga_check "ACT-METER(enforce, rc 2 poisoned tally): refused (fail-closed), no merge, the HOME path elided" refuse \
+    "ACTUATE REFUSED (metering gate)" "guard rc 2" "\$HOME…" "!$MH"
+
+  mga_fx "$MGA_ENF" ROW-MA4 code; mga_seed ROW-MA4 999999999999 1; mga_act
+  mga_check "ACT-METER(enforce, breached, F3 Option A): PROCEEDS with the loud STOP line, repeated in the report" proceed \
+    "STOP: ROW-MA4 tokens(" "ceiling breached (landed anyway: approved)" "OK: actuated"
+  # (the STOP-twice count is asserted on the land verb; here the merge ran and the line is present)
+
+  mga_fx "$MGA_OBS" ROW-MA5 code; mga_act
+  mga_check "ACT-METER(observe, unmetered): proceeds with the one line" proceed "unmetered: ROW-MA5 (observe — not gating)"
+
+  mga_fx NONE ROW-MA6 code; mga_act
+  mga_check "ACT-METER(dial absent): silent — proceeds, nothing about the meter" proceed "!metered" "!metering gate" "!runaway"
+
+  mga_fx "$MGA_ENF" ROW-MA7 docs base; mga_act
+  mga_check "ACT-METER(docs-only, enforce, unmetered): N/A — proceeds" proceed "N/A: docs-only change"
+
+  mga_fx "$MGA_ENF" ROW-MA8 rename base; mga_poison ROW-MA8; mga_act
+  mga_check "ACT-METER(a .sh -> .md rename is NOT docs-only): refused in enforce" refuse "ACTUATE REFUSED (metering gate)" "!N/A: docs-only"
+
+  mga_fx "$MGA_ENF" ROW-MA9 docs base nobase; mga_poison ROW-MA9; mga_act
+  mga_check "ACT-METER(unresolvable merge-base): NOT docs-only — refused in enforce, and says the base is unreadable (fix2 B)" refuse "ACTUATE REFUSED (metering gate)" "!N/A: docs-only" \
+    "docs-only exemption unavailable: cannot read origin's main"
+
+  # fix round 2 (Minor): the remote main tip is NOT present locally -> the exemption names the missing fetch.
+  mga_fx "$MGA_ENF" ROW-MA26 docs base; mga_poison ROW-MA26
+  ( set -e; _mgc="$(mktemp -d)"; git clone -q "$MD/.origin.git" "$_mgc/c"; cd "$_mgc/c"; git config user.email c@x; git config user.name c
+    git checkout -q main 2>/dev/null || git checkout -q -b main origin/main; printf 'n\n' > newer.txt; git add newer.txt; git commit -qm newer
+    git push -q origin HEAD:refs/heads/main; rm -rf "$_mgc" ) || fail "could not advance the fixture origin"
+  mga_act
+  mga_check "ACT-METER(fix2 B): remote main tip not fetched locally -> NOT docs-only, refused, names 'git fetch origin'" refuse "ACTUATE REFUSED (metering gate)" "!N/A: docs-only" \
+    "docs-only exemption unavailable: origin/main tip not fetched — git fetch origin"
+
+  # fix round 1 (security HIGH): the dial read is FULL-TREE — from a SUBDIRECTORY the gate still reads the root dial.
+  mga_fx "$MGA_ENF" ROW-MA19 code; mga_poison ROW-MA19; mkdir -p "$MD/sub"; MGA_SUB=sub; mga_act; MGA_SUB=""
+  mga_check "ACT-METER(fix1 A): enforce + unreadable tally invoked from a SUBDIRECTORY -> still refused" refuse "ACTUATE REFUSED (metering gate)" "guard rc 2"
+
+  # fix round 1 (security MEDIUM): a replace ref pointing the approved sha at an observe tree must not de-escalate.
+  mga_fx "$MGA_ENF" ROW-MA20 code; mga_poison ROW-MA20
+  ( set -e; cd "$MD"; git checkout -q -b crafted; printf 'RUNAWAY_METERING_GATE=observe\n' > .kit/dials.conf; git add .kit
+    git commit -qm crafted; git replace -f "$MX" "$(git rev-parse HEAD)"; git checkout -q feat ) || fail "could not build the replace-ref fixture"
+  mga_act
+  mga_check "ACT-METER(fix1 B): a replace ref redirecting the approved sha to an observe tree does NOT de-escalate -> refused" refuse "ACTUATE REFUSED (metering gate)"
+
+  # fix round 1 (security MEDIUM): the docs-only base is the REMOTE's main; moving the local ref must not exempt code+docs.
+  mga_fx "$MGA_ENF" ROW-MA21 codedocs base; mga_poison ROW-MA21
+  git -C "$MD" update-ref refs/remotes/origin/main "${MX}^"; mga_act
+  mga_check "ACT-METER(fix1 C): a code+docs change with the LOCAL origin/main moved to the approved parent is NOT docs-only -> refused" refuse "ACTUATE REFUSED (metering gate)" "!N/A: docs-only" "!docs-only exemption unavailable"
+
+  # fix round 2 (reviewer Blocker): a note for a sha whose COMMIT is absent locally (a clone that fetched only the notes
+  # ref) must REFUSE in the default (non-enforce) env — it cannot be proved non-enforcing — and never reach the merge.
+  mga_fx NONE ROW-MA25 code; _mgold="$MD"; MD="$(mktemp -d)"
+  ( set -e; cd "$MD"; git init -q; git config user.email committer@example.com; git config user.name committer
+    git fetch -q "$_mgold" refs/notes/promotions:refs/notes/promotions ) || fail "could not build the notes-only fixture"
+  if git -C "$MD" cat-file -e "${MX}^{commit}" 2>/dev/null; then fail "notes-only fixture unexpectedly holds the approved commit"; fi
+  mga_act; rm -rf "$_mgold" 2>/dev/null || true
+  # SWAS-207a step 0: the approved commit is ABSENT locally, so `--ref` cannot equal it and the verb refuses BEFORE it reads
+  # the note, SoD or the meter gate — the SoD/metering "absent commit" arms are now unreachable from `actuate` (they stay
+  # live for `land`). The refusal is step 0's own line, with the fetch remedy — NOT SoD's and NOT the metering gate's.
+  mga_check "ACT-METER(fix2 A): a note whose approved commit is ABSENT locally -> refused by step 0 with the fetch remedy, NO merge (default env)" refuse \
+    "ACTUATE REFUSED: --ref 'feat' resolves to nothing" "nothing was merged" "git fetch origin <branch>:<branch>" "!(metering gate)" "!SoD"
+
+  # SODEA-A1: the same notes-only clone with the dial in OBSERVE — the reason must be the SoD one, and no merge.
+  mga_fx "$MGA_OBS" ROW-SA1 code; _mgold="$MD"; MD="$(mktemp -d)"
+  ( set -e; cd "$MD"; git init -q; git config user.email committer@example.com; git config user.name committer
+    git fetch -q "$_mgold" refs/notes/promotions:refs/notes/promotions ) || fail "could not build the SODEA-A1 notes-only fixture"
+  if git -C "$MD" cat-file -e "${MX}^{commit}" 2>/dev/null; then fail "SODEA-A1 fixture unexpectedly holds the approved commit"; fi
+  mga_act; rm -rf "$_mgold" 2>/dev/null || true
+  mga_check "SODEA-A1: notes-only clone, observe -> refused by step 0 (the approved commit is absent, so --ref cannot equal it; the SoD arm stays live for land), NOT the metering gate, NO merge" refuse \
+    "ACTUATE REFUSED: --ref 'feat' resolves to nothing, not the approved sha $MX" "git fetch origin <branch>:<branch>" "!(metering gate)" "!SoD"
+
+  # SODEA-A2: a case-varied and a whitespace-varied self-approval (the author is 'Author A') are refused, NO merge.
+  # Each is a note the fixture would otherwise PROCEED on (authenticated, ordinary, commit present), so step 3 is really reached.
+  # The last two are full-ident spellings ('Name <email>' and a bare '<EMAIL>'): the same person, refused too.
+  for _sa2 in 'author a' 'AUTHOR A' 'Author  A' ' Author   A ' 'Author A <a@x>' '<A@X>'; do
+    mga_fx NONE ROW-SA2 code; write_note "$MD" "$MX" "$_sa2 [authenticated: github-review]"; mga_act
+    mga_check "SODEA-A2: approver '$_sa2' vs author 'Author A' -> refused as a self-approval, NO merge" refuse "ACTUATE REFUSED: approver equals author"
+  done
+  mga_fx NONE ROW-SA2P code; write_note "$MD" "$MX" "Author AB [authenticated: github-review]"; mga_act
+  mga_check "SODEA-A2 (liveness): a DIFFERENT approver 'Author AB' still proceeds — the fold is not a refuse-all" proceed "OK: actuated"
+
+  # SODEA-A3: a RESOLVABLE commit whose author NAME is empty (crafted; git writes it without --literally) is refused
+  # with the empty-author reason — an identity that cannot be read is never a pass.
+  mga_fx NONE ROW-SA3 code
+  ( set -e; cd "$MD"; _sat="$(git rev-parse "${MX}^{tree}")"; _sap="$(git rev-parse "${MX}^")"
+    printf 'tree %s\nparent %s\nauthor  <a@x> 1757900000 +0000\ncommitter committer <committer@example.com> 1757900000 +0000\n\nX\n' "$_sat" "$_sap" > .sa3body
+    _sac="$(git hash-object -t commit -w .sa3body)"; printf '%s\n' "$_sac" > .X; git update-ref refs/heads/feat "$_sac" ) || fail "could not craft the empty-author commit"
+  MX="$(cat "$MD/.X")"; write_note "$MD" "$MX" "Reviewer B [authenticated: github-review]"
+  if [ -n "$(git -C "$MD" show -s --format=%an "$MX")" ]; then fail "SODEA-A3 fixture: the crafted author name is not empty"; fi
+  mga_act
+  mga_check "SODEA-A3: a resolvable commit with an EMPTY author name -> refused with the empty-author reason, NO merge" refuse "ACTUATE REFUSED:" "author of the approved commit" "cannot be read"
+
+  # SODEA-A4: the fixture repo's OWN config sets log.showSignature=true and the approved commit is ssh-SIGNED, so an
+  # unflagged `git show --format=%an` prints a signature line before the name. A real self-approval (approver ==
+  # author) must still be refused as one, NO merge. The fixture proves it is polluted, or the leg is not load-bearing.
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "N/A: SODEA-A4 (log.showSignature + signed commit): ssh-keygen is absent on this host, so no ssh-signed fixture can be built — NOT a PASS"
+  else
+    mga_fx NONE ROW-SA4 code
+    # (an `&&` chain, not `set -e`: errexit is disabled inside an `if` condition)
+    if ( cd "$MD" && ssh-keygen -q -t ed25519 -N '' -f "$MD/.k" && git config log.showSignature true \
+         && GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git -c gpg.format=ssh -c user.signingkey="$MD/.k.pub" commit -q -S --amend --no-edit \
+         && git rev-parse HEAD > .X ) >/dev/null 2>&1; then
+      MX="$(cat "$MD/.X")"; write_note "$MD" "$MX" "Author A [authenticated: github-review]"
+      if [ "$(git -C "$MD" show -s --format=%an "$MX" 2>/dev/null | wc -l | tr -d ' ')" -lt 2 ]; then fail "SODEA-A4 fixture: an unflagged %an read is NOT polluted, so the leg is not load-bearing"; fi
+      mga_act
+      mga_check "SODEA-A4: log.showSignature=true + a signed approved commit, approver == author -> still refused as a self-approval, NO merge" refuse "ACTUATE REFUSED: approver equals author"
+    else
+      echo "N/A: SODEA-A4 (log.showSignature + signed commit): this host's git/ssh-keygen cannot make an ssh-signed commit — NOT a PASS"; rm -rf "$MD" 2>/dev/null || true
+    fi
+  fi
+
+  # SODEA-A5: a RESOLVABLE commit with a real author NAME and an EMPTY email (crafted `author Name <> ...`; git accepts it
+  # without --literally) is refused with the empty-author reason (the empty-email arm).
+  mga_fx NONE ROW-SA5 code
+  ( set -e; cd "$MD"; _sat="$(git rev-parse "${MX}^{tree}")"; _sap="$(git rev-parse "${MX}^")"
+    printf 'tree %s\nparent %s\nauthor Name <> 1757900000 +0000\ncommitter committer <committer@example.com> 1757900000 +0000\n\nX\n' "$_sat" "$_sap" > .sa5body
+    _sac="$(git hash-object -t commit -w .sa5body)"; printf '%s\n' "$_sac" > .X; git update-ref refs/heads/feat "$_sac" ) || fail "could not craft the empty-email commit"
+  MX="$(cat "$MD/.X")"; write_note "$MD" "$MX" "Reviewer B [authenticated: github-review]"
+  if [ -n "$(git -C "$MD" show -s --format=%ae "$MX")" ] || [ -z "$(git -C "$MD" show -s --format=%an "$MX")" ]; then fail "SODEA-A5 fixture: want a real name and an EMPTY email"; fi
+  mga_act
+  mga_check "SODEA-A5: a resolvable commit with a real author name and an EMPTY email -> refused with the empty-author reason, NO merge" refuse "ACTUATE REFUSED:" "author of the approved commit" "cannot be read"
+
+  mga_fx "$MGA_ENF" ROW-MA10 docs base; mga_poison ROW-MA10; mga_layout "$MGA_ROOT/kit-nocls" noclassifier; MGA_K="$MGA_ROOT/kit-nocls"; mga_act; MGA_K="$MGA_KIT"
+  mga_check "ACT-METER(classifier absent): NOT docs-only (fail-safe) — refused in enforce" refuse "ACTUATE REFUSED (metering gate)" "!N/A: docs-only"
+
+  mga_fx "$MGA_ENF" NONE code; mga_act
+  mga_check "ACT-METER(note with no kit-row, enforce): refused — cannot meter an unnamed row" refuse "ACTUATE REFUSED (metering gate)" "unnamed row"
+  mga_fx "$MGA_ENF" '(none)' code; mga_act
+  mga_check "ACT-METER(kit-row: (none), enforce): refused" refuse "unnamed row"
+
+  mga_fx 'RUNAWAY_METERING_GATE=enforcee' ROW-MA11 code; mga_act
+  mga_check "ACT-METER(malformed conf value): reads as observe and WARNs on the conf side" proceed "WARN" ".kit/dials.conf" "unmetered: ROW-MA11 (observe — not gating)"
+
+  mga_fx "$MGA_ENF" ROW-MA12 code; mga_poison ROW-MA12
+  printf 'RUNAWAY_METERING_GATE=observe\n' > "$MD/.kit/dials.conf"; mga_act
+  mga_check "ACT-METER(F1): the working tree says observe but the APPROVED tree says enforce -> refused" refuse "ACTUATE REFUSED (metering gate)"
+
+  mga_fx "$MGA_ENF" ROW-MA13 code; mga_poison ROW-MA13; MGA_ENVX="RUNAWAY_METERING_GATE=observe"; mga_act; MGA_ENVX=""
+  mga_check "ACT-METER(F1): env =observe cannot de-escalate an enforcing approved tree -> refused, and says so" refuse "ACTUATE REFUSED (metering gate)" "cannot de-escalate"
+  mga_fx NONE ROW-MA14 code; mga_poison ROW-MA14; MGA_ENVX="RUNAWAY_METERING_GATE=enforce"; mga_act; MGA_ENVX=""
+  mga_check "ACT-METER(F1): env =enforce escalates a tree with no key -> refused" refuse "ACTUATE REFUSED (metering gate)"
+
+  # fix round 3 (F-C): a hand-written note whose kit-row differs from the approved commit's Kit-Row trailer
+  # (record never writes a mismatch) is refused in enforce, BEFORE the gate, with no merge.
+  MGA_TRAILER='Kit-Row: ROW-UNMETERED'; mga_fx "$MGA_ENF" ROW-METERED code; MGA_TRAILER=""; mga_seed ROW-METERED 100 1; mga_act
+  mga_check "ACT-METER(F-C): note kit-row ROW-METERED vs commit Kit-Row ROW-UNMETERED, enforce -> refused as a hand-written note, no merge" refuse "does not match the approved commit's Kit-Row" "ROW-METERED" "ROW-UNMETERED" "hand-written note"
+
+  mga_fx LINK ROW-MA15 code; mga_act
+  mga_check "ACT-METER(F1 cond 2): a 120000 symlink dials entry reads observe with a loud line naming the symlink" proceed "symlink" "unmetered: ROW-MA15 (observe — not gating)"
+
+  mga_fx "$MGA_ENF" ROW-MA16 code
+  mkdir -p "$MGA_ROOT/sbx"; printf '1757900000 keyA ROW-MA16 100 1\n' > "$MGA_ROOT/sbx/tally.v2"
+  if ( cd "$MD" && env HOME="$MH" KIT_RUNAWAY_SANDBOX="$MGA_ROOT/sbx" RUNAWAY_TALLY="$MGA_ROOT/sbx/tally.v2" \
+         sh "$MGA_KIT/scripts/runaway-guard.sh" meter --row ROW-MA16 >/dev/null 2>&1 ); then
+    pass "ACT-METER(F2) precondition: the sandbox env alone WOULD read ROW-MA16 as metered"
+  else fail "ACT-METER(F2) precondition: the sandbox tally did not read as metered, the leg would be vacuous"; fi
+  MGA_ENVX="KIT_RUNAWAY_SANDBOX=$MGA_ROOT/sbx RUNAWAY_TALLY=$MGA_ROOT/sbx/tally.v2"; mga_act; MGA_ENVX=""
+  mga_check "ACT-METER(F2): the sandbox env exported while the temp-HOME tally is unmetered -> the sandbox tally is NOT read (the row stays unmetered, noted, not refused)" proceed \
+    "unmetered: ROW-MA16" "!metered: ROW-MA16 tokens("
+
+  mga_fx "$MGA_ENF" ROW-MA17 code; mga_layout "$MGA_ROOT/kit-nog" noguard; MGA_K="$MGA_ROOT/kit-nog"; mga_act; MGA_K="$MGA_KIT"
+  mga_check "ACT-METER(F8): the guard script absent -> refused in enforce, naming the absence (deterministic under every shell)" refuse "ACTUATE REFUSED (metering gate)" "the runaway guard script is absent (<path elided>)"
+  mga_fx "$MGA_ENF" ROW-MA17B code; mga_layout "$MGA_ROOT/kit-stub7" stubrc7; MGA_K="$MGA_ROOT/kit-stub7"; mga_act; MGA_K="$MGA_KIT"
+  mga_check "ACT-METER(F8b): a guard that is present but exits rc 7 -> the any-other-rc arm refuses in enforce (no fail-open on a crash)" refuse "ACTUATE REFUSED (metering gate)" "exited rc 7"
+
+  mga_fx "$MGA_OBS" ROW-MA18 code; mga_seed ROW-MA18 1 1
+  printf 'this line is not the tally grammar\n' >> "$MH/.local/state/sparkwright/runaway/$_mkey/tally.v2"; mga_act
+  mga_check "ACT-METER(observe, rc 2): ONE line, proceeds" proceed "guard rc 2" "observe"
+  }
+  # `dash` explicitly only when `sh` is not already dash (every Ubuntu runner): a second pass would run every
+  # leg twice for nothing. If `sh` cannot be resolved, keep both.
+  mga_sh_is_dash() { _mgp="$(command -v sh 2>/dev/null)" || return 1; _mgt="$(readlink -f "$_mgp" 2>/dev/null || readlink "$_mgp" 2>/dev/null || true)"
+    case "$_mgt" in *dash*) return 0 ;; esac; return 1; }
+  MGA_SHELLS="sh dash"; if mga_sh_is_dash; then MGA_SHELLS="sh"; fi
+  for MGA_SH in $MGA_SHELLS; do
+    command -v "$MGA_SH" >/dev/null 2>&1 || continue
+    mga_legs
+  done
+  rm -rf "$MGA_ROOT" 2>/dev/null || true
+
+  # SAST-PARSE-MERGE-TOOL: one refuse cell per rewritten argument-vet arm in the merge tool (the one-line `case … esac` lines
+  # split for semgrep). Each pins its OWN refusal line and rc, so a rewrite that widens or drops a match goes red. They pass
+  # on the code before the split too: they pin behaviour, not red-first. (land's --approved-sha '-' arm is unreachable: land's
+  # peek refuses a flag-shaped value first, so only its charset arm has a cell.)
+  _rw_refuse() {  # <label> <expected rc> <needle> <verb> [args…] — run the verb in $D; it must refuse with that line
+    _rwl="$1"; _rwc="$2"; _rwn="$3"; shift 3
+    if OUT="$( cd "$D" && sh "$VERIFY" "$@" 2>&1 )"; then RC=0; else RC=$?; fi
+    if [ "$RC" = "$_rwc" ] && _has "$OUT" "$_rwn"; then
+      pass "$_rwl: refused with its own line (rc=$RC)"
+    else
+      fail "$_rwl: rc=$RC OUT=[$OUT]"
+    fi
+  }
+  D="$(mkrepo)" || { fail "fixture build (SAST-RW)"; return 1; }
+  _rw_refuse "SAST-RW-RECORD-ASHA" 2 "record: invalid --approved-sha '-x' (must not start with '-')" \
+    record --no-push --approved-sha -x --approved-by b --gate g --rung r --class Ordinary --scope s --token t
+  _rw_refuse "SAST-RW-TRACE-REF" 2 "trace: arguments must not start with '-' (got '-x')" trace --ref -x
+  _rw_refuse "SAST-RW-TRACE-FROM" 2 "trace: arguments must not start with '-' (got '-y')" trace --ref abc --from -y
+  _rw_refuse "SAST-RW-TRACE-RECENT" 2 "trace: --recent takes a positive integer" trace --recent 5x
+  _rw_refuse "SAST-RW-CHECK-REF" 2 "check: invalid --ref '-x' (must not start with '-')" check --ref -x --approved-sha abc
+  _rw_refuse "SAST-RW-CHECK-ASHA" 2 "check: invalid --approved-sha '-x' (must not start with '-')" check --ref feat --approved-sha -x
+  _rw_refuse "SAST-RW-ACT-REF" 2 "actuate: invalid --ref '-x' (must not start with '-')" actuate --ref -x --approved-sha abc
+  _rw_refuse "SAST-RW-ACT-ASHA" 2 "actuate: invalid --approved-sha '-x' (must not start with '-')" actuate --ref feat --approved-sha -x
+  _rw_refuse "SAST-RW-ACT-REF-CHARS" 2 "actuate: invalid --ref 'a;b' (allowed chars: A-Za-z0-9._/-)" actuate --ref 'a;b' --approved-sha abc
+  _rw_refuse "SAST-RW-ACT-ASHA-CHARS" 2 "actuate: invalid --approved-sha 'a b' (allowed chars: A-Za-z0-9._/-)" actuate --ref feat --approved-sha 'a b'
+  rm -rf "$D" 2>/dev/null || true
+  _mkland_fx || { fail "SAST-RW-LAND: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  _LREF='-x'; _land_run "$_lg" reviewer-login SeaBrad72; _LREF=""
+  if [ "$RC" = 2 ] && [ ! -f "$LDMARK" ] && _has "$OUT" "land: invalid --ref '-x' (must not start with '-')"; then
+    pass "SAST-RW-LAND-REF: land --ref -x -> rc 2 with its own line, merge never ran"
+  else fail "SAST-RW-LAND-REF: rc=$RC OUT=[$OUT]"; fi
+  _LREF='a;b'; _land_run "$_lg" reviewer-login SeaBrad72; _LREF=""
+  if [ "$RC" = 2 ] && [ ! -f "$LDMARK" ] && _has "$OUT" "land: invalid --ref 'a;b' (allowed chars: A-Za-z0-9._/-)"; then
+    pass "SAST-RW-LAND-REF-CHARS: land --ref 'a;b' -> rc 2 with its own line, merge never ran"
+  else fail "SAST-RW-LAND-REF-CHARS: rc=$RC OUT=[$OUT]"; fi
+  _land_run "$_lg" reviewer-login SeaBrad72 --approved-sha 'a;b'
+  if [ "$RC" = 2 ] && [ ! -f "$LDMARK" ] && _has "$OUT" "land: invalid --approved-sha 'a;b' (allowed chars: A-Za-z0-9._/-)"; then
+    pass "SAST-RW-LAND-ASHA-CHARS: land --approved-sha 'a;b' -> rc 2 with its own line, merge never ran"
+  else fail "SAST-RW-LAND-ASHA-CHARS: rc=$RC OUT=[$OUT]"; fi
+  _land_run "$_lg" reviewer-login SeaBrad72 --scope "PR #12x"
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && _has "$OUT" "is not a PR id"; then
+    pass "SAST-RW-LAND-SCOPE: land --scope 'PR #12x' -> rc 1 'is not a PR id', NO note, merge never ran"
+  else fail "SAST-RW-LAND-SCOPE: rc=$RC OUT=[$OUT]"; fi
+  _LREF=feat; _land_run "$_lg" reviewer-login SeaBrad72; _LREF=""
+  if [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && _has "$OUT" "the PR judged must be the PR merged"; then
+    pass "SAST-RW-LAND-REFNUM: land --ref feat (not a PR number) with --scope PR #260 -> rc 1, NO note, merge never ran"
+  else fail "SAST-RW-LAND-REFNUM: rc=$RC OUT=[$OUT]"; fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+
+  # MTC1-MTC3 (SWAS-577) — the in-process matcher (_has) and the rc-aware wrapper (_grepx). Each cell carries its own mutant, applied as a function redefined in a subshell (no knob).
+  _mtc_nl='
+'
+  _mtc_h="line one${_mtc_nl}line two"
+  _mtc_fn=$(sed -n '/^_has() {/,/^}/p' "$0")
+  _mtc_mut=$(printf '%s\n' "$_mtc_fn" | sed 's/\*"\$2"\*) return 0/*) return 0/')
+  if _has "abc def" def && ! _has "abc def" xyz && _has "abc" "" && ! _has "" x && _has "$_mtc_h" "one${_mtc_nl}line" && ! _has "$_mtc_h" "two${_mtc_nl}line"; then
+    if [ -n "$_mtc_fn" ] && [ "$_mtc_mut" != "$_mtc_fn" ] && ( eval "$_mtc_mut"; _has "abc def" xyz ); then pass "MTC1 — _has answers present, absent, empty-needle and multi-line questions, and an always-true mutant made by a sed of the real function text flips the absent question (the cell has teeth)"
+    else fail "MTC1 — the always-true mutant of _has did not apply or did not flip the absent-needle question"; fi
+  else fail "MTC1 — _has answered a present/absent/empty/multi-line question wrongly"; fi
+  _mtc_fn=$(sed -n '/^_has() {/,/^}/p' "$0")
+  _mtc_want="y1${_mtc_nl}n1${_mtc_nl}y2${_mtc_nl}n2${_mtc_nl}y3${_mtc_nl}n3${_mtc_nl}y4${_mtc_nl}n4"
+  for _mtc_sh in sh dash bash; do
+    if ! command -v "$_mtc_sh" >/dev/null 2>&1; then echo "SKIP: MTC2[$_mtc_sh] — the shell is absent here"; continue; fi
+    _mtc_o=$("$_mtc_sh" -c "$_mtc_fn
+_has 'x a\\b y' 'a\\b' && echo y1
+_has 'x ab y' 'a\\b' || echo n1
+_has 'x * y' '*' && echo y2
+_has 'x ab y' '*' || echo n2
+_has 'x ? y' '?' && echo y3
+_has 'xy' '?' || echo n3
+_has 'x [ y' '[' && echo y4
+_has 'x a y' '[a]' || echo n4" 2>&1)
+    if [ -n "$_mtc_fn" ] && [ "$_mtc_o" = "$_mtc_want" ]; then pass "MTC2[$_mtc_sh] — _has treats a backslash and the glob characters * ? [ literally"
+    else fail "MTC2[$_mtc_sh] — _has mishandled a backslash or glob needle (got: $_mtc_o)"; fi
+  done
+  _mtc_d=$(mktemp -d)
+  mkdir -p "$_mtc_d/bin2" "$_mtc_d/bin3"
+  printf '#!/bin/sh\nexit 2\n' > "$_mtc_d/bin2/grep"; chmod +x "$_mtc_d/bin2/grep"
+  printf '#!/bin/sh\nkill -TERM $$\n' > "$_mtc_d/bin3/grep"; chmod +x "$_mtc_d/bin3/grep"
+  _mtc_r=$( _unv_f="$_mtc_d/m0"; _grepx abc -q b && echo a0 || echo a$?; _grepx abc -q z && echo b0 || echo b$? )
+  if [ "$_mtc_r" = "a0${_mtc_nl}b1" ] && [ ! -s "$_mtc_d/m0" ]; then pass "MTC3a — _grepx passes grep's rc 0 and rc 1 through and marks nothing"
+  else fail "MTC3a — _grepx altered grep's own answer (got: $_mtc_r)"; fi
+  for _mtc_s in 2:bin2 143:bin3; do
+    _mtc_rc=${_mtc_s%%:*}; _mtc_b=${_mtc_s#*:}
+    if ( _unv_f="$_mtc_d/m$_mtc_b"; PATH="$_mtc_d/$_mtc_b:$PATH"; export PATH
+         if _mtc_x=$(_grepx abc -q b 2>&1); then :; fi
+         _has "$_mtc_x" "UNVERIFIED (grep rc=$_mtc_rc)" && [ -s "$_unv_f" ] && ! _unv_end >/dev/null ); then
+      pass "MTC3[$_mtc_b] — a grep that exits $_mtc_rc inside \$( ) prints UNVERIFIED (grep rc=$_mtc_rc), marks the run, and _unv_end reads non-zero"
+    else fail "MTC3[$_mtc_b] — an unanswered grep (rc $_mtc_rc) was not marked or not read back by _unv_end"; fi
+  done
+  _mtc_gx=$(sed -n '/^_grepx() {/,/^}/p' "$0")
+  _mtc_gm=$(printf '%s\n' "$_mtc_gx" | sed '/>> "\$_unv_f"/d')
+  if [ -n "$_mtc_gx" ] && [ "$_mtc_gm" != "$_mtc_gx" ] && ( _unv_f="$_mtc_d/mm"; : > "$_unv_f"; PATH="$_mtc_d/bin2:$PATH"; export PATH; eval "$_mtc_gm"
+       if _mtc_x=$(_grepx abc -q b 2>&1); then :; fi
+       _unv_end >/dev/null ); then pass "MTC3m — with the marker write deleted from the real _grepx text (a sed), _unv_end reads clean, so MTC3's marker assertion has teeth"
+  else fail "MTC3m — the marker-drop mutant of _grepx did not apply or still read non-zero: MTC3 pins nothing"; fi
+  # MTC6 (SWAS-577, S-LOW-1): a marker file that is missing or unnamed reads RED, never clean; the mutant is the real _unv_end text with its existence test turned off
+  _mtc_ue=$(sed -n '/^_unv_end() {/,/^}/p' "$0")
+  _mtc_um=$(printf '%s\n' "$_mtc_ue" | sed 's/^  if \[ -z .*# UNVMISS$/  if false; then/')
+  if [ -n "$_mtc_ue" ] && [ "$_mtc_um" != "$_mtc_ue" ] && ( _unv_f="$_mtc_d/gone"; rm -f "$_unv_f"; ! _unv_end >/dev/null ) && ( _unv_f=""; ! _unv_end >/dev/null ) \
+     && ( _unv_f="$_mtc_d/gone"; rm -f "$_unv_f"; eval "$_mtc_um"; _unv_end >/dev/null ); then pass "MTC6 — _unv_end reads RED on a missing or unnamed marker file, and the real text with its existence test off reads clean (the cell has teeth)"
+  else fail "MTC6 — _unv_end did not red on a missing marker, or its mutant did not apply or still read non-zero"; fi
+  rm -rf "$_mtc_d"
+
+  # =====================================================================================
+  # SWAS-537 (S4 of SWAS-382, S3-SEC-2): land and actuate merge only when a COMPLETED run of the CI workflow on the EXACT
+  # approved head graded at least the light set. The forge is the default `gh` shim ($EVD/gh); each cell flips $EVD/mode for ITS
+  # run. A refusal is asserted on its OWN line, and (LE7) a land refusal leaves NO note, local or on origin: the leg sits
+  # before the record. Mutants for these cells run on a sed-rewritten throwaway copy, never a switch in the gate.
+  # =====================================================================================
+  _le_land() {  # <label> <forge-mode> <merge|refuse> <needle> : one control-plane land on a fresh fixture
+    if [ "$3" = refuse ] && [ "$(_fxkind)" = adopter ]; then _fxskip "$1"; return 0; fi
+    _mkland_fx || { fail "$1: fixture build"; return 0; }
+    _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+    printf '%s' "$2" > "$EVD/mode"; _land_run "$_lg" reviewer-login SeaBrad72; printf light > "$EVD/mode"
+    if [ "$3" = merge ]; then
+      if [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ -n "$(_land_onote)" ]; then pass "$1: land merged, the GO note is on origin"
+      else fail "$1: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) OUT=[$OUT]"; fi
+    elif [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+         && _has "$OUT" "LAND REFUSED (exact-head CI evidence): $4"; then
+      pass "$1: land refused on '$4', NO note (local or origin), merge never ran"
+    else fail "$1: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) local=[$(_land_note)] origin=[$(_land_onote)] OUT=[$OUT]"; fi
+    rm -rf "$LDR" "$_lg" 2>/dev/null || true
+  }
+  _le_act() {  # <label> <forge-mode> <merge|refuse> <needle> : one actuate on a fresh fixture
+    if [ "$3" = refuse ] && [ "$(_fxkind)" = adopter ]; then _fxskip "$1"; return 0; fi
+    D="$(mkrepo)" || { fail "$1: fixture build"; return 0; }
+    X="$(cat "$D/.X")"; write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+    printf '%s' "$2" > "$EVD/mode"; run_actuate "$VERIFY" "$D" feat "$X" "$(_act_stub "$D" "$X")"; printf light > "$EVD/mode"
+    if [ "$3" = merge ]; then
+      if [ "$RC" = 0 ] && [ -f "$D/.invoked" ]; then pass "$1: actuate merged"; else fail "$1: rc=$RC OUT=[$OUT]"; fi
+    elif [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "ACTUATE REFUSED (exact-head CI evidence): $4"; then
+      pass "$1: actuate refused on '$4', merge stub never ran"
+    else fail "$1: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"; fi
+    rm -rf "$D" 2>/dev/null || true
+  }
+  _le_land "LE3-land-light-run-exact-head" light merge ""
+  _le_land "LE1-land-draft" draft refuse "draft"
+  _le_land "LE2-land-cheap-run" cheap refuse "needed-job-not-success:changes"
+  _le_land "LE4-land-stale-head" stale refuse "stale-head"
+  _le_land "LE5-land-no-gate-job" nogate refuse "no-gate-job"
+  _le_land "LE6a-land-api-error" apierr refuse "forge-unreadable"
+  _le_land "LE6b-land-partial-page" partial refuse "forge-unreadable"
+  _le_land "LE6c-land-non-json" nonjson refuse "forge-unreadable"
+  _le_land "LE6d-land-pr-unreadable" apierr-pr refuse "forge-unreadable"
+  _le_land "LE9-land-run-pending" pending refuse "run-not-completed"
+  _le_land "LE9b-land-no-run-yet" norun refuse "no-graded-run"
+  _le_act "LE8a-actuate-light-run" light merge ""
+  _le_act "LE8b-actuate-cheap-run" cheap refuse "needed-job-not-success:changes"
+  _le_act "LE8c-actuate-draft" draft refuse "draft"
+  _le_act "LE8d-actuate-stale-head" stale refuse "stale-head"
+  _le_act "LE8e-actuate-api-error" apierr refuse "forge-unreadable"
+  _le_act "LE8f-actuate-pending" pending refuse "run-not-completed"
+  _le_act "LE8g-actuate-needs-no-gate-job" nogate merge ""
+  # LE9: the refusal names the run and what to wait for.
+  if [ "$(_fxkind)" = adopter ]; then _fxskip "LE9"; else
+  _mkland_fx || { fail "LE9: fixture build"; return 1; }
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+  printf pending > "$EVD/mode"; _land_run "$_lg" reviewer-login SeaBrad72; printf light > "$EVD/mode"
+  if _has "$OUT" 'run 900 has not completed: wait for it to finish'; then pass "LE9: the pending-run refusal names the run and the wait"
+  else fail "LE9: OUT=[$OUT]"; fi
+  rm -rf "$LDR" "$_lg" 2>/dev/null || true
+  fi
+  # LE10: the leg is three production functions that read no environment variable, parse no flag and emit no bypass.
+  _le_fn="$(sed -n '/^pv_ev_read()/,/^}/p;/^pv_ev_read_in()/,/^}/p;/^pv_ci_evidence()/,/^}/p' "$VERIFY")"
+  _le_bad=0
+  case $_le_fn in
+    *--admin*|*'$'[A-Z]*|*'${'[A-Z]*|*'export '*|*getopts*|*'case "$1" in'*|*environ*) _le_bad=1 ;;
+  esac
+  if [ -n "$_le_fn" ] && [ "$(_grepx "$_le_fn" -c '^pv_')" = 3 ] \
+     && [ "$_le_bad" = 0 ]; then
+    pass "LE10: the evidence leg reads no environment variable, adds no flag and emits no --admin"
+  else fail "LE10: the evidence leg's source carries an env read, a flag parse or --admin"; fi
+
+  # =====================================================================================
+  # SWAS-537 FIX ROUND. H1: the leg is scoped to the KIT pipeline, keyed on two facts read from the RUNNING checkout (the copy of
+  # the gate under test, `$(dirname "$0")/..`): conformance/ci-gate-state.sh exists, and .github/workflows/ci.yml carries a `gate:`
+  # job. Both -> the leg runs; neither (an adopter) -> ONE N/A line and the merge proceeds; exactly one -> REFUSED
+  # `kit-pipeline-half-present`, so deleting one fact never silently turns the leg off. L1 (a fork head), the Security LOW (`--ref`
+  # must be the PR's head branch) and no-pr-scope get cells too. A cell with a trailing sed script is a MUTANT: the script rewrites a
+  # throwaway COPY of the gate (never a switch in the shipped file) and the cell passes only if the SAME assertion then FAILS.
+  # =====================================================================================
+  _le_pvcopy() {  # <dir> <decider 0|1> <gate-job 0|1> [<marker 0|1> = the decider's] : a gate COPY in a kit-or-adopter layout; the classifier is always beside it
+    mkdir -p "$1/scripts" "$1/conformance" "$1/.github/workflows"
+    cp "$VERIFY" "$1/scripts/promotion-verify.sh"
+    cp "$(dirname "$VERIFY")/../conformance/ci-classify-changes.sh" "$1/conformance/ci-classify-changes.sh"
+    if [ "$2" = 1 ]; then : > "$1/conformance/ci-gate-state.sh"; fi
+    if [ "${4:-$2}" = 1 ]; then : > "$1/conformance/adopter-census.sh"; fi
+    if [ "$3" = 1 ]; then printf 'jobs:\n  gate:\n    runs-on: x\n  changes:\n    needs: gate\n' > "$1/.github/workflows/ci.yml"
+    else printf 'jobs:\n  changes:\n    runs-on: x\n' > "$1/.github/workflows/ci.yml"; fi
+  }
+  _le_mutate() {  # <copy-of-gate> <sed-script> : rewrite the copy in place; rc 1 when the script changed nothing
+    cp "$1" "$1.orig"; sed "$2" "$1.orig" > "$1"; chmod +x "$1"
+    if cmp -s "$1" "$1.orig"; then return 1; fi
+    return 0
+  }
+  _le_land_ok() {  # <merge|refuse> <needle> : the assertion every land cell makes on RC / OUT / the marker / the notes
+    if [ "$1" = merge ]; then
+      [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ -n "$(_land_onote)" ] && _has "$OUT" "$2"
+    else
+      [ "$RC" = 1 ] && [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ] \
+        && _has "$OUT" "LAND REFUSED (exact-head CI evidence): $2"
+    fi
+  }
+  _le_act_ok() {  # <merge|refuse> <needle> : the same for actuate (the stub is $D/.invoked)
+    if [ "$1" = merge ]; then
+      [ "$RC" = 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" "$2"
+    else
+      [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "ACTUATE REFUSED (exact-head CI evidence): $2"
+    fi
+  }
+  _le_judge() {  # <label> <mutant 0|1> <assertion rc> : a mutant cell passes only when its assertion FAILED
+    if [ "$2" = 1 ]; then
+      if [ "$3" = 0 ]; then fail "$1: the mutant SURVIVED (the cell passed against the broken gate)"; else pass "$1: the mutant is killed (the cell fails against it)"; fi
+    elif [ "$3" = 0 ]; then pass "$1"
+    else fail "$1: rc=$RC OUT=[$OUT]"; fi
+  }
+  _le_lay() {  # <label> <decider 0|1> <gate-job 0|1> <forge-mode> <merge|refuse> <needle> [<sed-script> = a mutant] [<repo decider> <repo gate-job> = the copy's] [<copy marker> = the decider's] [<repo marker> = the repo decider's] : one land through a gate COPY
+    _mkland_fx || { fail "$1: fixture build"; return 0; }
+    _fxlay "$LDR/c" "${8:-$2}" "${9:-$3}" "${11:-${8:-${10:-$2}}}"
+    _lyv="$VERIFY"; _lym=0
+    _le_pvcopy "$LDR/pv" "$2" "$3" "${10:-$2}"
+    if [ -n "${7:-}" ]; then
+      _lym=1
+      if ! _le_mutate "$LDR/pv/scripts/promotion-verify.sh" "$7"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$LDR" 2>/dev/null || true; return 0; fi
+    fi
+    _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+    VERIFY="$LDR/pv/scripts/promotion-verify.sh"
+    printf '%s' "$4" > "$EVD/mode"; _land_run "$_lg" reviewer-login SeaBrad72; printf light > "$EVD/mode"
+    VERIFY="$_lyv"
+    if _le_land_ok "$5" "$6"; then _lyr=0; else _lyr=1; fi
+    _le_judge "$1" "$_lym" "$_lyr"
+    rm -rf "$LDR" "$_lg" 2>/dev/null || true
+  }
+  _le_actx() {  # <label> <forge-mode> <merge|refuse> <needle> <note-scope|-> <ref> [<sed-script> = a mutant] : one actuate; ref `feat` is the PR's head branch
+    if [ "$3" = refuse ] && [ -z "${7:-}" ] && [ "$(_fxkind)" = adopter ]; then _fxskip "$1"; return 0; fi
+    D="$(mkrepo)" || { fail "$1: fixture build"; return 0; }
+    X="$(cat "$D/.X")"; write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+    if [ "$5" != - ]; then
+      printf '%s\n' "record: promotion GO (fabricated fixture note)" "approved-sha: $X" "approved-by: Reviewer B [authenticated: github-review]" \
+        "gate: release-candidate" "rung: Release candidate" "change-class: Ordinary" "scope: $5" "approval-token: \"GO: merge #260\"" \
+        "basis: reviewer APPROVE" "recorded-at: fixture" | ( cd "$D" && git notes --ref=promotions add -f -F - "$X" >/dev/null 2>&1 )
+    fi
+    if [ "$6" != feat ]; then git -C "$D" branch "$6" "$X" >/dev/null 2>&1; fi
+    _axg="$VERIFY"; _axm=0
+    if [ -n "${7:-}" ]; then
+      _axm=1; _le_pvcopy "$D/pv" 1 1; _fxlay "$D" 1 1   # the copy is a kit layout, whatever tree this runs in: so is its repository
+      if ! _le_mutate "$D/pv/scripts/promotion-verify.sh" "$7"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$D" 2>/dev/null || true; return 0; fi
+      _axg="$D/pv/scripts/promotion-verify.sh"
+    fi
+    printf '%s' "$2" > "$EVD/mode"; run_actuate "$_axg" "$D" "$6" "$X" "$(_act_stub "$D" "$X")"; printf light > "$EVD/mode"
+    if _le_act_ok "$3" "$4"; then _axr=0; else _axr=1; fi
+    _le_judge "$1" "$_axm" "$_axr"
+    rm -rf "$D" 2>/dev/null || true
+  }
+  # SWAS-730: the two evidence reads ask for 30 per page and page (`--paginate`). A 65-job run answered HTTP 502 on every try at 100 per page.
+  # The default forge records each evidence call's argv; one light land through the gate (or a COPY, for a mutant) is read back for the line
+  # of the read named (`runs`: the workflow-run listing, `jobs`: a run's jobs). A cell with a trailing sed script is a MUTANT, as above.
+  _le_pin() {  # <label> <runs|jobs> [<sed-script> = a mutant] : the argv of that read must carry per_page=30 and --paginate
+    if [ -z "${3:-}" ] && [ "$(_fxkind)" = adopter ]; then _fxskip "$1"; return 0; fi
+    _mkland_fx || { fail "$1: fixture build"; return 0; }
+    _pyv="$VERIFY"; _pym=0
+    if [ -n "${3:-}" ]; then
+      _pym=1; _le_pvcopy "$LDR/pv" 1 1; _fxlay "$LDR/c" 1 1
+      if ! _le_mutate "$LDR/pv/scripts/promotion-verify.sh" "$3"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$LDR" 2>/dev/null || true; return 0; fi
+      VERIFY="$LDR/pv/scripts/promotion-verify.sh"
+    fi
+    _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"
+    rm -f "$EVD/argv"; printf light > "$EVD/mode"; _land_run "$_lg" reviewer-login SeaBrad72
+    VERIFY="$_pyv"
+    case "$2" in runs) _pyk='/actions/workflows/' ;; *) _pyk='/actions/runs/' ;; esac
+    _pyl=""; if _pyl="$(grep -F -e "$_pyk" "$EVD/argv" 2>/dev/null)"; then :; fi
+    if [ -z "$_pyl" ] && [ "$_pym" = 1 ]; then   # a read never reached is not a kill: only a recorded line that fails the check is
+      fail "$1: the mutant's land never reached the $2 read"; rm -rf "$LDR" "$_lg" 2>/dev/null || true; return 0
+    fi
+    _pyn="$(printf '%s\n' "$_pyl" | grep -c . || true)"
+    # exactly one recorded line for the read; the page size is matched whole (a trailing space, so 300 is not 30) and `--paginate` follows it
+    if [ "$_pyn" = 1 ] && _has "$_pyl" 'per_page=30 --paginate '; then _pyr=0; else _pyr=1; fi
+    OUT="the $2 read asked ($_pyn line(s)): [$_pyl]"
+    _le_judge "$1" "$_pym" "$_pyr"
+    rm -rf "$LDR" "$_lg" 2>/dev/null || true
+  }
+  _le_pin "PG1-runs-read-asks-30-per-page-and-paginates" runs
+  _le_pin "PG2-jobs-read-asks-30-per-page-and-paginates" jobs
+  _le_pin "PGm1-mutant-runs-read-back-to-100" runs 's/event=pull_request&per_page=30"/event=pull_request\&per_page=100"/'
+  _le_pin "PGm2-mutant-jobs-read-back-to-100" jobs 's/filter=latest&per_page=30"/filter=latest\&per_page=100"/'
+  _le_pin "PGm3-mutant-runs-read-stops-paginating" runs "s/--paginate --jq '.workflow_runs/--jq '.workflow_runs/"
+  _le_pin "PGm4-mutant-jobs-read-stops-paginating" jobs "s/--paginate --jq '.jobs/--jq '.jobs/"
+  _le_pin "PGm5-mutant-jobs-read-asks-300-per-page" jobs 's/filter=latest&per_page=30"/filter=latest\&per_page=300"/'
+  # A later page of the jobs read that fails (the forge answers a first page, then a non-zero exit) is unreadable, never a short list of jobs.
+  _le_land "LE6e-land-jobs-later-page-fails" jobspartial refuse "forge-unreadable"
+  _le_land "LE6f-land-runs-later-page-fails" runspartial refuse "forge-unreadable"
+  _le_act "LE8i-actuate-jobs-later-page-fails" jobspartial refuse "forge-unreadable"
+  _le_lay "LE6em1-mutant-jobs-failure-ignored" 1 1 jobspartial refuse "forge-unreadable" 's#\(jobs\.nd" 2>/dev/null\) || return 0#\1#'
+  _le_lay "LE6em2-mutant-runs-failure-ignored" 1 1 runspartial refuse "forge-unreadable" 's#\(runs\.nd" 2>/dev/null\) || return 0#\1#'
+  _NA='exact-head CI evidence: N/A (not the kit'"'"'s own CI pipeline)'
+  # H1: the four layouts, then one mutant per branch (and one per fact). Fix round 2: the layout is read at TWO locations (the copy's own
+  # checkout, and the repository the verb runs in: _le_lay gives the land repository the copy's layout unless told otherwise), so the
+  # cases are keyed `<script checkout>/<repository>`.
+  _le_lay "H1a-adopter-layout-na" 0 0 cheap merge "$_NA"
+  _le_lay "H1b-kit-layout-cheap-run-refused" 1 1 cheap refuse "needed-job-not-success:changes"
+  _le_lay "H1c-half-decider-only-refused" 1 0 light refuse "kit-pipeline-half-present" "" "" "" 0
+  # SWAS-641: a third, kit-only fact (the marker conformance/adopter-census.sh). An adopter's own `gate:` job (no decider, no marker)
+  # reads adopter and proceeds, against a CHEAP forge so a gate that wrongly ran the leg would refuse. Every other combination is half.
+  _le_lay "H1d-adopter-own-gate-job-no-decider-no-marker-na" 0 1 cheap merge "$_NA"
+  _le_lay "H1e-half-marker-only-refused" 0 0 light refuse "kit-pipeline-half-present" "" "" "" 1
+  _le_lay "H1f-half-decider-and-marker-no-gate-job-refused" 1 0 light refuse "kit-pipeline-half-present"
+  _le_lay "H1g-half-decider-and-gate-job-no-marker-refused" 1 1 light refuse "kit-pipeline-half-present" "" "" "" 0
+  _le_lay "H1h-half-marker-and-gate-job-no-decider-refused" 0 1 light refuse "kit-pipeline-half-present" "" "" "" 1
+  _le_lay "H1m1-mutant-adopter-branch-runs-the-leg" 0 0 cheap merge "$_NA" 's/^    adopter\/adopter) _pv_ev_layout=adopter ;;/    adopter\/adopter) _pv_ev_layout=kit ;;/'
+  _le_lay "H1m2-mutant-kit-branch-skips-the-leg" 1 1 cheap refuse "needed-job-not-success:changes" 's/^    kit\/kit)         _pv_ev_layout=kit ;;/    kit\/kit)         _pv_ev_layout=adopter ;;/'
+  _le_lay "H1m3-mutant-half-branch-skips-the-leg" 1 0 light refuse "kit-pipeline-half-present" 's/^    half\/\*|\*\/half)   _pv_ev_layout=refuse;/    half\/*|*\/half)   _pv_ev_layout=adopter;/'
+  _le_lay "H1m4-mutant-decider-fact-never-seen" 1 1 cheap refuse "needed-job-not-success:changes" 's#/conformance/ci-gate-state.sh"#/conformance/nope.sh"#'
+  _le_lay "H1m5-mutant-gate-job-fact-never-seen" 1 1 cheap refuse "needed-job-not-success:changes" "s#grep -q '^  gate:#grep -q '^  nogate:#"
+  _le_lay "H1m6-mutant-marker-fact-never-seen" 1 1 cheap refuse "needed-job-not-success:changes" 's#/conformance/adopter-census.sh"#/conformance/nope2.sh"#'
+  _le_lay "H1m7-mutant-marker-dropped-from-the-case-key" 1 1 light refuse "kit-pipeline-half-present" 's/case "\$_pl_dec\$_pl_mark\$_pl_gate" in/case "${_pl_dec}1\$_pl_gate" in/' "" "" 0
+  _le_lay "H1m8-mutant-old-two-fact-reading-of-001-restored" 0 1 cheap merge "$_NA" 's/^    000|001) printf/    000) printf/'
+  # SWAS-864: h2-hermetic is a kit-only required job (PG_NEEDED). An adopter layout stops at the N/A line before any job list is read, so a run with no
+  # h2-hermetic job is never refused for it (H2-LD-a: the merge carries the N/A line, and OUT, still the land's, never names the token); the kit layout is refused for it (H2-LD-b).
+  OUT=""
+  _le_lay "H2-LD-a-adopter-layout-run-without-h2-hermetic-na" 0 0 noh2 merge "$_NA"
+  if _has "$OUT" 'needed-job-missing:h2-hermetic'; then fail "H2-LD-a-not-refused: an adopter layout was refused for the missing h2-hermetic job: OUT=[$OUT]"
+  else pass "H2-LD-a-not-refused: an adopter layout's land never names needed-job-missing:h2-hermetic"; fi
+  _le_lay "H2-LD-b-kit-layout-run-without-h2-hermetic-refused" 1 1 noh2 refuse "needed-job-missing:h2-hermetic"
+  # LM (fix round 2, closes a fail-open): the layout is read at the script's own checkout AND in the repository the verb runs in, and ANY
+  # disagreement refuses `layout-mismatch`. A copy or symlink of the gate run inside another repository used to read "adopter" from its own
+  # directory (against a draft forge: N/A, rc 0, merged). Each cell runs actuate and the evidence verb through a gate COPY that lives
+  # OUTSIDE the repository, against a DRAFT forge, so a gate that trusts either location alone merges (or says N/A) and the cell goes red.
+  _le_lname() { case "$1$2$3" in 111) printf kit ;; 000|001) printf adopter ;; *) printf half ;; esac; }   # <decider> <marker> <gate-job>
+  _le_lm2() {  # <label> <copy decider> <copy gate-job> <repo decider> <repo gate-job> <token> [<sed-script> = a mutant] [<copy marker> = the copy's decider] [<repo marker> = the repo's decider]
+    D="$(mkrepo)" || { fail "$1: fixture build"; return 0; }
+    X="$(cat "$D/.X")"; write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+    _fxlay "$D" "$4" "$5" "${9:-$4}"
+    _lmo="$(mktemp -d)"; _le_pvcopy "$_lmo" "$2" "$3" "${8:-$2}"; _lmg="$_lmo/scripts/promotion-verify.sh"; _lmm=0
+    if [ -n "${7:-}" ]; then
+      _lmm=1
+      if ! _le_mutate "$_lmg" "$7"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$D" "$_lmo" 2>/dev/null || true; return 0; fi
+    fi
+    _lmn="reads $(_le_lname "$2" "${8:-$2}" "$3") and the repository it operates on reads $(_le_lname "$4" "${9:-$4}" "$5")"
+    printf draft > "$EVD/mode"
+    run_actuate "$_lmg" "$D" feat "$X" "$(_act_stub "$D" "$X")"
+    if [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "ACTUATE REFUSED (exact-head CI evidence): $6" && _has "$OUT" "$_lmn"; then _lmr=0; else _lmr=1; fi
+    _lmao="$OUT"
+    if OUT="$( cd "$D" && sh "$_lmg" evidence --pr 260 --approved-sha "$X" 2>&1 )"; then RC=0; else RC=$?; fi
+    if [ "$_lmr" = 0 ] && { [ "$RC" != 1 ] || ! _has "$OUT" "EVIDENCE REFUSED (exact-head CI evidence): $6" || ! _has "$OUT" "$_lmn"; }; then _lmr=1; fi
+    printf light > "$EVD/mode"
+    OUT="actuate: $_lmao || evidence: $OUT"
+    _le_judge "$1" "$_lmm" "$_lmr"
+    rm -rf "$D" "$_lmo" 2>/dev/null || true
+  }
+  _le_nogit() {  # <label> [<sed-script> = a mutant] : the evidence verb run from a directory that is NOT inside any git repository must refuse, never N/A
+    _lgn="$(mktemp -d)"; _lgo="$(mktemp -d)"; _le_pvcopy "$_lgo" 1 1; _lgm=0
+    if [ -n "${2:-}" ]; then
+      _lgm=1
+      if ! _le_mutate "$_lgo/scripts/promotion-verify.sh" "$2"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$_lgn" "$_lgo" 2>/dev/null || true; return 0; fi
+    fi
+    if OUT="$( cd "$_lgn" && GIT_CEILING_DIRECTORIES="$(dirname "$_lgn")" sh "$_lgo/scripts/promotion-verify.sh" evidence --pr 260 --approved-sha 1111111111111111111111111111111111111111 2>&1 )"; then RC=0; else RC=$?; fi
+    if [ "$RC" = 1 ] && _has "$OUT" "EVIDENCE REFUSED (exact-head CI evidence): forge-unreadable" && _has "$OUT" "the repository it operates on reads none"; then _lgr=0; else _lgr=1; fi
+    _le_judge "$1" "$_lgm" "$_lgr"
+    rm -rf "$_lgn" "$_lgo" 2>/dev/null || true
+  }
+  # (a) a gate copy that looks like an adopter's, run inside a kit-layout repository; (b) a kit-layout gate run inside an adopter repository;
+  # (c) a half repository; land (the record-first verb) for (a) and (b) through _le_lay, actuate and evidence through _le_lm2.
+  _le_lay "LM-a-land-adopter-copy-in-kit-repo" 0 0 draft refuse "layout-mismatch" "" 1 1
+  _le_lay "LM-b-land-kit-copy-in-adopter-repo" 1 1 draft refuse "layout-mismatch" "" 0 0
+  _le_lm2 "LM-a-actuate-and-evidence-adopter-copy-in-kit-repo" 0 0 1 1 layout-mismatch
+  _le_lm2 "LM-b-actuate-and-evidence-kit-copy-in-adopter-repo" 1 1 0 0 layout-mismatch
+  _le_lm2 "LM-c-actuate-and-evidence-repo-half" 1 1 0 1 kit-pipeline-half-present "" "" 1
+  _le_nogit "LM-d-evidence-outside-any-git-repository"
+  # (d) both kit: the leg runs (H1b above, and a forge draft read through two kit locations); both adopter: N/A (H1a above, EV5 below).
+  _le_lm2 "LM-m1-mutant-mismatch-branch-fails-open" 0 0 1 1 layout-mismatch 's/^    \*)               _pv_ev_layout=refuse; _pv_ev_lay_reason=layout-mismatch ;;/    *)               _pv_ev_layout=adopter ;;/'
+  _le_lm2 "LM-m2-mutant-repository-location-never-read" 0 0 1 1 layout-mismatch 's/_pl_repo="\$(pv_ev_lay_of "\$_pl_top")"/_pl_repo="$_pl_own"/'
+  _le_lm2 "LM-m3-mutant-script-location-always-kit" 0 0 1 1 layout-mismatch 's#^  _pl_own="\$(pv_ev_lay_of "\$(dirname -- "\$0")/..")"; _pl_repo=none#  _pl_own=kit; _pl_repo=none#'
+  _le_lm2 "LM-m4-mutant-script-location-always-adopter" 1 1 0 0 layout-mismatch 's#^  _pl_own="\$(pv_ev_lay_of "\$(dirname -- "\$0")/..")"; _pl_repo=none#  _pl_own=adopter; _pl_repo=none#'
+  _le_lm2 "LM-m5-mutant-half-repository-reads-adopter" 1 1 0 1 kit-pipeline-half-present 's/^    half\/\*|\*\/half)   _pv_ev_layout=refuse;/    half\/*|*\/half)   _pv_ev_layout=adopter;/' "" 1
+  _le_nogit "LM-m6-mutant-no-repository-reads-adopter" 's/^    \*\/none)          _pv_ev_layout=refuse;/    *\/none)          _pv_ev_layout=adopter;/'
+  # L1: a head in a fork refuses with its own token, and the mutant (the compare removed) lets it through.
+  _le_land "L1-land-fork-head" fork refuse "fork-head"
+  _le_act "L1-actuate-fork-head" fork refuse "fork-head"
+  _le_lay "L1m-mutant-fork-compare-removed" 1 1 fork refuse "fork-head" 's/if \[ "\$_pe_hrepo" != "\$_pe_repo" \]; then/if false; then/'
+  # Security LOW: actuate binds the PR's head.ref to --ref. The forge says the head branch is `feat`; the operator names feat2 (same sha).
+  _le_actx "L5-actuate-ref-mismatch" light refuse "ref-mismatch" - feat2
+  _le_actx "L5-actuate-ref-matches" light merge "" - feat
+  _le_actx "L5m-mutant-ref-bind-removed" light refuse "ref-mismatch" - feat2 's/if \[ -n "\$_pv_ev_xref" \] && /if false \&\& /'
+  # LE8h: an actuate note scoped to a branch names no PR; refused before any merge. The mutant (the scope guard removed) merges.
+  _le_actx "LE8h-actuate-branch-scope-no-pr" light refuse "no-pr-scope" "branch/x" feat
+  _le_actx "LE8hm-mutant-pr-scope-guard-removed" light refuse "no-pr-scope" "branch/x" feat 's/elif \[ -z "\$_pc_n" \]; then/elif false; then/'
+  # EV1-EV4: the read-only evidence verb. It writes nothing and merges nothing; exit 0 evidenced, 1 refused, 2 usage.
+  D="$(mkrepo)" || { fail "EV: fixture build"; return 1; }
+  X="$(cat "$D/.X")"
+  _le_ev() {  # <forge-mode> <args...> -> RC, OUT
+    printf '%s' "$1" > "$EVD/mode"; shift
+    if OUT="$( cd "$D" && sh "$VERIFY" evidence "$@" 2>&1 )"; then RC=0; else RC=$?; fi
+    printf light > "$EVD/mode"
+  }
+  if [ "$(_fxkind)" = adopter ]; then _fxskip "EV1/EV2/EV3"; else
+  _le_ev light --pr 260 --approved-sha "$X"
+  if [ "$RC" = 0 ] && _has "$OUT" 'OK: exact-head CI evidence on '; then pass "EV1: a light run on the exact head -> rc 0 and the OK line"
+  else fail "EV1: rc=$RC OUT=[$OUT]"; fi
+  _le_ev cheap --pr 260 --approved-sha "$X"
+  if [ "$RC" = 1 ] && _has "$OUT" 'EVIDENCE REFUSED (exact-head CI evidence): needed-job-not-success:changes'; then pass "EV2: a cheap run -> rc 1 and needed-job-not-success:changes"
+  else fail "EV2: rc=$RC OUT=[$OUT]"; fi
+  _le_ev nogate --pr 260 --approved-sha "$X"
+  if [ "$RC" = 1 ] && _has "$OUT" 'EVIDENCE REFUSED (exact-head CI evidence): no-gate-job'; then pass "EV3: a run with no gate job -> rc 1 and no-gate-job"
+  else fail "EV3: rc=$RC OUT=[$OUT]"; fi
+  fi
+  _le_ev light --pr 12x --approved-sha "$X"
+  if [ "$RC" = 2 ]; then pass "EV4a: a non-digit --pr -> rc 2"; else fail "EV4a: rc=$RC OUT=[$OUT]"; fi
+  _le_ev light --pr 260 --approved-sha "$(printf '%s' "$X" | LC_ALL=C tr 'a-f' 'A-F')"
+  if [ "$RC" = 2 ] && _grepx "$X" -q '[a-f]'; then pass "EV4b: an uppercase --approved-sha -> rc 2"; else fail "EV4b: rc=$RC OUT=[$OUT]"; fi
+  _le_ev light --pr 260
+  if [ "$RC" = 2 ]; then pass "EV4c: a missing --approved-sha -> rc 2"; else fail "EV4c: rc=$RC OUT=[$OUT]"; fi
+  # EV5 (H1): in an adopter layout (the gate's checkout AND the repository it runs in) the verb prints the N/A line and exits 0, whatever the forge says.
+  _le_pvcopy "$D/pva" 0 0
+  _fxlay "$D" 0 0
+  printf cheap > "$EVD/mode"
+  if OUT="$( cd "$D" && sh "$D/pva/scripts/promotion-verify.sh" evidence --pr 260 --approved-sha "$X" 2>&1 )"; then RC=0; else RC=$?; fi
+  printf light > "$EVD/mode"
+  if [ "$RC" = 0 ] && [ "$OUT" = "$_NA" ]; then pass "EV5: an adopter layout -> exactly the N/A line, rc 0"
+  else fail "EV5: rc=$RC OUT=[$OUT]"; fi
+  _fxlay "$D" 1 1
+  _le_pvcopy "$D/pvh" 1 0
+  if OUT="$( cd "$D" && sh "$D/pvh/scripts/promotion-verify.sh" evidence --pr 260 --approved-sha "$X" 2>&1 )"; then RC=0; else RC=$?; fi
+  if [ "$RC" = 1 ] && _has "$OUT" 'EVIDENCE REFUSED (exact-head CI evidence): kit-pipeline-half-present'; then pass "EV6: a half-present layout -> rc 1 and kit-pipeline-half-present"
+  else fail "EV6: rc=$RC OUT=[$OUT]"; fi
+  rm -rf "$D" 2>/dev/null || true
+
+  # SWAS-537 fix round 3, FXL: the general fixtures follow the layout of the gate under test, and this runs in EVERY kind of tree (the
+  # exported tree is adopter-shaped; here an adopter-layout gate COPY proves the same on a kit tree, the H1a shape). a: actuate through the
+  # copy, the repository planted like it -> the N/A line, the merge proceeds, even against a CHEAP forge. b: the OLD plant (both kit facts)
+  # against the same copy -> REFUSED layout-mismatch (what the exported tree hit): the discriminant partner of a. c: the land fixture.
+  _fxo="$(mktemp -d)"; _le_pvcopy "$_fxo" 0 0
+  if [ "$(_fxfacts "$_fxo")" = "0 0 0" ]; then pass "FXL-d: the layout facts are read at the gate checkout (an adopter-layout copy reads 0 0 0)"
+  else fail "FXL-d: an adopter-layout gate copy read '$(_fxfacts "$_fxo")', not '0 0 0'"; fi
+  D="$(mkrepo)" || { fail "FXL: fixture build"; return 1; }
+  X="$(cat "$D/.X")"; write_note "$D" "$X" "Reviewer B [authenticated: github-review]"
+  _fxlike "$D" "$_fxo"; printf cheap > "$EVD/mode"
+  run_actuate "$_fxo/scripts/promotion-verify.sh" "$D" feat "$X" "$(_act_stub "$D" "$X")"
+  if [ "$RC" = 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" "$_NA"; then pass "FXL-a: an adopter-layout gate copy + a fixture planted like it -> the N/A line, actuate merges"
+  else fail "FXL-a: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"; fi
+  rm -f "$D/.invoked"; _fxlay "$D" 1 1
+  run_actuate "$_fxo/scripts/promotion-verify.sh" "$D" feat "$X" "$(_act_stub "$D" "$X")"; printf light > "$EVD/mode"
+  if [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "layout-mismatch"; then pass "FXL-b: the same copy + a kit-planted fixture (the old plant) -> REFUSED layout-mismatch, no merge"
+  else fail "FXL-b: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"; fi
+  rm -rf "$D" 2>/dev/null || true
+  _mkland_fx || { fail "FXL-c: fixture build"; return 1; }
+  _fxlike "$LDR/c" "$_fxo"
+  _lg="$(_mkgh "$(_L_json "$_L_REV")" '"SeaBrad72"')"; _lyv="$VERIFY"; VERIFY="$_fxo/scripts/promotion-verify.sh"
+  printf cheap > "$EVD/mode"; _land_run "$_lg" reviewer-login SeaBrad72; printf light > "$EVD/mode"; VERIFY="$_lyv"
+  if [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ -n "$(_land_onote)" ] && _has "$OUT" "$_NA"; then pass "FXL-c: an adopter-layout gate copy + the land fixture planted like it -> the N/A line, land merges (note on origin)"
+  else fail "FXL-c: rc=$RC merged=$([ -f "$LDMARK" ] && echo yes || echo no) OUT=[$OUT]"; fi
+  rm -rf "$LDR" "$_lg" "$_fxo" 2>/dev/null || true
+
+  # FXS: the skip count is load-bearing. A skip call raises it by exactly one, and the note carries the number (0 prints as "0 SKIPPED").
+  _fxs0="$_FXSKIPS"; _fxskip "FXS-probe" >/dev/null; _fxs1="$_FXSKIPS"; _FXSKIPS="$_fxs0"
+  if [ "$_fxs1" = "$((_fxs0 + 1))" ] && [ "$(_fxskip_note 3)" = "(3 SKIPPED: not a kit tree, counted per skip line above)" ] \
+     && _has "$(_fxskip_note 0)" "0 SKIPPED"; then pass "FXS: a skip is counted once and the summary note carries the count"
+  else fail "FXS: skip count $_fxs0 -> $_fxs1, note '$(_fxskip_note 3)'"; fi
+  # FXS-kit: a kit tree never skips. The judge kills the mutant (a skip forced on a kit tree) and spares an adopter tree's.
+  _fxskip_ok() { [ "$1" != "1 1 1" ] || [ "$2" = 0 ]; }
+  if _fxskip_ok "1 1 1" 0 && ! _fxskip_ok "1 1 1" 2 && _fxskip_ok "0 0 0" 2; then pass "FXS-kit: the judge kills a skip forced on a kit tree and allows an adopter tree's"
+  else fail "FXS-kit: the judge does not separate a kit tree's skips from an adopter tree's"; fi
+  if _fxskip_ok "$(_fxfacts "$(dirname "$VERIFY")/..")" "$_FXSKIPS"; then pass "FXS-kit: this tree skipped $_FXSKIPS cell group(s) and reads $(_fxkind)"
+  else fail "FXS-kit: a KIT tree skipped $_FXSKIPS cell group(s)"; fi
+
+  # =====================================================================================
+  # SWAS-727 — ONE-ACT APPROVAL (GO_ACT / GO_GIVERS; design 2026-11-06-one-act-approval-727-design.md, tests 1-12). The origin default
+  # branch carries the dials; `land` is the only route in review mode. Every cell asserts the notes and the merge marker, and each
+  # mutant (a sed-rewritten gate COPY in a kit layout) must make its cell FAIL. The mutants the design lists, and the cell that kills each:
+  # no GO_GIVERS check (RVm1 on RV2) · dials from the approved tree (RVm2 on RV-TREE) · absent read as review (RVm3 on RV-ABSENT) · no exact-sha
+  # check (RVm4 on RV4a) · no G1 inequality (RVm5 on RV9a) · body copied into the token (RVm6 on RV7c) · no hold (RVm7 on RV7a) · no control
+  # fold (RVm8 on RV7d) · no 1000-byte cap (RVm9 on RV7f) · a loosened login compare (RVm1a on RV2a, SWAS-835). The two dial-state mutants (a flipped value, a deleted line) live in dial-state.sh.
+  # =====================================================================================
+  _rvp() { _RV_POST="$1"; shift; _rv_cell "$@"; _RV_POST=""; }
+  _RV_APP='[{"id":5551,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _RV_OTHER='[{"id":5552,"user":{"login":"other-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _RV_OLD='[{"id":5553,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"0123456789012345678901234567890123456789","body":""}]'
+  _RV_WITHDRAWN='[{"id":5554,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""},{"id":5555,"user":{"login":"owner-rev","type":"User"},"state":"CHANGES_REQUESTED","commit_id":"@SHA@","body":"no"}]'
+  _RV_BADID='[{"id":"12x","user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _RV_NOID='[{"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _RV_HELD='[{"id":5557,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":"GO, with the full security read"}]'
+  _RV_WS='[{"id":5551,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":"  \t \n "}]'
+  _RV_CTRLJSON='[{"id":5559,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":"a\nb\tc\u001bd\u0085e \"q\""}]'
+  _RV_LONGJSON="[{\"id\":5560,\"user\":{\"login\":\"owner-rev\",\"type\":\"User\"},\"state\":\"APPROVED\",\"commit_id\":\"@SHA@\",\"body\":\"$(i=0; while [ "$i" -lt 600 ]; do printf 'abc\\u00e9\\u20ac'; i=$((i + 1)); done)\"}]"
+  _RV_INERTJSON='[{"id":5561,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":"$(touch sentinel-727) `touch sentinel-727b` ; rm -rf sentinel-727c"}]'
+  _RV_REVB='[{"id":5562,"user":{"login":"reviewer-login","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _RV_NOGO='--go-by <the GO-giver>'
+  # 1. a GO_GIVERS login's APPROVED review on the head is the merge GO: go-act review, one authenticated identity in two fields, the id as the token
+  _rvp _rv_post_oneact RV1-oneact-review-is-the-GO - 0 'GO = forge review 5551 by owner-rev' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _RVCLS=ordinary; _rv_cell RV1a-review-mode-land-takes-an-ordinary-class - 0 'merged 260 — ordinary' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVCLS=""
+  _rv_cell RV1b-absent-ordinary-is-still-actuates-not-lands - 2 'land is the control-plane/direct-path verb' NONE NONE "$_RV_APP" '"SeaBrad72"' owner-rev --go-by owner --token 'GO: land #260' --class ordinary
+  # 2. an approval by a non-author who is NOT on GO_GIVERS is no GO (W5)
+  _rv_cell RV2-not-on-GO_GIVERS-refused - 1 'giver-not-listed' "$_RV_DIAL" NONE "$_RV_OTHER" '"SeaBrad72"' other-rev
+  _rv_cell RVm1-mutant-GO_GIVERS-check-dropped 's/if \[ "\$_rg_ok" != 0 \]; then _fr_fallback giver-not-listed/if false; then _fr_fallback giver-not-listed/' 1 'giver-not-listed' "$_RV_DIAL" NONE "$_RV_OTHER" '"SeaBrad72"' other-rev
+  # 2a. SWAS-835: the login compare is EXACT per entry, never a prefix: with `giver-a giver-b` listed, a review by `giver-b-agent` is no GO
+  _RV_AGENT='[{"id":5563,"user":{"login":"giver-b-agent","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":""}]'
+  _rv_cell RV2a-agent-login-is-not-a-listed-giver - 1 'giver-not-listed' 'GO_ACT=review
+GO_GIVERS=giver-a giver-b' NONE "$_RV_AGENT" '"someone-else"' giver-b-agent
+  _rv_cell RVm1a-mutant-giver-compare-loosened 's/"\$_rg_login" \]; then _rg_ok=0; fi/"${_rg_login%-agent}" ]; then _rg_ok=0; fi/' 1 'giver-not-listed' 'GO_ACT=review
+GO_GIVERS=giver-a giver-b' NONE "$_RV_AGENT" '"someone-else"' giver-b-agent
+  # 3. GO_GIVERS empty, absent or not a list of logins: review refuses every merge (rc 2), naming the dial
+  _rv_cell RV3a-empty-GO_GIVERS-refuses-every-merge - 2 'GO_GIVERS is empty' 'GO_ACT=review
+GO_GIVERS=' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rv_cell RV3b-no-GO_GIVERS-line-refuses-every-merge - 2 'GO_GIVERS is empty' 'GO_ACT=review' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rv_cell RV3c-GO_GIVERS-with-a-non-login-reads-empty - 2 'GO_GIVERS is empty' 'GO_ACT=review
+GO_GIVERS=own;er' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  # 4. an approval of an older sha, and an approval later withdrawn by the same login, are no GO
+  _rv_cell RV4a-approval-on-an-older-sha-refused - 1 'review-sha-mismatch' "$_RV_DIAL" NONE "$_RV_OLD" '"SeaBrad72"' owner-rev
+  _rv_cell RVm4-mutant-exact-sha-check-skipped 's/\[ "\$_fr_cid" = "\$_fr_full" \] || { _fr_fallback review-sha-mismatch/true || { _fr_fallback review-sha-mismatch/' 1 'review-sha-mismatch' "$_RV_DIAL" NONE "$_RV_OLD" '"SeaBrad72"' owner-rev
+  _rv_cell RV4b-approved-then-changes-requested-refused - 1 'review-not-approved' "$_RV_DIAL" NONE "$_RV_WITHDRAWN" '"SeaBrad72"' owner-rev
+  # 5. the review by the PR's author is no GO, even on the list
+  _rv_cell RV5-the-PR-author-is-no-GO - 1 'reviewer-is-pr-author' "$_RV_DIAL" NONE "$_RV_APP" '"owner-rev"' owner-rev
+  # 6. the modes do not mix: an empty-body approval takes neither --token nor --go-by; a held one needs both
+  _rv_cell RV6a-token-on-an-empty-body-approval-refused - 2 'takes no --token and no --go-by' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev --token 'GO: land #260'
+  _rv_cell RV6b-go-by-on-an-empty-body-approval-refused - 2 'takes no --token and no --go-by' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev --go-by owner
+  _rv_cell RV6c-held-with-only-a-token-refused - 2 'Give the typed GO' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev --token 'GO: land #260'
+  _rv_cell RV6d-held-with-only-a-go-by-refused - 2 'Give the typed GO' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev --go-by owner
+  # 7. the review id is digits, else rc 2
+  _rv_cell RV7-non-digit-review-id-refused - 2 'not 1-20 digits' "$_RV_DIAL" NONE "$_RV_BADID" '"SeaBrad72"' owner-rev
+  _rv_cell RV7-no-review-id-refused - 2 'not 1-20 digits' "$_RV_DIAL" NONE "$_RV_NOID" '"SeaBrad72"' owner-rev
+  # 7a. a comment holds the approval: rc 2, the id and the words (made safe) printed, no note, no merge
+  _rv_cell RV7a-held-names-the-review-id - 2 'LAND HELD: review 5557' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev
+  _rv_cell RV7a-held-prints-the-words-made-safe - 2 'words (made safe): GO, with the full security read' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev
+  _rv_cell RVm7-mutant-comment-let-through-without-the-hold 's/then PV_FR_HELD=1; fi/then PV_FR_HELD=0; fi/' 2 'LAND HELD: review 5557' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev
+  # 7b. the held PR, then a typed GO: go-act separate, the held review as approved-by, the words and their hash kept
+  _rvp _rv_post_held RV7b-held-then-typed-GO-merges - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev --token 'GO #260: the full security read is on the record' --go-by 'the owner'
+  # 7c. a body of only whitespace is empty: one-act, no hold
+  _rvp _rv_post_oneact RV7c-whitespace-only-body-is-an-empty-body - 0 'GO = forge review 5551 by owner-rev' "$_RV_DIAL" NONE "$_RV_WS" '"SeaBrad72"' owner-rev
+  _rvp _rv_post_oneact RVm6-mutant-review-body-copied-into-the-token 's/--token "forge-review:\$PV_FR_ID" --go-by/--token "forge-review:$PV_FR_ID$PV_FR_BODY" --go-by/' 0 'GO = forge review 5551 by owner-rev' "$_RV_DIAL" NONE "$_RV_WS" '"SeaBrad72"' owner-rev
+  # 7d. control characters, a C1 character and a quote: one line, spaces, the quote escaped, the hash of the raw body
+  _rvp _rv_post_ctrl RV7d-control-characters-folded-and-quote-escaped - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_CTRLJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  _rvp _rv_post_ctrl RVm8-mutant-control-character-fold-skipped "s/tr '.000-.037.177' ' '/cat/" 0 'merged 260' "$_RV_DIAL" NONE "$_RV_CTRLJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  # 7f. a 4800-byte body: capped at 1000 bytes on a UTF-8 boundary with the mark; go-words-sha256 is the raw body's
+  _rvp _rv_post_long RV7f-long-body-capped-on-a-utf8-boundary - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_LONGJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  _rvp _rv_post_long RVm9-mutant-1000-byte-cap-skipped 's/-gt 1000 \]; then/-gt 100000000 ]; then/' 0 'merged 260' "$_RV_DIAL" NONE "$_RV_LONGJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  # 7e. a body of shell syntax is stored as text; nothing ran
+  _rvp _rv_post_inert RV7e-shell-syntax-in-the-body-stored-as-text - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_INERTJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  # 8. design and plan gates stay typed in every mode
+  _RVGATE=design; _rv_cell RV8a-design-gate-still-demands-the-typed-GO - 1 "$_RV_NOGO" "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVGATE=""
+  _RVGATE=plan; _rvp _rv_post_plain RV8b-plan-gate-merges-on-the-typed-GO-as-today - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev --token 'GO: land #260' --go-by 'the owner'; _RVGATE=""
+  # 9. separate: a go-by equal to the approver (folded) is refused (G1); a different name merges, 13 lines, no go-act
+  _rv_cell RV9a-separate-go-by-equals-approved-by-refused - 1 'GO_ACT=separate' 'GO_ACT=separate' NONE "$_RV_REVB" '"SeaBrad72"' reviewer-login --token 'GO: land #260' --go-by 'Reviewer-Login'
+  _rv_cell RVm5-mutant-G1-inequality-dropped 's/if \[ "\$_sof" = "\$(_pv_fold "\$3")" \]; then/if false; then/' 1 'GO_ACT=separate' 'GO_ACT=separate' NONE "$_RV_REVB" '"SeaBrad72"' reviewer-login --token 'GO: land #260' --go-by 'Reviewer-Login'
+  _rvp _rv_post_plain RV9b-separate-a-different-go-by-merges - 0 'merged 260' 'GO_ACT=separate' NONE "$_RV_REVB" '"SeaBrad72"' reviewer-login --token 'GO: land #260' --go-by 'the owner'
+  # 10. an absent dial is today's two acts: a GO_GIVERS line alone turns nothing on (no --go-by is refused), and the typed GO merges as before
+  _rv_cell RV-ABSENT-a-GO_GIVERS-line-alone-is-not-review - 1 "$_RV_NOGO" 'GO_GIVERS=owner-rev' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rv_cell RVm3-mutant-absent-read-as-review "/^pv_go_dials() {/,/^}/ s/^    '') ;;\$/    '') PV_GO_ACT=review ;;/" 1 "$_RV_NOGO" 'GO_GIVERS=owner-rev' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rvp _rv_post_plain RV10-absent-typed-GO-merges-as-today - 0 'merged 260' NONE NONE "$_RV_APP" '"SeaBrad72"' owner-rev --token 'GO: land #260' --go-by 'the owner'
+  # 11. an unrecognised value reads absent; no environment variable sets either dial; Governance can force separate and cannot turn review on
+  _rv_cell RV11a-unrecognised-GO_ACT-reads-absent - 1 'reads absent' 'GO_ACT=reveiw
+GO_GIVERS=owner-rev' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  GO_ACT=review; GO_GIVERS=owner-rev; export GO_ACT GO_GIVERS
+  _rv_cell RV11b-an-environment-variable-cannot-set-the-dials - 1 "$_RV_NOGO" NONE NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  unset GO_ACT GO_GIVERS
+  _rv_cell RV11c-a-Governance-line-forces-separate - 1 'CLAUDE.md says Merge GO: separate' "$_RV_DIAL" '- **Merge GO**: separate — two acts' "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rv_cell RV11d-a-Governance-line-cannot-turn-review-on - 1 "$_RV_NOGO" NONE '- **Merge GO**: review' "$_RV_APP" '"SeaBrad72"' owner-rev
+  # 12. solo: neither dial is read; the solo bar is unchanged
+  _rv_cell RV12a-solo-ignores-review-no-go-by-refused - 1 "$_RV_NOGO" 'MERGE_RELATIONSHIP=solo
+GO_ACT=review
+GO_GIVERS=owner-rev' NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rvp _rv_post_plain RV12b-solo-typed-GO-merges-as-before - 0 'merge relationship: solo' 'MERGE_RELATIONSHIP=solo
+GO_ACT=review
+GO_GIVERS=owner-rev' NONE "$_RV_APP" '"SeaBrad72"' owner-rev --token 'GO: land #260' --go-by 'the owner'
+  # 2'. the PR cannot choose its own bar: the head's tree declares review, origin's main does not, so the typed GO is still demanded
+  _RV_PRE=_rv_pre_treedial
+  _rv_cell RV-TREE-the-approved-tree-cannot-turn-review-on - 1 "$_RV_NOGO" NONE NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _rv_cell RVm2-mutant-dials-read-from-the-approved-tree 's#^  PV_REL_TIP="\$_mrtip"; PV_REL_DIALRC="\$_mrrc"; PV_REL_DIALTXT="\$_mrdial"#  PV_REL_TIP="$_mrtip"; PV_REL_DIALRC=0; PV_REL_DIALTXT="$(git -C "$ROOT" show "${asha}:.kit/dials.conf" 2>/dev/null)"#' 1 "$_RV_NOGO" NONE NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  _RV_PRE=""
+
+  # 6'. `actuate` in review mode merges nothing and points at land; separate adds G2 and G1; absent, solo, the environment and a plan gate keep today's bar.
+  _rv_act() {  # <label> <merge|refuse> <needle> <dial text|NONE> <note-kind: plain|go-equal|go-other|go-plan> — one actuate on a fresh fixture
+    D="$(mkrepo)" || { fail "$1: fixture build"; return 0; }
+    X="$(cat "$D/.X")"
+    case "$5" in
+      plain)    write_note "$D" "$X" "Reviewer B [authenticated: github-review]" ;;
+      go-equal) write_snote "$D" "$X" "reviewer b [self-asserted]" release-candidate AUTO ordinary "Reviewer B [authenticated: github-review]" ;;
+      go-other) write_snote "$D" "$X" "the owner [self-asserted]" release-candidate AUTO ordinary "Reviewer B [authenticated: github-review]" ;;
+      go-plan)  write_snote "$D" "$X" "the owner [self-asserted]" plan-record AUTO ordinary "Reviewer B [authenticated: github-review]" ;;
+    esac
+    _act_base "$D" "$4" NONE
+    run_actuate "$VERIFY" "$D" feat "$X" "$(_act_stub "$D" "$X")"
+    if [ "$2" = merge ]; then
+      if [ "$RC" = 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" "$3"; then pass "$1: actuate merged"; else fail "$1: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"; fi
+    elif [ "$RC" = 1 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "$3"; then pass "$1: actuate refused on '$3', merge stub never ran"
+    else fail "$1: rc=$RC invoked=$(invoked "$D") OUT=[$OUT]"; fi
+    rm -rf "$D" 2>/dev/null || true
+  }
+  _rv_act RV6e-actuate-refuses-review-mode-and-points-to-land refuse 'ACTUATE REFUSED (GO_ACT=review)' "$_RV_DIAL" plain
+  _rv_act RV6f-actuate-review-refusal-names-the-land-command refuse 'promotion-verify.sh land --ref <PR number>' "$_RV_DIAL" plain
+  _rv_act RV9c-actuate-separate-needs-a-go-by-G2 refuse 'records no GO-giver' 'GO_ACT=separate' plain
+  _rv_act RV9d-actuate-separate-go-by-equals-approved-by-G1 refuse 'is the reviewer in approved-by' 'GO_ACT=separate' go-equal
+  _rv_act RV9e-actuate-separate-a-different-go-by-merges merge 'OK: actuated' 'GO_ACT=separate' go-other
+  _rv_act RV10a-actuate-absent-dial-note-without-go-by-merges merge 'OK: actuated' NONE plain
+  _rv_act RV10b-actuate-absent-dial-with-a-GO_GIVERS-line-merges merge 'OK: actuated' 'GO_GIVERS=owner-rev' plain
+  GO_ACT=review; GO_GIVERS=owner-rev; export GO_ACT GO_GIVERS
+  _rv_act RV11e-an-environment-variable-cannot-turn-review-on-for-actuate merge 'OK: actuated' NONE plain
+  unset GO_ACT GO_GIVERS
+  _rv_act RV8c-actuate-plan-gate-stays-typed-in-review-mode merge 'OK: actuated' "$_RV_DIAL" go-plan
+  _rv_act RV12c-actuate-solo-ignores-both-dials merge 'merge relationship: solo' 'MERGE_RELATIONSHIP=solo
+GO_ACT=review
+GO_GIVERS=owner-rev' go-other
+
+  # SWAS-727 FIX PASS. H: `--gate` is consumed by land's argv peek (the shape `--gate design --basis --gate` once read an EMPTY gate in land and
+  # `design` in record), a flag-shaped value is rc 2, the recorded gate must equal the judged one, and only `design`, `plan`, `design-*` and
+  # `plan-*` are typed gates (`planned-release` is a merge gate).
+  _rv_cell RVH1-gate-flag-with-no-value-is-rc-2 - 2 'land: --gate needs a value' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev --basis --gate
+  _RVGATE=-x; _rv_cell RVH2-flag-shaped-gate-value-is-rc-2 - 2 "land: --gate value '-x' starts with '-'" "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVGATE=""
+  _RVGATE=planned-release; _rvp _rv_post_oneact RVH3-planned-release-is-a-merge-gate-not-typed - 0 'GO = forge review 5551 by owner-rev' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVGATE=""
+  _RVGATE=design-review; _rv_cell RVH4-design-dash-gate-stays-typed - 1 "$_RV_NOGO" "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVGATE=""
+  _RVGATE='design review'; _rv_cell RVH5-design-space-gate-stays-typed - 1 "$_RV_NOGO" "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RVGATE=""
+  # L: line comments on the review hold the approval; a failed comments read is a hold, never a one-act GO; zero comments is one-act.
+  _RV_COMMENTS='[{"id":1,"body":"x"}]'; _rv_cell RVL1-line-comments-hold-an-empty-body-approval - 2 'LAND HELD: review 5551' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RV_COMMENTS=""
+  _RV_COMMENTSERR=1; _rv_cell RVL2-failed-comments-read-is-a-hold - 2 'LAND HELD: review 5551' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RV_COMMENTSERR=0
+  _RV_COMMENTS='[]'; _rvp _rv_post_oneact RVL3-zero-line-comments-is-one-act - 0 'GO = forge review 5551 by owner-rev' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev; _RV_COMMENTS=""
+  # SWAS-747 (design 2026-11-07-review-go-later-comment-747-design.md): a COMMENTED review by a GO_GIVERS login that is not provably BEFORE the
+  # approval holds it (words, or line comments; a failed or unparsable read holds); a new empty-body approval after it is one act again.
+  # The mutants (RVCm1-RVCm7, each a sed over ONE line of the gate copy) and the cell that kills each: the later read removed (RVC1) · the
+  # GO_GIVERS filter dropped (RVC6) · a body read error read as no comment (RVC4a) · the provably-before test dropped (RVC5) · list position
+  # only (RVC12) · time only (RVC13) · a failed comments read read as zero (RVC4b).
+  _rvc_r() {  # <id> <login> <state> <commit> <body> [<submitted_at>] -> one review row as JSON (@SHA@ stands for the head)
+    _rc_t=""; if [ -n "${6:-}" ]; then _rc_t=",\"submitted_at\":\"$6\""; fi
+    printf '{"id":%s,"user":{"login":"%s","type":"User"},"state":"%s","commit_id":"%s","body":"%s"%s}' "$1" "$2" "$3" "$4" "$5" "$_rc_t"
+  }
+  _rvc() {  # <label> <sed|-> <expect-rc> <needle> <reviews-json> [<dial> = $_RV_DIAL] [land args…] -> one review-mode land (the post-check, if any, is _RV_POST)
+    _rcl="$1"; _rcm="$2"; _rce="$3"; _rcn="$4"; _rcj="$5"; _rcd="${6:-$_RV_DIAL}"
+    if [ "$#" -gt 6 ]; then shift 6; else shift "$#"; fi
+    _rv_cell "$_rcl" "$_rcm" "$_rce" "$_rcn" "$_rcd" NONE "$_rcj" '"SeaBrad72"' owner-rev "$@"
+  }
+  _T0=2026-11-07T09:00:00Z; _T1=2026-11-07T10:00:00Z; _T2=2026-11-07T11:00:00Z
+  _RC_A="$(_rvc_r 5551 owner-rev APPROVED @SHA@ '' "$_T1")"
+  _RC_WORDS='wait, do not merge this yet'
+  _RC_LW='later comment holds it (review 5571)'; _RC_HELD='LAND HELD: review 5551'
+  _RC_LATER="$(_rvc_r 5571 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")"
+  _rvc RVC1-later-commented-with-words-holds - 2 "$_RC_LW" "[$_RC_A,$_RC_LATER]"
+  _rvc RVCm1-mutant-the-later-read-removed 's/^  if ! _ls_late="\$(_fr_later_ids .*$/  _ls_late=""/' 2 "$_RC_LW" "[$_RC_A,$_RC_LATER]"
+  _RV_C5571='[]'; _RC_EMPTY="$(_rvc_r 5571 owner-rev COMMENTED @SHA@ '  \t \n ' "$_T2")"
+  _RV_POST=_rv_post_oneact; _rvc RVC2-later-empty-commented-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$_RC_EMPTY]"; _RV_POST=""
+  _RV_C5571='[{"id":1,"body":"x"}]'; _rvc RVC3-later-line-comment-holds - 2 "$_RC_HELD" "[$_RC_A,$(_rvc_r 5571 owner-rev COMMENTED @SHA@ '' "$_T2")]"; _RV_C5571=""
+  _RV_BERR5571=1; _rvc RVC4a-later-body-read-error-holds - 2 "$_RC_HELD" "[$_RC_A,$_RC_LATER]"
+  _rvc RVCm3-mutant-body-read-error-read-as-no-comment 's/^  if ! _fr_body_read "\$1" "\$2"; then return 2; fi$/  if ! _fr_body_read "$1" "$2"; then return 1; fi/' 2 "$_RC_HELD" "[$_RC_A,$_RC_LATER]"; _RV_BERR5571=0
+  _RV_CERR5571=1; _rvc RVC4b-later-comments-read-error-holds - 2 "$_RC_HELD" "[$_RC_A,$_RC_EMPTY]"
+  _rvc RVCm7-mutant-failed-comments-read-counts-as-zero 's/^\(  if ! _lh_c=.*; then \)return 2; fi$/\1_lh_c=0; fi/' 2 "$_RC_HELD" "[$_RC_A,$_RC_EMPTY]"; _RV_CERR5571=0
+  _rvc RVC4c-later-row-non-digit-id-holds - 2 "$_RC_HELD" "[$_RC_A,$(_rvc_r '"55x1"' owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")]"
+  _RC_BEFORE="$(_rvc_r 5570 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T0")"
+  _RV_POST=_rv_post_oneact; _rvc RVC5-commented-before-the-approval-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_BEFORE,$_RC_A]"
+  _rvc RVCm4-mutant-provably-before-test-dropped 's/^        if (i < ap && stamp.*$/        if (0) continue/' 0 'GO = forge review 5551 by owner-rev' "[$_RC_BEFORE,$_RC_A]"
+  _rvc RVC6-commented-by-a-login-not-on-GO_GIVERS-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$(_rvc_r 5571 other-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")]"
+  _rvc RVCm2-mutant-GO_GIVERS-filter-dropped 's/^        if (!on\[lg\[i\]\]) continue$/        if (0) continue/' 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$(_rvc_r 5571 other-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")]"
+  _RV_POST=""
+  _RV_POST=_rv_post_later; _rvc RVC7-held-by-a-later-comment-then-typed-GO-merges - 0 'merged 260' "[$(_rvc_r 5551 owner-rev APPROVED @SHA@ 'GO, with the full security read' "$_T1"),$(_rvc_r 5571 owner-rev COMMENTED @SHA@ 'but wait for the schema check' "$_T2")]" "$_RV_DIAL" --token 'GO #260: the schema check is done' --go-by 'the owner'; _RV_POST=""
+  _RVID=5572; _RV_POST=_rv_post_oneact
+  _rvc RVC8-re-approval-after-the-comment-is-one-act - 0 'GO = forge review 5572 by owner-rev' "[$(_rvc_r 5551 owner-rev APPROVED @SHA@ '' "$_T0"),$(_rvc_r 5571 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T1"),$(_rvc_r 5572 owner-rev APPROVED @SHA@ '' "$_T2")]"
+  _RVID=""; _RV_POST=""
+  _rvc RVC9-later-comment-by-another-GO_GIVERS-login-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 second-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")]" 'GO_ACT=review
+GO_GIVERS=owner-rev second-rev'
+  _rvc RVC10-later-comment-on-an-older-commit-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 owner-rev COMMENTED "$_RV_SHA0" "$_RC_WORDS" "$_T2")]"
+  _rvc RVC11-earlier-in-the-list-but-no-time-holds - 2 'later comment holds it (review 5570)' "[$(_rvc_r 5570 owner-rev COMMENTED @SHA@ "$_RC_WORDS"),$_RC_A]"
+  _RC_LATE_FIRST="$(_rvc_r 5570 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")"
+  _rvc RVC12-earlier-in-the-list-later-time-holds - 2 "$_RC_HELD" "[$_RC_LATE_FIRST,$_RC_A]"
+  _rvc RVCm5-mutant-list-position-only 's/^        if (i < ap && stamp.*$/        if (i < ap) continue/' 2 "$_RC_HELD" "[$_RC_LATE_FIRST,$_RC_A]"
+  _RC_EARLY_LAST="$(_rvc_r 5571 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T0")"
+  _rvc RVC13-later-in-the-list-earlier-time-holds - 2 "$_RC_HELD" "[$_RC_A,$_RC_EARLY_LAST]"
+  _rvc RVCm6-mutant-time-only 's/^        if (i < ap && stamp.*$/        if (stamp(tm[i]) \&\& stamp(at) \&\& ("" tm[i]) < ("" at)) continue/' 2 "$_RC_HELD" "[$_RC_A,$_RC_EARLY_LAST]"
+  _RV_POST=_rv_post_oneact; _rvc RVC14-pending-with-words-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$(_rvc_r 5571 owner-rev PENDING @SHA@ "$_RC_WORDS" "$_T2")]"; _RV_POST=""
+  _rvc RVC15-case-different-GO_GIVERS-login-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 Owner-Rev COMMENTED @SHA@ "$_RC_WORDS" "$_T2")]"
+  # S2: the approval is found by id as a STRING; a row whose id only looks numerically equal (05551) is not the approval, and an id matched by two rows holds.
+  # Compared as numbers, the 05551 row would become the approval: the wait before it would read as provably before, and the land would be one act.
+  _RC_ZERO="$(_rvc_r '"05551"' owner-rev COMMENTED @SHA@ '' "$_T2")"
+  _RC_WAIT_EARLY="$(_rvc_r 5571 owner-rev COMMENTED @SHA@ "$_RC_WORDS" "$_T1")"
+  _rvc RVC16-approval-id-matched-twice-holds - 2 "$_RC_HELD" "[$_RC_A,$_RC_WAIT_EARLY,$_RC_ZERO]"
+  _rvc RVCm8-mutant-approval-id-compared-as-numbers 's/if (("" \$5) == ("" ENVIRON\["FR_ID"\])) { ap = n; at = \$6; hits++ }/if ($5 == ENVIRON["FR_ID"]) { ap = n; at = $6 }/' 2 "$_RC_HELD" "[$_RC_A,$_RC_WAIT_EARLY,$_RC_ZERO]"
+  _rvc RVC17-approval-id-on-two-rows-holds - 2 "$_RC_HELD" "[$_RC_A,$(_rvc_r 5551 owner-rev COMMENTED @SHA@ '' "$_T2")]"
+  # SWAS-756 (errata E1, folded into 747): a second GO_GIVERS login's later review of ANY posted state holds on its words, like a COMMENTED one.
+  # The selected approval is owner-rev's 5551; the dial lists two logins, so a cell passes only for the reason it states (the state, the login, the time).
+  _RC_DIAL2='GO_ACT=review
+GO_GIVERS=owner-rev second-rev'
+  _rvc RVC18-second-giver-later-approved-with-words-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 second-rev APPROVED @SHA@ "$_RC_WORDS" "$_T2")]" "$_RC_DIAL2"
+  _rvc RVCm9-mutant-scan-commented-only 's/^        if (st\[i\] == "PENDING" || i == ap) continue$/        if (st[i] != "COMMENTED") continue/' 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 second-rev APPROVED @SHA@ "$_RC_WORDS" "$_T2")]" "$_RC_DIAL2"
+  _RV_POST=_rv_post_oneact
+  _rvc RVC19-second-giver-later-approved-empty-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$(_rvc_r 5571 second-rev APPROVED @SHA@ '' "$_T2")]" "$_RC_DIAL2"
+  _rvc RVC20-non-giver-later-approved-with-words-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$_RC_A,$(_rvc_r 5571 other-rev APPROVED @SHA@ "$_RC_WORDS" "$_T2")]" "$_RC_DIAL2"
+  _rvc RVC21-second-giver-approved-with-words-before-the-approval-is-one-act - 0 'GO = forge review 5551 by owner-rev' "[$(_rvc_r 5570 second-rev APPROVED @SHA@ "$_RC_WORDS" "$_T0"),$_RC_A]" "$_RC_DIAL2"
+  _RV_POST=""
+  _rvc RVC22-second-giver-later-changes-requested-with-words-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 second-rev CHANGES_REQUESTED @SHA@ "$_RC_WORDS" "$_T2")]" "$_RC_DIAL2"
+  _rvc RVC23-second-giver-later-dismissed-with-words-holds - 2 "$_RC_LW" "[$_RC_A,$(_rvc_r 5571 second-rev DISMISSED @SHA@ "$_RC_WORDS" "$_T2")]" "$_RC_DIAL2"
+  # M1: the one-act OK text says go-by is authenticated, not self-asserted.
+  _rvp _rv_post_oneact RVM1-one-act-OK-text-says-go-by-is-authenticated - 0 'authenticated (github-review), not self-asserted' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev
+  # M2: a backslash in the body is doubled before the quote is escaped.
+  _RV_BSJSON='[{"id":5563,"user":{"login":"owner-rev","type":"User"},"state":"APPROVED","commit_id":"@SHA@","body":"a\\\"b"}]'
+  _rvp _rv_post_bs RVM2-backslash-then-quote-round-trips-unambiguously - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_BSJSON" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by 'the owner'
+  # M4 (E3): a held approval whose typed --go-by equals approved-by merges in review mode (no G1 on a held-then-typed note); --token-file on an
+  # empty-body approval is rc 2 like --token.
+  _rv_cell RVM4a-held-then-typed-go-by-equal-to-approved-by-merges - 0 'merged 260' "$_RV_DIAL" NONE "$_RV_HELD" '"SeaBrad72"' owner-rev --token 'GO #260' --go-by owner-rev
+  _rvtf="$(mktemp)"; printf 'GO #260\n' > "$_rvtf"
+  _rv_cell RVM4b-token-file-on-an-empty-body-approval-refused - 2 'takes no --token and no --go-by' "$_RV_DIAL" NONE "$_RV_APP" '"SeaBrad72"' owner-rev --token-file "$_rvtf"
+  rm -f "$_rvtf"
+
+  # SWAS-323 A1 / L4 / D1: a GO note is a LIST of records and `actuate` judges ONE merge-gate record, chosen by pv_actuate_pick.
+  # A cell with a sed script is a MUTANT over a kit-layout COPY of the gate and passes only when its assertion FAILS against it.
+  _a1r() {   # <gate> <scope> <label> -> one GO record for $X
+    printf '%s\n' "record: promotion GO (fabricated fixture note)" "approved-sha: $X" "approved-by: Reviewer B [$3]" \
+      "gate: $1" "rung: Release candidate" "change-class: Ordinary" "scope: $2" "approval-token: \"GO: merge #260\"" \
+      "basis: reviewer APPROVE" "recorded-at: fixture"
+  }
+  _a1() {   # <label> <sed|-> <kind> <merge|refuse> <needle> [<gh answers `pr view` with this number>]
+    D="$(mkrepo)" || { fail "$1: fixture build"; return 0; }
+    X="$(cat "$D/.X")"
+    case "$3" in
+      design+merge) { _a1r design branch/x self-asserted; printf '\n'; _a1r release-candidate 'PR #260' 'authenticated: github-review'; } ;;
+      two-merge)    { _a1r release-candidate 'PR #260' 'authenticated: github-review'; printf '\n'; _a1r release-candidate 'PR-9' 'authenticated: github-review'; } ;;
+      land-after)   { _a1r design branch/x self-asserted; printf '\n'; _a1r release-candidate 'PR #260' 'authenticated: github-review' | sed '1s/^record: /land: /'; } ;;
+      no-header)    _a1r release-candidate 'PR #260' 'authenticated: github-review' | sed 1d ;;
+    esac | ( cd "$D" && git notes --ref=promotions add -f -F - "$X" >/dev/null 2>&1 )
+    _a1g="$VERIFY"; _a1m=0
+    if [ "$2" != - ]; then
+      _a1m=1; _le_pvcopy "$D/pv" 1 1; _fxlay "$D" 1 1
+      if ! _le_mutate "$D/pv/scripts/promotion-verify.sh" "$2"; then fail "$1: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$D" 2>/dev/null || true; return 0; fi
+      _a1g="$D/pv/scripts/promotion-verify.sh"
+    fi
+    _a1p="$PATH"
+    if [ -n "${6:-}" ]; then
+      _a1d="$(mktemp -d)"
+      printf '#!/bin/sh\ncase "$*" in "pr view"*) echo %s ;; *) exec "$EVD/gh" "$@" ;; esac\n' "$6" > "$_a1d/gh"; chmod +x "$_a1d/gh"
+      PATH="$_a1d:$PATH"
+    fi
+    run_actuate "$_a1g" "$D" feat "$X" "$(_act_stub "$D" "$X")"
+    PATH="$_a1p"
+    if [ "$4" = merge ]; then
+      if [ "$RC" = 0 ] && [ -f "$D/.invoked" ] && _has "$OUT" "$5"; then _a1r_=0; else _a1r_=1; fi
+    elif [ "$RC" != 0 ] && [ ! -f "$D/.invoked" ] && _has "$OUT" "$5"; then _a1r_=0; else _a1r_=1; fi
+    _le_judge "$1" "$_a1m" "$_a1r_"
+    rm -rf "$D" "${_a1d:-}" 2>/dev/null || true; _a1d=""
+  }
+  _a1 A1a-a-design-record-beside-a-merge-record-the-merge-record-is-judged - design+merge merge 'OK: actuated'
+  _a1 A1am-mutant-the-first-record-is-judged 's/^pv_actuate_pick() {$/pv_actuate_pick() { printf "%s\\n" "$1" | kit_note_records body 1; return 0/' design+merge merge 'OK: actuated'
+  _a1 A1b-two-merge-records-and-no-PR-match-refuse-naming-both - two-merge refuse "holds 2 merge-gate GO records (scopes: 'PR #260' 'PR-9')"
+  _a1 A1bm-mutant-the-first-record-is-judged 's/^pv_actuate_pick() {$/pv_actuate_pick() { printf "%s\\n" "$1" | kit_note_records body 1; return 0/' two-merge refuse "holds 2 merge-gate GO records"
+  _a1 A1c-two-merge-records-the-record-of-the-PR-whose-head-is-ref-is-judged - two-merge merge 'OK: actuated' 9
+  _a1 A1cm-mutant-the-PR-match-is-ignored 's/if \[ "\$_ap_hit" = 1 \]; then/if false; then/' two-merge merge 'OK: actuated' 9
+  _a1 L4-a-land-record-is-never-a-GO-record-the-design-record-above-it-is-judged - land-after refuse 'does not meet the control-plane bar'
+  _a1 L4m-mutant-no-generic-header-rule 's/function hdr(s) { return s ~ \/^(record|land): promotion \/ }/function hdr(s) { return s ~ \/^record: promotion \/ }/' land-after refuse 'does not meet the control-plane bar'
+  _a1 D1-a-note-with-no-header-binds-nothing - no-header refuse 'holds a merge-gate GO record'
+
+  # SWAS-901 slice B (B1), T16c: `actuate` in a solo-declared repository reads the head's solo-go-bound runs before it merges (the verb's
+  # step; `land`'s cells are T16-T18 in promotion-verify-wired.sh). The mutant removes actuate's call site: the red check then no longer stops the merge.
+  _sga_cell T16c-actuate-solo-red-solo-go-bound-is-refused-after-one-re-run - red refuse 'run 11'
+  _sga_cell T16cm-mutant-actuate-without-the-call-site 's@^  pv_sg_gate actuate .*$@  :@' red refuse 'run 11'
+  _sga_cell T16d-actuate-solo-green-solo-go-bound-merges - green merge 'solo-go-bound: green'
+  _sga_cell T16e-actuate-solo-without-the-installed-workflow-says-n-a-and-merges - nowf merge 'solo-go-bound: not installed'
+  # SWAS-901 E6 S-5: actuate (unlike land) never bound the note's PR to the ref it merges where the CI-evidence read is N/A (an adopter layout), so the
+  # solo step reads the PR's head and refuses a PR whose head is not --ref at the approved sha.
+  _sga_cell T16f-actuate-solo-a-PR-whose-head-is-not-ref-is-refused - badref refuse 'is not the pull request whose head is'
+  _sga_cell T16fm-mutant-actuate-without-the-ref-binding '/MUT-SG-BIND$/d' badref refuse 'is not the pull request whose head is'
+  # E6 R2-4: --ref may also be the bound PR's own NUMBER (a local ref named so); another PR's number refuses. The default merge in solo goes by the bound number.
+  _sga_cell T16h-actuate-solo-ref-is-the-bound-PR-number-passes - numref merge 'solo-go-bound: green'
+  _sga_cell T16hm-mutant-the-PR-number-leg-removed 's@ \&\& \[ "\$5" != "\$_sgp" \]@@' numref merge 'solo-go-bound: green'
+  _sga_cell T16i-actuate-solo-ref-is-another-PRs-number-is-refused - othernum refuse 'is not the pull request whose head is'
+  _sga_cell T16im-mutant-the-bind-never-refuses 's@"\$5" != "\$_sgp"@"$5" != "$5"@' othernum refuse 'is not the pull request whose head is'
+  _sga_cell T16j-actuate-solo-default-merge-goes-by-the-bound-PR-number - defmerge merge 'pr merge 260 --squash --match-head-commit @SHA@'
+  _sga_cell T16jm-mutant-the-default-merge-keeps-the-branch-name '/MUT-SG-MERGE$/d' defmerge merge 'pr merge 260 --squash --match-head-commit @SHA@'
+
+  # SWAS-901 slice B, HO1-HO3: the handover line. A solo `actuate` prints it twice (after the relationship line and before the success line); a team
+  # or an undeclared one never does, and a Governance solo line alone grants nothing. Each mutant removes one print (or the solo test) from a COPY.
+  _HOL="actuate: From here the agent merges on your recorded GO; the owner's per-PR act is the GO only."
+  _sga_cell HO1-actuate-solo-prints-the-handover-line-twice - nowf merge "$_HOL" 2
+  _sga_cell HO1m1-mutant-no-print-after-the-relationship-line 's@^  pv_handover actuate .*MUT-HO-REL$@  :@' nowf merge "$_HOL" 2
+  _sga_cell HO1m2-mutant-no-print-before-the-success-line 's@^  pv_handover actuate .*MUT-HO-OK$@  :@' nowf merge "$_HOL" 2
+  _hot_cell HO2-actuate-team-never-prints-the-handover-line - MERGE_RELATIONSHIP=team NONE
+  _hot_cell HO2m-mutant-the-solo-test-removed '/^  \[ "\$PV_REL" = solo \] || return 0$/d' MERGE_RELATIONSHIP=team NONE
+  _hot_cell HO3-actuate-undeclared-with-a-Governance-solo-line-never-prints-it - NONE '- **Governance** (§ solo/team): solo — x'
+  _hot_cell HO3m-mutant-a-Governance-solo-line-grants-solo 's@^  if \[ "\$_mrval" = undeclared \]; then$@  if [ "$_mrval" = undeclared ] \&\& [ "$_mrgov" != solo ]; then@' NONE '- **Governance** (§ solo/team): solo — x'
+
+  _unv_end || st=1
+  rm -f "$_unv_f"
+  if [ "$st" = 0 ]; then
+    echo "OK: promotion-actuate-wired selftest $(_fxskip_note "$_FXSKIPS") — actuate gate wired + non-vacuous (wiring: 1 liveness + 6 negatives; actuate: 1 liveness + 9 negatives + guard fixtures + lock self-negative; forge-review derivation: 3 liveness + 11 negatives + the class allowlist, both ends; GO identity: land L1-L4+L6 (the CP bar, the belt) + record L5/L7 (go-by); SWAS-207a head binding: step 0 x2, the pinned default, the shared vet, the pin requirement, the origin-read note, the never-skipped tail; SWAS-207b declared relationship: the solo bar legs, the base and Governance reads, the control-plane pointer and its order before step 2)"
+  else
+    echo "FAIL: promotion-actuate-wired selftest $(_fxskip_note "$_FXSKIPS")"
+  fi
+  return $st
+}
+
+# ===========================================================================================
+# ORACLE + wiring oracle helper — BELOW the ^selftest() marker, so the non-vacuity harness emits them
+# VERBATIM and never mutates them. fail()'s st accumulator is the ONE that legitimately leaves the
+# mutation region; wiring()'s six wiring flags stay ABOVE the marker and remain load-bearing.
+# ===========================================================================================
+st=0
+pass() { echo "PASS: $1"; }
+fail() { echo "FAIL: $1"; st=1; }
+
+# --- SWAS-577: the in-process matcher and the rc-aware wrapper (below the ^selftest() marker on purpose: the non-vacuity sweep mutates only lines BEFORE it).
+# _has <haystack> <needle> — 0 iff the needle occurs in the haystack, literally (equal to grep -F for a needle with no newline). In-process: no fork, no signal, rc 0 or 1 only, so ! _has is safe.
+# _has "" "" is true; no call site passes an empty needle.
+_has() {
+  case $1 in
+    *"$2"*) return 0 ;;
+  esac
+  return 1
+}
+# _grepx <haystack> <grep-args...> — grep over a captured string, for the shapes case cannot answer (an extracted line). rc 0 and 1 are grep's own answer and pass through.
+# Any other rc (an error, a spawn failure, a signal) is NOT an answer: print UNVERIFIED (grep rc=N) to stderr, append one line to the marker file $_unv_f (a $( ) subshell cannot lose a file), and return 2. The verdict reads the marker, never this return code.
+_grepx() {
+  _gx_h=$1; shift
+  _gx_rc=0
+  printf '%s\n' "$_gx_h" | grep "$@" || _gx_rc=$?
+  case $_gx_rc in
+    0|1) return "$_gx_rc" ;;
+  esac
+  printf 'selftest UNVERIFIED (grep rc=%s): grep %s\n' "$_gx_rc" "$*" >&2
+  printf 'rc=%s grep %s\n' "$_gx_rc" "$*" >> "$_unv_f"
+  return 2
+}
+# _unv_end — the final verdict's read of the marker: rc 1 (and one FAIL line naming the count) when any grep call could not answer.
+_unv_end() {
+  if [ -z "${_unv_f:-}" ] || [ ! -f "$_unv_f" ]; then   # UNVMISS
+    echo "selftest FAIL: UNVERIFIED: the marker file is missing or unnamed, so an unanswered grep could not have been recorded"
+    return 1
+  fi
+  [ -s "$_unv_f" ] || return 0
+  _un_n=0
+  while IFS= read -r _un_l || [ -n "$_un_l" ]; do _un_n=$((_un_n + 1)); done < "$_unv_f"
+  echo "selftest FAIL: UNVERIFIED: $_un_n grep call(s) could not answer (rc 2 or more, or a signal), so the verdict is not a PASS"
+  return 1
+}
+
+# Drive wiring() against fixture targets. The VERIFY/GUARD/VERIFY_SH reassignments live INSIDE the
+# $( … ) subshell, so they cannot leak between cases — wiring() always runs; only WHAT it inspects
+# changes.
+_expect_wiring() {  # <v-omit> <g-omit> <r-omit> <expected-rc> <needle> <label>
+  _d=$(_mkwiring "$1" "$2" "$3")
+  if _out=$( VERIFY="$_d/v.txt"; GUARD="$_d/g.txt"; VERIFY_SH="$_d/r.txt"; wiring 2>&1 ); then _rc=0; else _rc=$?; fi
+  if [ "$_rc" = "$4" ] && _has "$_out" "$5"; then
+    pass "wiring — $6 (rc $_rc)"
+  else
+    fail "wiring — $6 expected rc $4 + '$5'; got rc $_rc out=[$_out]"
+  fi
+  rm -rf "$_d"
+}
+
+# ===========================================================================================
+# PR 11 — FORGE-REVIEW DERIVATION fixtures. DELIBERATELY BELOW THE ^selftest() MARKER, for two
+# reasons that point the same way: (1) the non-vacuity sweep mutates only the lines ABOVE it, and a
+# neutered `gh` shim would silently disarm every REC-* leg's teeth rather than red them; (2) the mass
+# budget prices pre-marker lines as check LOGIC (zero-headroom) and post-marker lines as FIXTURE —
+# and these are fixtures, not check logic. The pre-marker NAME=1 accumulator invariant (see the
+# marker's comment) is therefore untouched by this block.
+# ===========================================================================================
+
+# _fxlay <repo dir> <decider 0|1> <gate-job 0|1> : SWAS-537 fix round 2. The evidence leg reads its layout at TWO locations (the gate's own
+# checkout AND the repository it operates on), so a fixture repository that a gate in a kit layout runs in must carry the same two facts
+# (conformance/ci-gate-state.sh, and a `gate:` job in .github/workflows/ci.yml), and an adopter-looking one must carry neither. The files
+# are written untracked and listed in the repository's info/exclude, so no cell ever sees a dirty tree.
+_fxlay() {  # <repo dir> <decider 0|1> <gate-job 0|1> [<marker 0|1> = the decider's: conformance/adopter-census.sh, the third fact, SWAS-641]
+  mkdir -p "$1/conformance" "$1/.github/workflows"
+  rm -f "$1/conformance/ci-gate-state.sh" "$1/conformance/adopter-census.sh"
+  if [ "$2" = 1 ]; then : > "$1/conformance/ci-gate-state.sh"; fi
+  if [ "${4:-$2}" = 1 ]; then : > "$1/conformance/adopter-census.sh"; fi
+  if [ "$3" = 1 ]; then printf 'jobs:\n  gate:\n    runs-on: x\n  changes:\n    needs: gate\n' > "$1/.github/workflows/ci.yml"
+  else printf 'jobs:\n  changes:\n    runs-on: x\n' > "$1/.github/workflows/ci.yml"; fi
+  if _fx_ex="$(git -C "$1" rev-parse --git-path info/exclude 2>/dev/null)"; then
+    case "$_fx_ex" in /*) ;; *) _fx_ex="$1/$_fx_ex" ;; esac
+    mkdir -p "$(dirname "$_fx_ex")"
+    printf '/conformance/ci-gate-state.sh\n/conformance/adopter-census.sh\n/.github/workflows/ci.yml\n' >> "$_fx_ex"
+  fi
+}
+# SWAS-537 fix round 3: the GENERAL fixtures (mkrepo, _mkland_fx) plant the layout of the gate UNDER TEST, never a fixed kit one. In the
+# exported, adopter-shaped tree the decider and the workflow are export-ignored, so the gate reads adopter at its own checkout, and a
+# repository planted kit would be a layout-mismatch that refuses every merge. The two facts are read the way the gate reads them
+# (pv_ev_lay_of). The cells that assert an evidence refusal exist only on a kit tree and print a SKIP elsewhere.
+_fxfacts() {  # <root> -> "<decider 0|1> <marker 0|1> <gate-job 0|1>"
+  _xfd=0; _xfm=0; _xfg=0
+  if [ -f "$1/conformance/ci-gate-state.sh" ]; then _xfd=1; fi
+  if [ -f "$1/conformance/adopter-census.sh" ]; then _xfm=1; fi
+  if grep -q '^  gate:[[:space:]]*$' "$1/.github/workflows/ci.yml" 2>/dev/null; then _xfg=1; fi
+  echo "$_xfd $_xfm $_xfg"
+}
+_fxlike() {  # <repo dir> [<gate checkout root> = the gate under test's own]
+  set -- "$1" "$(_fxfacts "${2:-$(dirname "$VERIFY")/..}")"
+  _fxlay "$1" "${2%% *}" "${2##* }" "$(printf '%s' "$2" | cut -d' ' -f2)"
+}
+_fxkind() {
+  case "$(_fxfacts "$(dirname "$VERIFY")/..")" in
+    "1 1 1") echo kit ;;
+    "0 0 0"|"0 0 1") echo adopter ;;
+    *) echo half ;;
+  esac
+}
+# Every skip is COUNTED and the count is printed on the final line, so a silent narrowing shows on the export lane (a kit tree says 0).
+_FXSKIPS=0
+_fxskip() { _FXSKIPS=$((_FXSKIPS + 1)); echo "selftest SKIP: $1 — not a kit tree (the evidence leg is N/A here)"; }
+_fxskip_note() { echo "($1 SKIPPED: not a kit tree, counted per skip line above)"; }
+
+# _mkevgh -> echoes a throwaway dir holding the DEFAULT forge for the SWAS-537 exact-head evidence reads. Mode (the file
+# `mode` beside it; light when absent) shapes the answer: light | draft | stale | fork | cheap | nogate | pending | norun | apierr |
+# apierr-pr | partial | runspartial | jobspartial | nonjson | noh2 (runspartial, jobspartial: the read answers a first page, then fails, as a
+# failing later page does; jobspartial answers the full light job set, `gate` included, all success).
+# noh2 (SWAS-864): a run without its h2-hermetic job, what an adopter's CI never has; the H2-LD cells use it.
+# Every evidence call's argv is appended to the file `argv` beside it, so a cell can pin what was asked.
+# The head sha is the fixture's `feat` ref (else HEAD), or the file `sha`. Any call that is
+# not an evidence read fails, as an unreachable forge does, so the cells that never asked the forge keep their fallbacks.
+_mkevgh() {
+  _ev=$(mktemp -d)
+  cat > "$_ev/gh" <<'EVSHIM'
+#!/bin/sh
+d=$(dirname "$0"); mode=$(cat "$d/mode" 2>/dev/null || echo light)
+sha=$(cat "$d/sha" 2>/dev/null || git rev-parse -q --verify refs/heads/feat 2>/dev/null || git rev-parse HEAD 2>/dev/null)
+job() { printf '{"name":"%s","conclusion":"%s"}\n' "$1" "$2"; }
+case "$*" in */actions/*) printf '%s\n' "$*" >> "$d/argv" ;; esac
+case "$*" in
+  *draft*)
+    [ "$mode" != apierr-pr ] || exit 1
+    dr=false; live=$sha; hr=acme/kit; [ "$mode" != draft ] || dr=true; [ "$mode" != stale ] || live=4444444444444444444444444444444444444444; [ "$mode" != fork ] || hr=evil/kit
+    printf '%s\t%s\tfeat\tacme/kit\t%s\n' "$dr" "$live" "$hr" ;;
+  */actions/workflows/*)
+    case "$mode" in apierr) exit 1 ;; partial) printf '{"id":1,'; exit 1 ;; nonjson) echo 'not json'; exit 0 ;; norun) exit 0 ;; esac
+    st=completed; cc=success; [ "$mode" != pending ] || { st=in_progress; cc=; }
+    printf '{"id":900,"path":".github/workflows/ci.yml","run_number":1,"run_attempt":1,"status":"%s","conclusion":"%s","head_sha":"%s","head_branch":"feat","head_repository":{"full_name":"acme/kit"},"event":"pull_request"}\n' "$st" "$cc" "$sha"
+    [ "$mode" != runspartial ] || exit 1 ;;
+  */actions/runs/*)
+    c=success; [ "$mode" != cheap ] || c=skipped
+    for n in changes conformance-core conformance-selftests cf-doctor cf-export cf-export-claims cf-verify-enforced cf-claims cf-green-on-clone guard-battery guard-delta boundary-redteam h2-hermetic conformance-docs docs-links; do [ "$mode" = noh2 ] && [ "$n" = h2-hermetic ] && continue; job "$n" "$c"; done
+    job conformance success; job 'non-vacuity (1)' "$c"; [ "$mode" = nogate ] || job gate success
+    [ "$mode" != jobspartial ] || exit 1 ;;
+  *) exit 1 ;;
+esac
+EVSHIM
+  chmod +x "$_ev/gh"
+  printf '%s\n' "$_ev"
+}
+
+# _mkgh <reviews-json> <pr-author-login-as-JSON> -> echoes a throwaway dir holding an executable `gh`.
+#
+# A PATH SHIM — a real executable file the derivation finds through PATH — and NOT an env-var-eval'd
+# probe. That distinction is the point: `BOARD_DRIFT_PR_STATE`-style `sh -c "$VAR …"` injection is the
+# class PR 10 caught an RCE in, and the cure for this file is to not add a second instance.
+#
+# The shim applies the caller's own `--jq` filter with REAL jq, exactly as `gh api` does, so the
+# PRODUCTION extraction filters are what the legs exercise. A shim that returned canned post-jq
+# answers would leave the one thing worth proving — that the extraction is structural rather than a
+# substring grep of raw JSON — untested, and REC-N6 would then be theatre.
+_mkgh() {
+  _g=$(mktemp -d)
+  printf '%s' "$1" > "$_g/reviews.json"
+  printf '{"user":{"login":%s}}' "$2" > "$_g/pr.json"
+  # OPTIONAL 3rd arg: the reviews the forge answers on EVERY LATER reviews call (the first call gets $1) —
+  # the approval-withdrawn-between-two-reads shape that GO-IDENTITY-AND-LAND-SOD's belt (L6) needs.
+  [ -z "${3:-}" ] || printf '%s' "$3" > "$_g/reviews2.json"
+  cat > "$_g/gh" <<'GHSHIM'
+#!/bin/sh
+# fake gh — answers `gh api <path> [--jq <filter>] [flags]` and nothing else.
+# SWAS-537: the exact-head evidence calls (the PR's draft/head read, the workflow runs, a run's jobs) are the default forge's.
+case "$*" in *draft*|*/actions/*) exec "$EVD/gh" "$@" ;; esac
+_p=""; _f="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq) _f="${2:-.}"; shift ;;
+    -*|api) : ;;
+    *) [ -n "$_p" ] || _p="$1" ;;
+  esac
+  shift
+done
+case "$_p" in
+  */reviews) _src="$(dirname "$0")/reviews.json"
+             if [ -f "$(dirname "$0")/reviews2.json" ]; then
+               _c="$(dirname "$0")/calls"; _n=$(( $(cat "$_c" 2>/dev/null || echo 0) + 1 )); echo "$_n" > "$_c"
+               [ "$_n" -le 1 ] || _src="$(dirname "$0")/reviews2.json"
+             fi ;;
+  # SWAS-727: ONE review by id (`.../reviews/<id>`), the body read of review mode: the caller's own filter, applied by real jq to the
+  # element of the list whose id matches. An id no review has answers nothing at all (the gate must not read that as an empty body).
+  # ... and its LINE COMMENTS (`.../reviews/<id>/comments`): the caller's filter over the file `comments.json` beside the shim (`[]` when
+  # absent), or a failed read when the file `commentserr` is there.
+  # SWAS-747: per-id files win over the shared ones: `commentserr-<id>` fails that id's comments read, `comments-<id>.json` answers it,
+  # and `bodyerr-<id>` fails that id's body read.
+  */reviews/*/comments) _gd="$(dirname "$0")"; _gi="${_p%/comments}"; _gi="${_gi##*/}"
+                        [ ! -f "$_gd/commentserr-$_gi" ] || exit 1
+                        if [ -f "$_gd/comments-$_gi.json" ]; then jq -r "$_f" < "$_gd/comments-$_gi.json"; exit $?; fi
+                        [ ! -f "$_gd/commentserr" ] || exit 1
+                        if [ -f "$_gd/comments.json" ]; then jq -r "$_f" < "$_gd/comments.json"; else printf '[]' | jq -r "$_f"; fi
+                        exit $? ;;
+  */reviews/*) [ ! -f "$(dirname "$0")/bodyerr-${_p##*/}" ] || exit 1
+               jq -r --arg id "${_p##*/}" ".[] | select((.id | tostring) == \$id) | $_f" < "$(dirname "$0")/reviews.json"
+               exit $? ;;
+  *)         _src="$(dirname "$0")/pr.json" ;;
+esac
+[ -f "$_src" ] || exit 1
+jq -r "$_f" < "$_src"
+GHSHIM
+  chmod +x "$_g/gh"
+  printf '%s\n' "$_g"
+}
+
+# _mknogh -> echoes a dir that is a COMPLETE PATH carrying every tool `record` needs EXCEPT `gh`.
+# The honest way to test "gh absent" is a PATH on which it genuinely is not, rather than a stub that
+# pretends to fail — a stub failing is the api-error arm, which is a different reason string.
+_mknogh() {
+  _n=$(mktemp -d)
+  for _t in sh env git awk sed tr cut grep head tail wc sort date mktemp basename dirname \
+            cat rm ln chmod expr test true false uname jq; do
+    _tp="$(command -v "$_t" 2>/dev/null)" || continue
+    ln -s "$_tp" "$_n/$_t" 2>/dev/null || true
+  done
+  printf '%s\n' "$_n"
+}
+
+# _run_record <dir> <path-prefix-or-PATH-override> <scope> <approved-by> <sha> [absolute]
+#   Drives the REAL `record` in <dir>. With a 6th arg the 2nd is used as the WHOLE PATH (the gh-absent
+#   leg); otherwise it is PREPENDED. Sets RC + OUT (merged), as run_actuate does.
+_run_record() {
+  _rd="$1"; _rg="$2"; _rs="$3"; _rb="$4"; _rx="$5"; _rabs="${6:-}"
+  if [ -n "$_rabs" ]; then _rp="$_rg"; else _rp="${_rg:+$_rg:}$PATH"; fi
+  # --no-push: since RECORD-FETCHES-AND-PUSHES-LEDGER, `record` fetches the ledger from `origin`
+  # first and refuses when it cannot read it. These fixtures are remote-less `git init` repos and
+  # they test the ASSURANCE LABEL, not publication, so they take the labelled offline escape.
+  if OUT="$( cd "$_rd" && PATH="$_rp" sh "$VERIFY" record --no-push \
+               --approved-sha "$_rx" --approved-by "$_rb" --gate release-candidate \
+               --rung "Release candidate" --class Ordinary --scope "$_rs" \
+               --token "GO: merge $_rs" 2>&1 )"; then RC=0; else RC=$?; fi
+}
+
+# _note_of <dir> <sha> -> the recorded note body ('' when none).
+_note_of() { ( cd "$1" && git notes --ref=promotions show "$2" 2>/dev/null ) || true; }
+
+# ── SWAS-207a actuate fixtures. `actuate` now (a) reads the GO note from ORIGIN, (b) refuses a --ref that is not the
+#    PR's head branch AT the approved sha before any merge, and (c) requires the merge command to pin
+#    --match-head-commit <sha> and pass land's vet. So every actuate cell needs: a bare origin holding the note, a
+#    head ref (`feat`, which mkrepo/mga_fx leave at the approved sha) and a merge stub that is a SCRIPT FILE (the
+#    merge command carries no shell metacharacter).
+# _act_origin <dir> — a bare origin as `origin`, with the dir's GO notes ref pushed (unless ACT_LOCAL_ONLY=1 — the
+#    note-stays-local negative). Idempotent; the push is forced so a leg that rewrote its note re-publishes it.
+_act_origin() {
+  _ao="$1/.act-origin.git"
+  if [ ! -d "$_ao" ]; then git init -q --bare "$_ao"; fi
+  git -C "$1" remote get-url origin >/dev/null 2>&1 || git -C "$1" remote add origin "$_ao"
+  if [ "${ACT_LOCAL_ONLY:-0}" != 1 ] && git -C "$1" rev-parse -q --verify refs/notes/promotions >/dev/null 2>&1; then
+    git -C "$1" push -q -f origin refs/notes/promotions:refs/notes/promotions >/dev/null 2>&1 || echo "FAIL: fixture could not publish the GO note to origin" >&2
+  fi
+}
+# _act_stub <dir> <sha> [move-head-to] — writes <dir>/.stub.sh (touches <dir>/.invoked, records its argv in
+#    <dir>/.argv, and optionally moves the head ref `feat` to <move-head-to> AFTER step 0 has passed) and echoes the
+#    --merge-cmd that runs it with the pin.
+_act_stub() {
+  printf '#!/bin/sh\n: > "%s/.invoked"\nprintf "%%s\\n" "$*" > "%s/.argv"\n' "$1" "$1" > "$1/.stub.sh"
+  [ -z "${3:-}" ] || printf 'git -C "%s" update-ref refs/heads/feat %s\n' "$1" "$3" >> "$1/.stub.sh"
+  printf 'sh %s/.stub.sh --match-head-commit %s\n' "$1" "$2"
+}
+
+# ── SWAS-207b solo fixtures.
+# _act_mktip <repo> <dial-line|NONE> <claude-md-line|NONE> [LINK] -> echoes a parentless BASE commit built with plumbing (no
+#    checkout, no index): .kit/dials.conf holds <dial-line> and CLAUDE.md holds <claude-md-line>; LINK makes `.kit` itself a
+#    symlink entry (120000). The commit exists in <repo>, so a push of it puts the tip on origin.
+_act_mktip() {
+  _mt_ents=""
+  _mt_nl='
+'
+  if [ "${SN_WF:-}" = 1 ]; then   # SWAS-901: the installed solo-go workflow is on the tip (the marker line is what the verb reads)
+    _mt_w="$(printf '# COPY & ADAPT\nname: solo-go\n' | git -C "$1" hash-object -w --stdin)"
+    _mt_ws="$(printf '100644 blob %s\tsolo-go.yml\n' "$_mt_w" | git -C "$1" mktree)"
+    _mt_gs="$(printf '040000 tree %s\tworkflows\n' "$_mt_ws" | git -C "$1" mktree)"
+    _mt_ents="040000 tree $_mt_gs	.github$_mt_nl"
+  fi
+  if [ "$2" != NONE ] && [ "${4:-}" = LINK ]; then
+    _mt_l="$(printf 'elsewhere' | git -C "$1" hash-object -w --stdin)"
+    _mt_ents="${_mt_ents}120000 blob $_mt_l	.kit$_mt_nl"
+  elif [ "$2" != NONE ]; then
+    _mt_b="$(printf '%s\n' "$2" | git -C "$1" hash-object -w --stdin)"
+    _mt_s="$(printf '100644 blob %s\tdials.conf\n' "$_mt_b" | git -C "$1" mktree)"
+    _mt_ents="${_mt_ents}040000 tree $_mt_s	.kit$_mt_nl"
+  fi
+  if [ "$3" != NONE ]; then
+    _mt_g="$(printf '%s\n' "$3" | git -C "$1" hash-object -w --stdin)"
+    _mt_ents="${_mt_ents}100644 blob $_mt_g	CLAUDE.md$_mt_nl"
+  fi
+  [ -n "$_mt_ents" ] || _mt_ents="100644 blob $(printf 'base\n' | git -C "$1" hash-object -w --stdin)	README$_mt_nl"
+  _mt_t="$(printf '%s' "$_mt_ents" | git -C "$1" mktree)"
+  git -C "$1" commit-tree "$_mt_t" -m 'base'
+}
+# _act_base <dir> <dial-line|NONE> <claude-md-line|NONE> — publishes that BASE commit as origin's refs/heads/main. SN_KIND=LINK
+#    makes `.kit` a symlink; SN_KIND=REMOTE builds and pushes the commit from a SECOND repo, so the tip is on origin but its
+#    objects are NOT in <dir> (the unfetched-tip shape). NONE+NONE still pushes a main (a plain base that declares nothing).
+_act_base() {
+  _act_origin "$1"
+  if [ "${SN_KIND:-}" = REMOTE ]; then
+    _ab_x="$(mktemp -d)"
+    git init -q "$_ab_x"; git -C "$_ab_x" config user.email other@example.com; git -C "$_ab_x" config user.name other
+    _ab_c="$(_act_mktip "$_ab_x" "$2" "$3")"
+    git -C "$_ab_x" push -q "$1/.act-origin.git" "$_ab_c:refs/heads/main"
+    rm -rf "$_ab_x"
+  else
+    _ab_c="$(_act_mktip "$1" "$2" "$3" "${SN_KIND:-}")"
+    git -C "$1" push -q -f origin "$_ab_c:refs/heads/main"
+    if [ "${SN_KIND:-}" = GOVGONE ]; then   # GOVGONE: delete CLAUDE.md's loose blob from <dir> AFTER the push, so its read fails with rc 128
+      _ab_g="$(printf '%s\n' "$3" | git -C "$1" hash-object --stdin)"
+      rm -f "$1/.git/objects/$(printf '%s' "$_ab_g" | cut -c1-2)/$(printf '%s' "$_ab_g" | cut -c3-)"
+    fi
+  fi
+}
+# write_snote <dir> <sha> <go-by-value> <gate> <tree|AUTO|BAD> [class] [approved-by-value] — a SOLO-shaped GO note: all 13 lines
+#    in `record`'s order, every key on its own line. SN_BOUND overrides the `approved-sha:` line (the bound-sha leg).
+write_snote() {
+  _sn_tree="$5"
+  if [ "$_sn_tree" = AUTO ]; then _sn_tree="$(git -C "$1" rev-parse "${2}^{tree}")"; fi
+  if [ "$_sn_tree" = BAD ]; then _sn_tree=0000000000000000000000000000000000000000; fi
+  printf '%s\n' \
+    "record: promotion GO (approve->execute->log)" \
+    "approved-sha: ${SN_BOUND:-$2}" \
+    "approved-tree: $_sn_tree" \
+    "approved-by: ${7:-Author A [committer]}" \
+    "go-by: $3" \
+    "gate: $4" \
+    "rung: Release candidate" \
+    "change-class: ${6-ordinary}" \
+    "kit-row: (none)" \
+    "scope: PR #260" \
+    "approval-token: \"GO: merge #260\"" \
+    "basis: the owner's words" \
+    "recorded-at: fixture" \
+    | ( cd "$1" && git notes --ref=promotions add -f -F - "$2" >/dev/null 2>&1 )
+}
+# _solo_cell <label> <merge|refuse> <needle> <dial|NONE> <claude-md-line|NONE> <go-by> <gate> <tree|AUTO|BAD> [class] [approved-by]
+#    One actuate run on a fresh fixture. merge: rc 0, the stub ran, OUT carries <needle>. refuse: rc != 0, the stub did NOT
+#    run, OUT carries <needle> (the cell's OWN refusal or line, never a bare rc).
+_solo_cell() {
+  _sc_l="$1"; _sc_w="$2"; _sc_n="$3"; _sc_dial="$4"; _sc_gov="$5"
+  _sc_d="$(mkrepo)" || { fail "$_sc_l: fixture build"; return 0; }
+  _sc_x="$(cat "$_sc_d/.X")"
+  write_snote "$_sc_d" "$_sc_x" "$6" "$7" "$8" "${9-ordinary}" "${10:-Author A [committer]}"
+  _act_base "$_sc_d" "$_sc_dial" "$_sc_gov"
+  run_actuate "$VERIFY" "$_sc_d" feat "$_sc_x" "$(_act_stub "$_sc_d" "$_sc_x")"
+  if [ "$_sc_w" = merge ]; then
+    if [ "$RC" = 0 ] && [ -f "$_sc_d/.invoked" ] && _has "$OUT" "$_sc_n" \
+       && _has "$OUT" 'OK: actuated'; then
+      pass "$_sc_l: solo base + a named go-by -> merged (rc 0), the relationship line says solo"
+    else
+      fail "$_sc_l: rc=$RC invoked=$(invoked "$_sc_d") OUT=[$OUT]"
+    fi
+  elif [ "$RC" != 0 ] && [ ! -f "$_sc_d/.invoked" ] && _has "$OUT" "$_sc_n"; then
+    pass "$_sc_l: refused naming '$_sc_n', merge stub never ran (rc=$RC)"
+  else
+    fail "$_sc_l: rc=$RC invoked=$(invoked "$_sc_d") OUT=[$OUT]"
+  fi
+  rm -rf "$_sc_d" 2>/dev/null || true
+}
+
+# _sga_cell <label> <sed|-> <red|green|nowf> <merge|refuse> <needle> — one solo `actuate` (SWAS-901) with a `gh` PATH stub in front of the default forge:
+#    it serves a fixture check-run list and workflow-run list (through the verb's own --jq, real jq), logs every call, and sends the rest to $EVD/gh.
+#    red: one failed qualifying run that stays red (PROMOTION_VERIFY_SG_POLL=1 bounds the wait); green: the same run succeeded; nowf: the tip carries no
+#    installed workflow. A sed script makes it a MUTANT over a kit-layout COPY of the gate; it passes only when the assertion then FAILS.
+_sga_cell() {
+  _sg_l="$1"; _sg_m="$2"; _sg_k="$3"; _sg_w="$4"; _sg_n="$5"; _sg_cnt="${6:-}"   # a 6th argument: the needle must be a whole line, exactly that many times
+  _sg_d="$(mkrepo)" || { fail "$_sg_l: fixture build"; return 0; }
+  _sg_x="$(cat "$_sg_d/.X")"
+  write_snote "$_sg_d" "$_sg_x" "the owner [self-asserted]" release-candidate AUTO ordinary "Author A [committer]"
+  SN_WF=1; [ "$_sg_k" != nowf ] || SN_WF=0
+  _act_base "$_sg_d" MERGE_RELATIONSHIP=solo NONE
+  SN_WF=""
+  _sg_c=failure; if [ "$_sg_k" = green ] || [ "$_sg_k" = numref ] || [ "$_sg_k" = defmerge ]; then _sg_c=success; fi
+  printf '{"check_runs":[{"id":1,"app":{"slug":"github-actions"},"check_suite":{"id":101},"status":"completed","conclusion":"%s"}]}\n' "$_sg_c" > "$_sg_d/.cr.json"
+  printf '{"workflow_runs":[{"id":11,"path":".github/workflows/solo-go.yml","event":"pull_request_target","check_suite_id":101,"run_attempt":1,"status":"completed","conclusion":"%s","pull_requests":[{"number":260,"base":{"ref":"main"}}]}]}\n' "$_sg_c" > "$_sg_d/.wr.json"
+  printf '%s' "$_sg_x" > "$_sg_d/.headsha"; printf '%s' feat > "$_sg_d/.headref"; [ "$_sg_k" != badref ] || printf '%s' other > "$_sg_d/.headref"
+  printf '%s\n' '#!/bin/sh' \
+    'd=$(dirname "$0"); a="$*"; jqf=.; prev=' \
+    'for x in "$@"; do if [ "$prev" = --jq ]; then jqf=$x; fi; prev=$x; done' \
+    'case "$a" in' \
+    '  *rerun-failed-jobs*) exit 0 ;;' \
+    '  *check-runs*) jq -r "$jqf" < "$d/../.cr.json"; exit $? ;;' \
+    '  *"pr merge"*) printf "%s\n" "$a" > "$d/../.argv"; exit 0 ;;' \
+    '  *pulls/*) case "$a" in' \
+    '      *draft*) exec "$EVD/gh" "$@" ;;' \
+    '      *) printf "%s\t%s\n" "$(cat "$d/../.headref")" "$(cat "$d/../.headsha")"; exit 0 ;;' \
+    '    esac ;;' \
+    '  *"actions/runs?head_sha"*) jq -r "$jqf" < "$d/../.wr.json"; exit $? ;;' \
+    '  *) exec "$EVD/gh" "$@" ;;' \
+    'esac' > "$_sg_d/.gh"
+  mkdir -p "$_sg_d/.ghd"; cp "$_sg_d/.gh" "$_sg_d/.ghd/gh"; chmod +x "$_sg_d/.ghd/gh"
+  # a --ref that is a PR NUMBER only passes where the CI-evidence leg is N/A (an adopter layout: the kit layout binds --ref to the head branch itself), so those two kinds run an adopter-layout COPY of the gate
+  _sg_g="$VERIFY"; _sg_mut=0; _sg_lay=1
+  if [ "$_sg_k" = numref ] || [ "$_sg_k" = othernum ]; then _sg_lay=0; fi
+  if [ "$_sg_m" != - ] || [ "$_sg_lay" = 0 ]; then
+    _le_pvcopy "$_sg_d/pv" "$_sg_lay" "$_sg_lay"; _fxlay "$_sg_d" "$_sg_lay" "$_sg_lay"
+    if [ "$_sg_m" != - ]; then
+      _sg_mut=1
+      if ! _le_mutate "$_sg_d/pv/scripts/promotion-verify.sh" "$_sg_m"; then fail "$_sg_l: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$_sg_d" 2>/dev/null || true; return 0; fi
+    fi
+    _sg_g="$_sg_d/pv/scripts/promotion-verify.sh"
+  fi
+  _sg_ref=feat
+  if [ "$_sg_k" = numref ]; then _sg_ref=260; elif [ "$_sg_k" = othernum ]; then _sg_ref=261; fi
+  git -C "$_sg_d" branch -f 260 "$_sg_x" >/dev/null 2>&1; git -C "$_sg_d" branch -f 261 "$_sg_x" >/dev/null 2>&1
+  _sg_p="$PATH"; PATH="$_sg_d/.ghd:$PATH"; PROMOTION_VERIFY_SG_POLL=1; export PROMOTION_VERIFY_SG_POLL
+  if [ "$_sg_k" = defmerge ]; then
+    if OUT="$( ( cd "$_sg_d" && sh "$_sg_g" actuate --ref feat --approved-sha "$_sg_x" ) 2>&1 )"; then RC=0; else RC=$?; fi
+  else
+    run_actuate "$_sg_g" "$_sg_d" "$_sg_ref" "$_sg_x" "$(_act_stub "$_sg_d" "$_sg_x")"
+  fi
+  PATH="$_sg_p"; unset PROMOTION_VERIFY_SG_POLL
+  if [ "$_sg_k" = defmerge ]; then
+    if [ "$RC" = 0 ] && [ "$(cat "$_sg_d/.argv" 2>/dev/null)" = "$(printf '%s' "$_sg_n" | sed "s/@SHA@/$_sg_x/")" ]; then _sg_r=0; else _sg_r=1; fi
+  elif [ "$_sg_w" = merge ]; then
+    if [ "$RC" = 0 ] && [ -f "$_sg_d/.invoked" ] && _has "$OUT" "$_sg_n" && { [ -z "$_sg_cnt" ] || [ "$(printf '%s\n' "$OUT" | grep -cxF "$_sg_n")" = "$_sg_cnt" ]; }; then _sg_r=0; else _sg_r=1; fi
+  elif [ "$RC" != 0 ] && [ ! -f "$_sg_d/.invoked" ] && _has "$OUT" "$_sg_n"; then _sg_r=0; else _sg_r=1; fi
+  _le_judge "$_sg_l" "$_sg_mut" "$_sg_r"
+  rm -rf "$_sg_d" 2>/dev/null || true
+}
+
+# _hot_cell <label> <sed|-> <dial|NONE> <claude-md-line|NONE> — one TEAM-bar `actuate` (an authenticated non-author approval on the note) that must merge and
+#    must NOT print the handover line ($_HOL). A sed script makes it a MUTANT over a kit-layout COPY of the gate; it passes only when the assertion then FAILS.
+_hot_cell() {
+  _ho_l="$1"; _ho_m="$2"
+  _ho_d="$(mkrepo)" || { fail "$_ho_l: fixture build"; return 0; }
+  _ho_x="$(cat "$_ho_d/.X")"
+  write_note "$_ho_d" "$_ho_x" "Reviewer B [authenticated: github-review]"
+  _act_base "$_ho_d" "$3" "$4"
+  _ho_g="$VERIFY"; _ho_mut=0
+  if [ "$_ho_m" != - ]; then
+    _ho_mut=1; _le_pvcopy "$_ho_d/pv" 1 1; _fxlay "$_ho_d" 1 1
+    if ! _le_mutate "$_ho_d/pv/scripts/promotion-verify.sh" "$_ho_m"; then fail "$_ho_l: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$_ho_d" 2>/dev/null || true; return 0; fi
+    _ho_g="$_ho_d/pv/scripts/promotion-verify.sh"
+  fi
+  run_actuate "$_ho_g" "$_ho_d" feat "$_ho_x" "$(_act_stub "$_ho_d" "$_ho_x")"
+  if [ "$RC" = 0 ] && [ -f "$_ho_d/.invoked" ] && ! _has "$OUT" "$_HOL"; then _ho_r=0; else _ho_r=1; fi
+  _le_judge "$_ho_l" "$_ho_mut" "$_ho_r"
+  rm -rf "$_ho_d" 2>/dev/null || true
+}
+
+# ── GO-IDENTITY-AND-LAND-SOD land fixtures. `land` records THROUGH origin and refuses --no-push, so these
+#    legs need a real bare origin (a throwaway under mktemp; PROMOTION_NOTES_REF names the fixture ledger,
+#    so nothing here can touch the real one). The approved commit X is authored by `Author A`, which is
+#    neither reviewer nor PR author, so land's own commit-author SoD passes and the FORGE derivation is the
+#    only thing under test. The merge-cmd is ONE word (a stub touching $LDMARK): land refuses every shell
+#    metacharacter in a merge-cmd, and "marker absent" is what proves no merge ran.
+_mkland_fx() {
+  LDR="$(mktemp -d)"
+  git init -q --bare -b main "$LDR/origin.git" || return 1
+  ( set -e
+    git clone -q "$LDR/origin.git" "$LDR/c" 2>/dev/null
+    cd "$LDR/c"
+    git config user.email committer@example.com; git config user.name committer; git config commit.gpgsign false
+    printf 'base\n' > f.txt; git add f.txt; git commit -qm G
+    git push -q origin HEAD:refs/heads/main
+    git checkout -q -b feat; printf 'x\n' >> f.txt; git add f.txt
+    GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git commit -qm X
+    git rev-parse HEAD > "$LDR/.X" ) >/dev/null 2>&1 || return 1
+  _fxlike "$LDR/c"
+  LDX="$(cat "$LDR/.X")"; LDMARK="$LDR/.merged"
+  printf '#!/bin/sh\ntouch %s\n' "'$LDMARK'" > "$LDR/stub"; chmod +x "$LDR/stub"
+}
+# _mkland_jira_fx: _mkland_fx's shape on a TRACKER repo (LAND-WRITES-CARD-STATE). G carries CLAUDE.md (jira), the conf,
+# conformance/backlog-lib.sh and scripts/{board.sh,tracker-conf.sh} (real) + a COPY of the gate + stubs for board-claim.sh
+# (`check` -> rc 1: no claim ref) and tracker-jira.sh (state in $STUB_STATE_FILE; STUB_TRANSITION_FAIL=1 refuses). X
+# carries `Kit-Row: AB-1`. The caller sets VERIFY to the gate COPY ($LDR/c/scripts/promotion-verify.sh).
+_mkland_jira_fx() {
+  _jsrc="$(cd "$(dirname "$VERIFY")" && pwd)"
+  LDR="$(mktemp -d)"
+  git init -q --bare -b main "$LDR/origin.git" || return 1
+  ( set -e
+    git clone -q "$LDR/origin.git" "$LDR/c" 2>/dev/null
+    cd "$LDR/c"
+    git config user.email committer@example.com; git config user.name committer; git config commit.gpgsign false
+    mkdir -p .kit scripts conformance
+    printf 'Backlog backend: jira\n' > CLAUDE.md
+    printf 'version=1\nbackend=jira\nbase_url=https://ex.atlassian.net\nflavour=cloud\nauth=basic\nproject=AB\nstate.ready=Selected for Development\nstate.in-progress=In Progress\nstate.done=Done\n' > .kit/tracker.conf
+    cp "$_jsrc/../conformance/backlog-lib.sh" conformance/backlog-lib.sh
+    cp "$_jsrc/board.sh" "$_jsrc/tracker-conf.sh" scripts/
+    cp "$_jsrc/../conformance/ci-classify-changes.sh" conformance/   # SWAS-537: the gate's evidence leg resolves the classifier beside scripts/
+    cp "$VERIFY" scripts/promotion-verify.sh
+    printf '#!/bin/sh\ncase "$1" in check) exit 1 ;; *) exit 0 ;; esac\n' > scripts/board-claim.sh
+    cat > scripts/tracker-jira.sh <<'JIRA_STUB'
+#!/bin/sh
+case "$1" in
+  get-issue) printf 'key\t%s\n' "$5"; printf 'status-name\t%s\n' "$(cat "$STUB_STATE_FILE")"; exit 0 ;;
+  transition) [ "${STUB_TRANSITION_FAIL:-0}" = 1 ] && exit 1; printf '%s' "$6" > "$STUB_STATE_FILE"; exit 0 ;;
+  *) exit 2 ;;
+esac
+JIRA_STUB
+    printf 'base\n' > f.txt; git add -A; git commit -qm G
+    git push -q origin HEAD:refs/heads/main
+    git checkout -q -b feat; printf 'x\n' >> f.txt; git add f.txt
+    GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git commit -qm X -m 'Kit-Row: AB-1'
+    git rev-parse HEAD > "$LDR/.X" ) >/dev/null 2>&1 || return 1
+  LDX="$(cat "$LDR/.X")"; LDMARK="$LDR/.merged"
+  printf '#!/bin/sh\ntouch %s\n' "'$LDMARK'" > "$LDR/stub"; chmod +x "$LDR/stub"
+}
+_L_json() { printf '%s' "$1" | sed "s/@SHA@/$LDX/g"; }
+# _land_run <gh-shim-dir> <approved-by> <go-by|NONE> [extra land args] -> RC, OUT (stdout+stderr merged).
+_land_run() {
+  _lrg="$1"; _lrb="$2"; _lrgo="$3"; shift 3
+  if [ "$_lrgo" = NONE ]; then :; else set -- --go-by "$_lrgo" "$@"; fi
+  rm -f "$LDMARK"
+  if OUT="$( cd "$LDR/c" && PATH="$_lrg:$PATH" PROMOTION_NOTES_REF=promotions sh "$VERIFY" land --ref "${_LREF:-260}" \
+       --merge-cmd "$LDR/stub" --approved-sha "$LDX" --approved-by "$_lrb" --gate release-candidate \
+       --rung "Release candidate" --class control-plane --scope "PR #260" --token "GO: land #260" "$@" 2>&1 )"; then RC=0; else RC=$?; fi
+}
+# SWAS-323b: a landed note is the GO record and then the LAND record (a blank line between), so these two read the GO record, the lines the cells
+# have always counted and indexed: everything before the first blank line.
+_land_note()  { ( cd "$LDR/c" && git notes --ref=promotions show "$LDX" 2>/dev/null | sed '/^$/,$d' ) || true; }
+_land_onote() { git --git-dir="$LDR/origin.git" notes --ref=promotions show "$LDX" 2>/dev/null | sed '/^$/,$d' || true; }
+
+# ── SWAS-727 one-act-approval fixtures (GO_ACT / GO_GIVERS). Below the ^selftest() marker like the other fixtures. A cell builds the
+#    land fixture, publishes an origin main whose .kit/dials.conf (and CLAUDE.md) say what the cell is about, answers the forge with a
+#    `gh` PATH shim that serves the reviews (with ids and bodies) and the one-review body read, runs `land`, and asserts the notes and
+#    the merge marker, never a bare rc. A MUTANT cell runs the very same cell through a sed-rewritten COPY of the gate in a kit layout
+#    and passes only if the assertion then FAILS (the cell has teeth); the shipped gate is never switched.
+_RV_DIAL='GO_ACT=review
+GO_GIVERS=owner-rev'
+_RV_SHA0='0123456789012345678901234567890123456789'
+_RV_COMMENTS=""; _RV_COMMENTSERR=0
+_RV_C5571=""; _RV_CERR5571=0; _RV_BERR5571=0   # SWAS-747: the per-id files of review 5571 (its line comments, a failed comments read, a failed body read)
+_RV_POST=""; _RV_PRE=""; _RVV=""; _RVKIT=0; _RVGATE=""; _RVCLS=""
+# _rv_pre_treedial — the PR's own head commit declares `review` in its tree (a PR must not choose its own bar); LDX moves to that head.
+_rv_pre_treedial() {
+  ( cd "$LDR/c" && mkdir -p .kit && printf 'GO_ACT=review\nGO_GIVERS=owner-rev\n' > .kit/dials.conf && git add .kit/dials.conf \
+    && GIT_AUTHOR_NAME='Author A' GIT_AUTHOR_EMAIL='a@x' git commit -qm 'declare review in the PR' && git rev-parse HEAD > "$LDR/.X" ) >/dev/null 2>&1 \
+    && LDX="$(cat "$LDR/.X")"
+}
+_rv_sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+# _rv_fx <dial text|NONE> [<CLAUDE.md line|NONE>] — the land fixture, then origin's main replaced by a parentless base commit carrying them.
+_rv_fx() {
+  _mkland_fx || return 1
+  if [ "${_RVKIT:-0}" = 1 ]; then _fxlay "$LDR/c" 1 1 1; fi
+  _rvc="$(_act_mktip "$LDR/c" "$1" "${2:-NONE}")" && git -C "$LDR/c" push -q -f origin "$_rvc:refs/heads/main" >/dev/null 2>&1 || return 1
+  # SWAS-323b: a serial land needs origin's main to be an ancestor of the approved head, so the head now CONTAINS the plumbing base (a merge
+  # of the unrelated base into feat); LDX is the merge commit. The base's declarations still come from origin's tip, never from this tree.
+  ( cd "$LDR/c" && git merge -q --allow-unrelated-histories --no-edit "$_rvc" >/dev/null 2>&1 && git rev-parse HEAD > "$LDR/.X" ) || return 1
+  LDX="$(cat "$LDR/.X")"
+}
+# _rv_run <gh shim dir> <approved-by> [extra land args…] — one land through the gate under test (or the mutant copy). RC, OUT.
+_rv_run() {
+  _rvg="$1"; _rvb="$2"; shift 2
+  rm -f "$LDMARK"
+  if OUT="$( cd "$LDR/c" && PATH="$_rvg:$PATH" PROMOTION_NOTES_REF=promotions sh "${_RVV:-$VERIFY}" land --ref "${_LREF:-260}" \
+       --merge-cmd "$LDR/stub" --approved-sha "$LDX" --approved-by "$_rvb" --gate "${_RVGATE:-release-candidate}" \
+       --rung "Release candidate" --class "${_RVCLS:-control-plane}" --scope "PR #260" "$@" 2>&1 )"; then RC=0; else RC=$?; fi
+}
+_rv_none() { [ ! -f "$LDMARK" ] && [ -z "$(_land_note)" ] && [ -z "$(_land_onote)" ]; }
+# _rv_cell <label> <sed-script|-> <expect-rc> <needle> <dial|NONE> <CLAUDE.md line|NONE> <reviews-json> <pr-author-json> <approved-by> [land args…]
+#    expect-rc 0: land merged, the note is on origin, OUT carries the needle, and (when set) the function named in $_RV_POST also holds.
+#    any other rc: that rc, OUT carries the needle, and NOTHING was written or merged. A sed-script (not `-`) makes it a mutant cell.
+_rv_cell() {
+  _cl="$1"; _cm="$2"; _ce="$3"; _cn="$4"; _cdial="$5"; _cgov="$6"; _crev="$7"; _cau="$8"; _cby="$9"; shift 9
+  _RVV="$VERIFY"; _RVKIT=0; _cmut=0; _cd=""
+  if [ "$_cm" != - ]; then
+    _cmut=1; _cd="$(mktemp -d)"; _le_pvcopy "$_cd" 1 1 1; _RVKIT=1
+    if ! _le_mutate "$_cd/scripts/promotion-verify.sh" "$_cm"; then fail "$_cl: the mutant script changed nothing (it no longer matches the gate)"; rm -rf "$_cd" 2>/dev/null || true; return 0; fi
+    _RVV="$_cd/scripts/promotion-verify.sh"
+  fi
+  _rv_fx "$_cdial" "$_cgov" || { fail "$_cl: fixture build"; rm -rf "$LDR" "$_cd" 2>/dev/null || true; return 0; }
+  if [ -n "$_RV_PRE" ]; then "$_RV_PRE" || { fail "$_cl: pre-hook"; rm -rf "$LDR" "$_cd" 2>/dev/null || true; return 0; }; fi
+  _lg="$(_mkgh "$(_L_json "$_crev")" "$_cau")"
+  if [ -n "$_RV_COMMENTS" ]; then printf '%s' "$_RV_COMMENTS" > "$_lg/comments.json"; fi
+  if [ "$_RV_COMMENTSERR" = 1 ]; then : > "$_lg/commentserr"; fi
+  if [ -n "$_RV_C5571" ]; then printf '%s' "$_RV_C5571" > "$_lg/comments-5571.json"; fi
+  if [ "$_RV_CERR5571" = 1 ]; then : > "$_lg/commentserr-5571"; fi
+  if [ "$_RV_BERR5571" = 1 ]; then : > "$_lg/bodyerr-5571"; fi
+  _rv_run "$_lg" "$_cby" "$@"
+  if [ "$_ce" = 0 ]; then
+    if [ "$RC" = 0 ] && [ -f "$LDMARK" ] && [ -n "$(_land_onote)" ] && _has "$OUT" "$_cn" && { [ -z "$_RV_POST" ] || "$_RV_POST"; }; then _cr=0; else _cr=1; fi
+  elif [ "$RC" = "$_ce" ] && _rv_none && _has "$OUT" "$_cn"; then _cr=0; else _cr=1; fi
+  _le_judge "$_cl" "$_cmut" "$_cr"
+  _RVV=""; _RVKIT=0
+  rm -rf "$LDR" "$_lg" "$_cd" 2>/dev/null || true
+}
+_rv_note_line() { printf '%s\n' "$_rvn" | sed -n "${1}p"; }
+# the post-checks of the cells that merge
+_rv_post_oneact() {
+  _rvn="$(_land_note)"
+  [ "$(printf '%s\n' "$_rvn" | wc -l | tr -d ' ')" = 14 ] \
+    && [ "$(_rv_note_line 4)" = 'approved-by: owner-rev [authenticated: github-review]' ] \
+    && [ "$(_rv_note_line 5)" = 'go-by: owner-rev [authenticated: github-review]' ] \
+    && [ "$(_rv_note_line 11)" = "approval-token: \"forge-review:${_RVID:-5551}\"" ] \
+    && [ "$(_rv_note_line 14)" = 'go-act: review' ] \
+    && _has "$OUT" "GO = forge review ${_RVID:-5551} by owner-rev"
+}
+_rv_post_later() {   # SWAS-747: held by a later comment, then a typed GO: the approval's words and the later words, joined by a line feed
+  _rvn="$(_land_note)"
+  [ "$(printf '%s\n' "$_rvn" | wc -l | tr -d ' ')" = 16 ] \
+    && [ "$(_rv_note_line 14)" = 'go-act: separate' ] \
+    && [ "$(_rv_note_line 15)" = 'go-words: "GO, with the full security read but wait for the schema check"' ] \
+    && [ "$(_rv_note_line 16)" = "go-words-sha256: $(printf '%s\n%s' 'GO, with the full security read' 'but wait for the schema check' | _rv_sha)" ]
+}
+_rv_post_held() {
+  _rvn="$(_land_note)"
+  [ "$(printf '%s\n' "$_rvn" | wc -l | tr -d ' ')" = 16 ] \
+    && [ "$(_rv_note_line 4)" = 'approved-by: owner-rev [authenticated: github-review]' ] \
+    && [ "$(_rv_note_line 5)" = 'go-by: the owner [self-asserted]' ] \
+    && [ "$(_rv_note_line 14)" = 'go-act: separate' ] \
+    && [ "$(_rv_note_line 15)" = 'go-words: "GO, with the full security read"' ] \
+    && [ "$(_rv_note_line 16)" = "go-words-sha256: $(printf '%s' 'GO, with the full security read' | _rv_sha)" ]
+}
+_rv_post_plain() {   # a merged note with no go-act at all (today's 13 lines)
+  _rvn="$(_land_note)"
+  [ "$(printf '%s\n' "$_rvn" | wc -l | tr -d ' ')" = 13 ] && ! _has "$_rvn" 'go-act'
+}
+_rv_post_ctrl() {   # a body with newlines, a tab, ESC, a C1 character and a double quote: one line, spaces, the quote escaped
+  _rvn="$(_land_note)"
+  [ "$(printf '%s\n' "$_rvn" | wc -l | tr -d ' ')" = 16 ] \
+    && [ "$(_rv_note_line 15)" = 'go-words: "a b c d e \"q\""' ] \
+    && [ "$(printf '%s' "$_rvn" | LC_ALL=C tr -d '\001-\010\013\014\016-\037\177' | wc -c | tr -d ' ')" = "$(printf '%s' "$_rvn" | wc -c | tr -d ' ')" ] \
+    && [ "$(_rv_note_line 16)" = "go-words-sha256: $(printf '%s' "$_RV_CTRLJSON" | jq -j '.[0].body' | _rv_sha)" ]
+}
+_rv_post_long() {   # a 4800-byte body: capped at 1000 bytes on a UTF-8 boundary with the truncation mark; the hash is the raw body's
+  _rvn="$(_land_note)"; _rvw="$(_rv_note_line 15)"; _rvi="${_rvw#go-words: \"}"; _rvi="${_rvi%\"}"
+  [ "$(printf '%s' "$_rvi" | wc -c | tr -d ' ')" -le 1000 ] \
+    && [ "$(printf '%s' "$_rvi" | tail -c 14 | od -An -tx1 | tr -d ' \n')" = e280a65b7472756e63617465645d ] \
+    && { ! command -v iconv >/dev/null 2>&1 || printf '%s' "$_rvi" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; } \
+    && [ "$(_rv_note_line 16)" = "go-words-sha256: $(printf '%s' "$_RV_LONGJSON" | jq -j '.[0].body' | _rv_sha)" ]
+}
+_rv_post_bs() {   # a body of a, backslash, quote, b: the backslash is doubled before the quote is escaped, so the form is unambiguous
+  _rvn="$(_land_note)"
+  [ "$(_rv_note_line 15)" = 'go-words: "a\\\"b"' ] \
+    && [ "$(_rv_note_line 16)" = "go-words-sha256: $(printf '%s' 'a\"b' | _rv_sha)" ]
+}
+_rv_post_inert() {   # a body of shell syntax is stored as text and nothing ran
+  _rvn="$(_land_note)"
+  [ "$(_rv_note_line 15)" = 'go-words: "$(touch sentinel-727) `touch sentinel-727b` ; rm -rf sentinel-727c"' ] \
+    && [ ! -e "$LDR/c/sentinel-727" ] && [ ! -e "$LDR/c/sentinel-727b" ] && [ ! -e sentinel-727 ] && [ ! -e sentinel-727b ]
+}
+
+# _rec_case <label> <auth|base> <reviews-json-template> <author-login-json> <notice-reason> [approver]
+#   The shared REC-* driver. `@SHA@` in the template is replaced by the fixture's REAL full X sha, so
+#   the resolved-SHA compare is exercised against a genuine object rather than a literal.
+#   Every leg asserts the RECORDED LABEL, never a bare rc — a record NEVER fails on a derivation gap
+#   (it only ever declines to upgrade), so rc alone would pass vacuously on all ten negatives.
+_rec_case() {
+  _cl="$1"; _ce="$2"; _ct="$3"; _ca="$4"; _cn="$5"; _cw="${6:-Reviewer B}"; _csc="${7:-PR #260}"
+  _cd="$(mkrepo)" || { fail "$_cl: fixture build"; return 0; }
+  _cx="$(cat "$_cd/.X")"
+  _cj="$(printf '%s' "$_ct" | sed "s/@SHA@/$_cx/g")"
+  _cg="$(_mkgh "$_cj" "$_ca")"
+  _run_record "$_cd" "$_cg" "$_csc" "$_cw" "$_cx"
+  _cb="$(_note_of "$_cd" "$_cx")"
+  if _cline="$(_grepx "$_cb" '^approved-by:')"; then :; fi
+  if [ "$_ce" = auth ]; then
+    if [ "$RC" = 0 ] && _has "$_cline" "$_cw [authenticated: github-review]"; then
+      pass "$_cl: qualifying forge review -> recorded [authenticated: github-review]"
+    else
+      fail "$_cl: expected the authenticated upgrade; rc=$RC approved-by=[$_cline] note=[$_cb] OUT=[$OUT]"
+    fi
+  else
+    if [ "$RC" = 0 ] \
+       && _has "$_cline" '[self-asserted]' \
+       && ! _has "$_cb" 'authenticated' \
+       && _has "$OUT" "forge-review derivation: $_cn" \
+       && _has "$OUT" 'recording [self-asserted]'; then
+      pass "$_cl: no upgrade -> [self-asserted] kept + '$_cn' notice on stderr"
+    else
+      fail "$_cl: expected NO upgrade + '$_cn'; rc=$RC approved-by=[$_cline] note=[$_cb] OUT=[$OUT]"
+    fi
+  fi
+  rm -rf "$_cd" "$_cg" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  --selftest)
+    [ -f "$VERIFY" ] || { echo "FAIL: missing actuate producer $VERIFY"; exit 1; }
+    [ -f "$GUARD" ]  || { echo "FAIL: missing guard core $GUARD"; exit 1; }
+    selftest; exit $? ;;
+  "")
+    wiring; exit $? ;;
+  *)
+    echo "usage: promotion-actuate-wired.sh [--selftest]" >&2; exit 2 ;;
+esac

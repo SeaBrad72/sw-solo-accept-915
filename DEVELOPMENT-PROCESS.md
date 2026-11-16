@@ -1,0 +1,482 @@
+# Development Process — Agentic SDLC
+
+**Purpose:** Define *how work flows and improves over time* — from a project's first day through released, operating software.
+
+**Applies to:** All projects, all contributors (human and AI), solo or multi-agent.
+
+**Status:** MANDATORY — exceptions require explicit approval.
+
+**Relationship to other docs:** This is the **process** companion to `DEVELOPMENT-STANDARDS.md` (the universal quality bar) and `ENGINEERING-PRINCIPLES.md` (authoritative principles + Definition of Done). This doc owns *flow, cadence, and improvement*; the standards doc owns *what good looks like* (with stack specifics in your chosen `profiles/<stack>.md`). When they overlap, `ENGINEERING-PRINCIPLES.md` is authoritative.
+
+---
+
+## 1. Governing Lens
+
+One principle decides what belongs in this process and what doesn't:
+
+> **Rituals that manage or forecast human effort die or transform. Rituals that clarify intent or improve quality get stronger.**
+
+Agent effort is fast and cheap; the scarce resources are **human attention** and **integration risk**. So estimation, velocity, sprint commitment, and standups lose their reason to exist — while intent-clarifying and quality practices (Definition of Ready, acceptance criteria, demo/acceptance, retrospectives, adversarial review) get *more* powerful, because agents can run them more often and in parallel than a human team ever could.
+
+A second pattern runs throughout: **define the rich model, ship a sensible default, make it per-project configurable, and let maturity/metrics raise the bar.** The backlog backend, autonomy tiers, error budgets, and scale stages all obey this — nothing heavy is imposed before it earns its place.
+
+---
+
+## 2. Roles (functions, not titles)
+
+Roles are **functions, each mappable to a human or an agent** — not job titles. On a small team one person or agent holds several; the rule is that every function is *covered* and a few separations are *enforced*.
+
+| Role | Owns | Typically |
+|------|------|-----------|
+| **Intent owner** (product) | The *why*, acceptance criteria, accepting increments | Human |
+| **Lead / integrator** | The board, WIP limits, integration, ratifying retro/doc/governance changes (a person sets autonomy tiers) | Human or lead agent |
+| **Builder** | Implementing increments per standards | Agent or human |
+| **Reviewer** | Independent review (quality, security lens) | Agent or human |
+| **On-call / operator** | Watching production, triaging incidents | Human + agent-assist |
+| **Security owner** | Threat modeling, the security/compliance gate (a tier raise is a human act) | Human or specialized agent |
+
+**Enforced separations:** the **Builder is never the sole Reviewer** of their own work; **ratification of governance/standards/doc changes is always human** (agents propose, humans ratify).
+
+### Personas (who holds which function)
+
+The functions above are authoritative. **Personas are lenses on them** — an enterprise puts named roles around the loop; this maps each to the function it holds, where it plugs in, and its entry/exit artifact. One person or agent may hold several (as above).
+
+| Persona | Holds function(s) | Plugs in at | Entry → exit artifact |
+|---------|-------------------|-------------|-----------------------|
+| **Product Owner / BA** | Intent owner | Discover → Plan; accepts increments | `FEATURE-REQUEST` in → accepted increment out *(dedicated)* |
+| **Designer** | *informs Intent owner (advisory — no standalone §2 function)* | Discover (UX input) → Review (a11y sign-off) | design assets / UX handoff in → `A11Y-SIGNOFF` out *(dedicated)* |
+| **Engineer** | Builder (often also Reviewer / Lead) | Plan → Build → Review | spec in → reviewed PR out |
+| **QA Engineer** | Reviewer (test lens) + acceptance | Review + UAT acceptance gate (§9 — "Environments & promotion") | `TEST-PLAN` in → `UAT-SIGNOFF` out *(dedicated)* |
+| **DevOps / SRE** | On-call / operator | Release → Operate (promotion, deploy, rollback, monitoring) | promotion run in → operated service out — works through `RUNBOOK` *(shared)* |
+| **Security owner** | Security owner | the security / ratification gate (§7, §13) | threat model in → gate pass / governed exception |
+| **Lead / Agent** | Lead / integrator, Builder | the whole loop | the board in → integrated, ratified work out |
+
+Markers above: *dedicated* = a template this persona owns in `templates/`; *shared* = the persona works through another artifact (no persona-specific template). The unmarked core roles (Engineer, Security owner, Lead/Agent) likewise work through shared artifacts — the spec/PR, the security gate, and the board — not a persona-specific template. The asymmetry is deliberate: not every lens needs its own template. (QA's UAT acceptance ties to the Dev→QA→UAT→Prod model, §9; the Designer's a11y sign-off to the Definition-of-Done accessibility item.)
+
+---
+
+## 3. Project Inception (Phase 0)
+
+Before the steady-state loop can run, a greenfield project passes **once** through Inception. The loop assumes a project already exists; Phase 0 is how it comes to exist. It is a gate, not a stage you revisit.
+
+```
+INCEPTION (one-time) ──▶ [ Discover → Plan → Build → Review → Release → Done → Operate ↺ ]
+```
+
+**Inception checklist:**
+
+1. **Charter** — the problem, the vision, success metrics, scope boundaries, and the named **intent owner**. (Project-altitude Discovery; see §5 for the per-item version.)
+2. **Tech selection** — choose the stack via a **spike**, and record the choice and its alternatives as **ADR-000**. This is where "we haven't picked technologies yet" is formally resolved. Until done, downstream standards can't be specialized.
+3. **Repo & environment** — repo created; branch protection on `main`; `.gitignore`; `.env.example`; reproducible local env (Docker / devcontainer); secrets management wired.
+4. **Tooling & CI/CD baseline** — formatter, linter, test runner, and a CI pipeline with quality gates, appropriate to the chosen stack. Green pipeline on an empty project before feature work starts.
+5. **Instantiate project artifacts** — create the project's `CLAUDE.md` (from `templates/PROJECT-CLAUDE-TEMPLATE.md`), `RUNBOOK.md`, the backlog (`BACKLOG.md` from `templates/BACKLOG-TEMPLATE.md`, or chosen backend), and a seed roadmap.
+6. **Per-project configuration** — declare in the project `CLAUDE.md`: backlog backend (§6), autonomy-tier defaults (§13), SLO/error-budget posture (§9), review routing (§12), WIP limits, and environments (Dev/QA/UAT/Prod — see Environments & promotion).
+7. **Assign roles** — fill each function in §2 with a human or agent for this project.
+8. **Exit gate — "Inception Done"** — charter approved, stack decided (ADR-000), CI green, branch protection on `main`, project `CLAUDE.md`/`RUNBOOK`/backlog in place, config declared (backlog backend, autonomy tier, review routing, WIP limits, cost posture), roles assigned (every function except on-call), identities. This is the **first-slice set** (maturity Stage 1), and **only then does the project enter the loop at Discover.** The **first-deploy set** is owed before the first production deploy and is not yet gated: SLO/error-budget posture, environments, the on-call role, the BIA (data projects), and RUNBOOK §4 Deploy, §5 Rollback, §6 Disaster recovery (data projects) and §8 Monitoring. `inception-done` prints each as an `OWED` line and never reads it for the verdict; the deploy gate that makes them block is a later card. The two lists are in `START-HERE.md`.
+
+Inception is itself subject to the standards (the empty repo already meets the structural bar) and produces its first artifacts per §15.
+
+**Bootstrap order (incept-first):** run `incept` *first* (it `git init`s) — **do not commit before it** (no repo yet; a pre-incept commit breaks `inception-done`'s fixtures). Commit the incepted baseline as the first commit; the first feature branches from it, never a restored `origin/main`. `incept` is exempt from the loop's design/build *mechanics* (see the "Inception exception" notes in `skills/design` + `skills/build`), not from architecture-first (ADR-000). Full sequence + the detail: [`docs/adoption/inception-bootstrap.md`](docs/adoption/inception-bootstrap.md).
+
+---
+
+## 4. The Loop
+
+Work flows continuously through stages — pulled, not pushed, the moment capacity frees. There is no timebox; **humans are the pacing metronome** via the checkpoints, and **WIP limits** protect review bandwidth and integration safety. The loop does not end at release — it closes through **Operate**, whose signals feed back into **Discover**.
+
+```
+        ┌─────────── L3 · PROCESS RETRO (periodic) → edits THESE docs ──────────────┐
+        │  ┌──────── L2 · MILESTONE RETRO → adjust roadmap, backlog, docs, memory ──┐│
+  ┌─────┼──┼─────────────────────────────────────────────────────────────────────┐ ││
+  │     ▼  ▼                                                                       │ ││
+DISCOVER → PLAN →│plan│→ BUILD → REVIEW →│merge│→ RELEASE →│accept│→ DONE → L1 RETRO │ ││
+ (intake, (slice,  shown         ▲         gate  (deploy,    gate    │   (agent note)│ ││
+  validate, DoR,                 │L0 loop        flags,             ▼               │ ││
+  innovate) threat-model)        │               rollout,    durable learnings→memory│ ││
+  ▲                              │               smoke,                              │ ││
+  │   EVENT RETRO ◀──────────────┴─ any stage ─▶ CHANGELOG)                          │ ││
+  │   (bug·red CI·blocker)                          │                                │ ││
+  │                                                 ▼                                │ ││
+  └──────────────── OPERATE & SUPPORT ◀── monitor · triage · resolve ◀───────────────┘ ││
+        production signals (errors, tickets, usage, telemetry) feed Discover ─────────┘│
+                                                                                        │
+        adjust always exits into an artifact (PR · memory · backlog · docs) ────────────┘
+```
+
+| Stage | What happens | Exit |
+|-------|--------------|------|
+| **Discover** | Intake, **product validation** (§5), triage, innovation lens. | Validated candidate item |
+| **Plan** | Slice into small vertical increments; acceptance criteria; spec for non-trivial work; **threat-model** sensitive features (→ `templates/THREAT-MODEL-TEMPLATE.md`). Must reach the **Definition of Ready** (the entry gate in `CLAUDE.md`). Design is a gate inside Plan, not a stage of its own (owner-ratified). | Plan presented (non-blocking) |
+| **Build** | TDD per `DEVELOPMENT-STANDARDS.md`. L0 reflection-in-action runs continuously. Fast inner loop (`docs/operations/dev-inner-loop.md`). | Self-verified, tests green |
+| **Review** | "Did we build it *right*?" — code + adversarial/multi-lens + **security lens** + **code-quality lens** (`templates/REVIEW-RECORD-TEMPLATE.md` quality-lens rubric), routed per ownership. | Merge gate (human) |
+| **Release** | "Done → Live": deploy, feature flags, staged rollout, smoke test, CHANGELOG, rollback ready — see **Safe Change Delivery (§10)**; verified against `conformance/definition-of-deployable.md`. Breaking changes need explicit approval. | Live in production |
+| **Done** | **Acceptance** ("right thing?"), Definition of Done met, **L1 retro** written (advisory: a missing one WARNs). | Closed |
+| **Operate** | Monitor, triage, resolve; **feed signals back to Discover** (§9). | Continuous |
+
+**Milestones** are the planning/retro horizon, not the execution cadence.
+
+---
+
+## 5. Discovery & Intake
+
+Discovery turns a raw idea into a **validated candidate** before it earns a place on the board. Lightweight — a handful of prompts, not a PRD:
+
+- **Problem & user** — what problem, for whom? What's the current pain?
+- **Evidence** — what tells us this is real (signal, request volume, telemetry, support tickets)? Not "we assume."
+- **Success metric / hypothesis** — how will we know it worked? State it as a measurable hypothesis.
+- **Rough scope & risk** — small enough to slice? Any obvious risk/complexity/compliance flags?
+- **Innovation lens** — could AI materially improve this? Is there a reusable or product angle?
+- **UX & accessibility lens** — is there a user-experience or visual surface? If so, the Designer informs the candidate here; capture rough flows/assets and flag the WCAG 2.1 AA accessibility obligation that the Definition of Done will check. The Designer signs the WCAG check at Review using `templates/A11Y-SIGNOFF-TEMPLATE.md`.
+
+**Output:** a candidate item with intent + a validation note, ready for Plan. Items that fail validation go to the roadmap parking lot, not the board.
+
+---
+
+## 6. Work Items & Backlog (Pluggable)
+
+The backlog is an **abstraction** so the storage backend swaps per project without changing the loop, gates, or retros. For multi-agent use it is also the **atomic work-distribution queue**.
+
+**Work-item model (backend-agnostic):**
+- **States:** `Backlog → Ready → In Progress → In Review → Released → Done` (+ `Blocked`).
+- **Required fields:** title · intent (why) · acceptance criteria · size (one-flow small) · risk/complexity tag · owner (human or agent) · links (spec, PR, milestone).
+- **Claiming:** entering `In Progress` is an **atomic** ownership change — no two agents grab the same item. On the `BACKLOG.md` backend that sentence has a mechanism behind it: `sh scripts/board-claim.sh claim <ROW-ID> --branch <name>` pushes `refs/claims/<ROW-ID>` to the forge without a `+`, so a second claimant is refused at claim time and told who holds the row; the same verb moves the row. The CI presence gate's `--claims` arm reds an In Progress row with no live claim for the branch, and **the merge releases the claim — from `land` as well as from `actuate`**; a claim reclaimed as **stale** now requires a forge-visible **proof** of staleness (branch gone · a merged same-repo PR with no open sibling · the row Done on the default branch's board), with every non-holder release recorded in `refs/claims-log/<ROW-ID>`, and a parked slice is picked up cold with `sh scripts/sparkwright resume <ROW-ID>`. Ceiling: it stops accidental double-work, not an actor who force-pushes the ref (`docs/work-tracking/adapters.md`). **Board-edit ordering (approval-preserving conduct: ordering is conduct, not a predicate):** bind the board row by **branch name** in the slice's *first* push (the presence gate has accepted branch-name binding since v3.129.0); move it to In Review — PR cell = branch name, then number — in the `gh pr create` push itself; fold every owner-step/board edit into pushes that *precede* the review request; request approval only on the **final diff**. Rationale, measured: `dismiss_stale` voids an approval on *any* later push, so a board edit sequenced after the review request spends an owner approval on ceremony (2 of 9 approvals were killed by pure board-ceremony commits).
+
+**Backend adapters — chosen per project (at Inception), declared in the project's `CLAUDE.md`:**
+
+| Backend | When |
+|---------|------|
+| **`BACKLOG.md`** (repo-native) | **Default.** Zero setup, travels with the repo, directly agent-readable. Created at Inception/Plan. |
+| GitHub (Issues + Projects) | GitHub-centric teams |
+| Jira (Atlassian) | Enterprise / Jira shops |
+| Azure DevOps (Boards) | Microsoft / .NET shops |
+| Linear | Teams already in Linear |
+| GitLab (Issues / Boards) | GitLab shops; self-hosted / regulated |
+
+The loop, gates, and retros are identical regardless of backend — only storage swaps. An adapter must satisfy the contract: the states above, the required fields, and atomic claiming. **Per-tracker mappings** (state map · field map · atomic claim · fit notes) for each named backend, plus a "bring your own tracker" recipe, are in `docs/work-tracking/adapters.md`. General PM tools (Asana/Monday/ClickUp) are intentionally not named here — they lack a race-safe atomic-claim primitive; use the bring-your-own recipe with its caveats.
+
+### Two altitudes: roadmap vs. board
+- **Roadmap** (strategic) — vision, phases, parking lot, success metrics. Seeded at Inception; feeds **Discover**; reviewed at milestone retros.
+- **Flow board** (tactical) — the work-item queue running the loop.
+
+The roadmap answers *what should we build and why*; the board answers *what is in flight now*. Roadmap items decompose into board items at Plan.
+
+### Prioritization & work types
+
+Validation (§5) decides whether an item is *worth doing*; prioritization decides *what's next*. The backlog is **ordered, not a pile**:
+
+- **Ordering signal:** value × urgency ÷ effort-risk. The **intent owner** ranks by value; the **lead** breaks ties on risk/dependencies. No story points — the risk/complexity tag plus slice-size discipline replace estimation.
+- **Work types share one board** and are prioritized *against each other*, not in silos: **feature · bug · tech-debt · spike · recurring/maintenance** (§15).
+- **Tech debt is first-class** — not just "captured" at Done. It enters the backlog as tagged items, is prioritized alongside features, and gets a standing **paydown allocation** (a fixed share of capacity per cycle) so it's serviced continuously rather than deferred until it bites. Debt the team chooses *not* to pay is recorded with that decision.
+
+---
+
+## 7. Gates & Checkpoints
+
+Humans gate only where judgment matters; agents flow at machine speed between gates. **Gates are also the autonomy boundaries** (§13) — an agent's autonomy level is how far it proceeds before a gate.
+
+| Gate | Question | Owner |
+|------|----------|-------|
+| **Definition of Ready** | Safe to start? (the enumerated entry gate in `CLAUDE.md` — criteria, INVEST slice, deps, success metric, + conditional flags) | Human/lead |
+| **Threat model** *(sensitive/regulated features)* | What can go wrong security/privacy-wise? (`templates/THREAT-MODEL-TEMPLATE.md`) | Security owner |
+| **Plan presented** *(non-blocking; replaces the per-slice human Spec gate)* | What team and plan is the conductor about to proceed with? The human may change a row; nothing waits for a ratification. | Conductor presents, human may amend |
+| **Review** | Did we build it *right*? (quality, **security lens**, standards) | Different agent + human |
+| **Eval gate** *(AI features)* | Do model/prompt outputs meet the eval bar — and did this change not regress evals? | Builder + reviewer |
+| **SAST** *(first-party code)* | Do static-analysis findings pass — no high-severity injection / auth-bypass / SSRF / unsafe-deserialization? (`docs/operations/security-scanning.md`) | Builder + reviewer |
+| **License compliance** *(when an SBOM is produced)* | Do dependency licenses pass policy — no denylisted copyleft; undetermined ones reviewed? (`scripts/license-check.sh`) | Builder + reviewer |
+| **AI System Card** *(AI features)* | Is the AI governance declared — risk classified (consequential / children's / prohibited), human oversight named? (`conformance/responsible-ai-readiness.md`) | Security / compliance owner + reviewer |
+| **Compliance gate** *(regulated domains)* | Does this meet the regulatory bar before release? | Security owner + human |
+| **15-Factor conformance** *(deployable services)* | Does the architecture satisfy the applicable 15 factors? (`conformance/15-factor-checklist.md`) | Reviewer + lead |
+| **Definition of Deployable** *(deployable services)* | Is the release safe to promote — rollback ready, smoke + monitoring wired? (`conformance/definition-of-deployable.md`) | Release manager + reviewer |
+| **DR readiness** *(data services)* | Is DR provable — BIA done, RTO/RPO tiered, restore drill passed? (`conformance/dr-readiness.md`) | On-call / operator + reviewer |
+| **Resilience readiness** *(deployable services)* | Do resilience + load/soak verifications pass — breaker trips, degrades gracefully, within perf budget? (`conformance/resilience-readiness.md`) | On-call / operator + reviewer |
+| **Observability readiness** *(deployable services)* | Are SLOs declared and telemetry wired — signals emit, alerts fire on breach, error budget tracked? (`conformance/observability-readiness.md`) | On-call / operator + reviewer |
+| **Accessibility** *(user-facing UI)* | Keyboard / screen-reader / contrast pass (WCAG 2.1 AA)? Recorded in `templates/A11Y-SIGNOFF-TEMPLATE.md` (axe / Lighthouse evidence). | Designer / reviewer |
+| **Acceptance** | Did we build the *right thing*? (intent/need) | Intent owner |
+| **Definition of Done** | Truly complete? (the enumerated exit gate in `CLAUDE.md`; quality bar in `DEVELOPMENT-STANDARDS.md`) | Automated + human |
+
+Review and Acceptance fail *differently* and are kept distinct. The gates marked *(…)* above are **conditional** — each applies only where its trigger fits (sensitive/regulated, AI, regulated domain, deployable service, data-handling); don't impose them where they optimize nothing. For AI features, **evals are the dev-time quality bar** — the AI analog of TDD: written alongside the feature, run in CI, and gating like tests (see `DEVELOPMENT-STANDARDS.md`).
+
+---
+
+## 8. Retrospectives (Nested)
+
+Same structure at every level (fractal); different scope and frequency. **Every retro must exit into an artifact** — that routing *is* the "adjust" step. A retro that changes nothing is theater. **Epic-close / release-boundary checklist** — the same rule binds the boundary event (an epic closing, a release train shipping): run the kit-steward meta-control panel at the **full (11-dimension) profile** (`docs/enterprise/meta-control.md`), which leaves the two standing artifacts, both **human-committed** — a row appended to `docs/governance/meta-control-log.md` and a dated verdict artifact under `docs/architecture/` — then route its findings into the backlog as ordinary rows and advance the state marker with that log row, so the freshness detector and the release rung see one record. The trigger is thereby a **documented boundary event**, not conductor self-start: a check that distrusts the conductor must not depend on the conductor to remember it. **The teeth do not move** — enforcement remains the release-tag cadence gate, which refuses a tag once the cadence is ESCALATED, and every tag additionally prints one line of panel freshness. **Ceiling:** this checklist is *conduct anchored in a governing doc*; a boundary that skips it is caught only later, by that responder, at >2N release tags.
+
+| Level | Trigger | Who | Output → Destination |
+|-------|---------|-----|----------------------|
+| **L0 · Reflection-in-action** | Every tool result / test run | Agent, silently | Course-correction (no artifact) → immediate behavior |
+| **L1 · Increment retro** | Item → Done / PR opened | Building agent | Tiny structured note → PR/item; durable learnings → memory; doc proposals → L2 |
+| **L2 · Milestone retro** | Milestone close / time-fallback | Human + lead, fed by L1 notes | Pattern-level decisions → roadmap, backlog, the two docs, memory |
+| **L3 · Process retro** | Periodic / when the process bites | Human | Process improvements → `DEVELOPMENT-PROCESS.md` + `DEVELOPMENT-STANDARDS.md`; kit-level improvements → the project's own backlog (humans ratify) |
+| **Event retro** | Bug · red CI · rejected review · blocker — *any stage* | Whoever hit it | Blameless triage → logged on item; prevention → backlog/docs |
+
+**L1 increment-retro prompt (kept tiny — seconds to write):**
+> Goal vs. what I actually did · friction/surprises · spec deviations & why · what future work should know · proposed adjustments.
+
+**Two ratified defaults:**
+1. **L1 is a tiny note** — heaviness kills the per-increment habit.
+2. **Agents propose, humans ratify** — agents never silently edit the standards/process docs that govern them; proposed changes surface at L2.
+
+**Event retro = impediment / bug / anomaly handler.** Handles in-flight blockers, bugs, and anomalies. *Production* incidents follow Operate & Support (§9) and the Incident Response / postmortem standard in `DEVELOPMENT-STANDARDS.md` §15.
+
+---
+
+## 9. Operate & Support
+
+The loop is only closed when production teaches the next iteration. Operate is **continuous**, runs alongside the loop, and **feeds Discover**.
+
+**The support arc:**
+```
+monitor → detect (alert · error spike · support ticket · user feedback · usage telemetry)
+        → triage (severity P0–P3) → route → resolve → feed back to Discover
+```
+- **Route** decides: fix-now (Event retro → hotfix), backlog item, or spike. P0/P1 escalate to Incident Response + postmortem (`DEVELOPMENT-STANDARDS.md` §15).
+- **On-call / watch** — a human is on-call; **agents assist**: detect, summarize, correlate, and *propose* remediation. Production actions obey the autonomy/reversibility rules in §13 (irreversible prod actions are human-gated).
+- **Feedback edge** — production signals (errors, tickets, telemetry, user feedback) are **first-class Discover inputs**. This is the arc that turns a delivery pipeline into a closed-loop SDLC.
+
+**SLOs & error budgets (per service, per project):**
+- Define SLOs and an error budget for production services.
+- **Default: soft** — surface budget burn in metrics and retros; do not hard-gate releases.
+- **Maturity step: hard-gate** — a project at production scale may promote to SRE-style gating (non-critical releases freeze when the budget is burned until reliability recovers). Mirrors the Stage 1–4 maturity progression in `docs/enterprise/ORG-ROLLOUT.md`. The same soft→hard promotion applies to the DORA change-failure rate / MTTR — see `docs/operations/dora-metrics.md`.
+
+**Cost / spend governance (per project):** track delivery and runtime cost — including agent/compute spend, which can grow fast. **Default: tracked and surfaced in metrics; a spend-gate (alert/throttle on budget burn) promotes at maturity** — same soft→gating progression as error budgets.
+
+### Environments & promotion
+
+Changes flow through a promotion pipeline with a gate between each tier:
+
+| Tier | Purpose | Promotion gate into it |
+|------|---------|------------------------|
+| **Dev** | Active development / integration | CI green on the PR |
+| **QA** | Automated + integration acceptance | Dev green + test suite/integration pass |
+| **UAT** | Stakeholder / business acceptance | QA green + acceptance sign-off (PO/QA) (record it with `templates/UAT-SIGNOFF-TEMPLATE.md`) |
+| **Prod** | Live users | UAT sign-off + **human approval (release manager)** |
+
+**Production promotion is always human-gated** regardless of agent autonomy tier (§13) — it is in the irreversible/high-blast set. Promotion is forward-only through the tiers; no skipping straight to Prod.
+
+A project may **collapse tiers with a one-line reason** (e.g. a tiny internal tool runs Dev→Prod) — but the contract is: at least one non-prod tier, gated promotion, and a human gate on prod. Environments and per-tier deploy triggers are declared in the project `CLAUDE.md` (§3).
+
+**Ephemeral preview environments** *(recommended for deployable services)* — a per-PR isolated environment seeded with **safe test data** (`docs/operations/test-data-management.md`), **scoped short-lived credentials**, a **TTL/auto-teardown** on merge/close, and **never prod data or secrets**; it accelerates Review/Acceptance. Declared in RUNBOOK §4; reference `docs/operations/preview-environments.md` (`conformance/preview-environments-readiness.md`).
+
+For containerized services, promotion moves an **attested image by digest** (not a rebuilt tag) across Dev → QA → UAT → Prod; rollback is a redeploy of the previous digest. Kubernetes + Helm is **one** reference orchestration pattern (`profiles/typescript-node/deploy/`); the principle — promote by digest, not tag — holds for any orchestrator.
+
+**Promotion is proportional** — rigor at each promotion scales with **rung × change-class** (Ordinary / Sensitive / Control-plane; full matrix in [`docs/governance/promotion-contract.md`](docs/governance/promotion-contract.md)). Relaxation is **deferral, not a waiver**: the destination rung's gates fire in full on the whole accumulated change at every promotion, and the Control-plane class stays human-ratified at every rung.
+
+### Outcome validation
+
+Discovery (§5) commits a **success-metric hypothesis**; Operate is where it's checked. After a feature has been live long enough to read signal, validate it against its hypothesis:
+
+- **Hit** → record the win; the item is truly Done (outcome, not just output).
+- **Miss / inconclusive** → route back to **Discover** as new evidence — iterate, pivot, or retire. A shipped feature that doesn't move its metric is a discovery input, not a closed item.
+
+This makes the loop measure *value delivered*, not just *work completed* — and is the product half of the production→Discover feedback edge.
+
+---
+
+## 10. Safe Change Delivery
+
+How to change a running system without breaking it — the release-engineering mechanisms behind the **Release** stage (§4) and the L2 "merge behind flags" autonomy (§13). Most are maturity-gated: a Stage-1 project uses the basics; depth promotes with scale. (Supply-chain integrity below is the exception — it is a required baseline CI gate, `DEVELOPMENT-STANDARDS.md` §14.)
+
+### Feature flags
+- **Purpose** — decouple deploy from release: merge incomplete or risky work to trunk **behind a flag**, keeping `main` always deployable. This is what makes trunk-based development and L2 agent autonomy safe.
+- **Kill-switch** — flag-off is the **fastest rollback**; prefer it to a redeploy for flag-guarded changes.
+- **Lifecycle & retirement** — every flag has an owner and an expected end state. **Stale flags are tech debt**: they enter the backlog as tech-debt items (§6) and are cleared in recurring maintenance (§15). A flag with no expiry is a defect.
+
+### Database & schema migrations
+- **Expand-contract** (parallel-change) — add the new shape → migrate/backfill → switch reads → remove the old. Never a breaking change in one step.
+- **Backward-compatible & reversible** — each migration runs against the *previous* app version; every migration has a tested down-path.
+- **Zero-downtime by default** — no long locks; large backfills run async/batched. Migrations are versioned — never manual production DDL.
+
+### Progressive delivery
+- Release by **canary or blue-green**, not big-bang: ship to a slice, watch SLOs/error rate (§9), then widen or abort.
+- **Default:** staged rollout (staging → small % → full). **Maturity step:** automated canary analysis. Same soft→gating progression as error budgets. **Reference: `docs/operations/progressive-delivery.md`** (strategies, multi-stage smoke gates, canary analysis).
+
+### Rollback vs. forward-fix
+- **Default to rollback** when production is degraded and the cause isn't obvious early in the incident — restore service first, diagnose after.
+- **Forward-fix** only when rollback is riskier than the bug (e.g., an irreversible migration already applied) or the fix is trivial and verified.
+- Preference order: **flag-off → redeploy previous → revert + redeploy**. Every release declares its rollback path *before* it ships (the "rollback ready" in §4) — captured in `conformance/definition-of-deployable.md`.
+
+### Supply-chain integrity *(required CI gates)*
+Pin/lock dependencies; scan dependencies for vulnerabilities; generate an **SBOM**; attest build **provenance** for released artifacts. These are **required CI gates on every PR** (`DEVELOPMENT-STANDARDS.md` §14), not optional hooks. Tooling is a project choice (**→ profile**; e.g., the wired Semgrep / Sonatype). A deeper full-tree audit also runs in recurring maintenance (§15).
+
+### Versioning & release identity *(configuration hook)*
+Tag releases with **semantic versioning**; the CHANGELOG (§15) records what each version changed. Breaking changes bump major and require explicit approval (§4).
+
+---
+
+## 11. Rituals We Keep, Adapted
+
+- **Definition of Ready** — the enumerated entry gate before Build (`CLAUDE.md`, peer to the Definition of Done).
+- **Acceptance criteria + INVEST slicing** — testable criteria, small vertical increments.
+- **Acceptance checkpoint** — intent validation, distinct from code review.
+- **Spike** — explicit time-boxed research/de-risk work-item type for unknowns, *before* committing a plan (used heavily at Inception for tech selection).
+- **Adversarial / multi-lens review** — builder agent + critic agent, or a spec reviewed in parallel by product / architecture / test / security lenses. Parallel perspectives are nearly free agentically — use them.
+
+## Rituals We Drop (and why)
+
+- **Story-point estimation / planning poker** — forecasts scarce *human* effort; agent effort is cheap. Replaced by slice-size discipline + a risk/complexity tag.
+- **Time-boxed sprint planning** — replaced by continuous backlog refinement + WIP pull.
+- **Daily standup (as a meeting)** — the board *is* the status. Replaced by an on-demand board digest.
+- **Burndown / velocity charts** — replaced by the flow + DORA metrics in §14.
+
+---
+
+## 12. Multi-Agent Coordination
+
+These mechanics work for a single agent spawning sub-agents today and scale to many parallel agents.
+
+- **Shared board = work-distribution queue.** The single source of work-truth that humans and agents read and claim from. Replaces the standup: state is queryable, not verbally synced. **Context hygiene (advisory):** because the board carries the state, a long-running orchestrating session can be recycled at a slice boundary well before the runtime's context limit (adopter-tuned; this kit's own sessions use ~400K tokens) — either start a fresh session (the board, the claim ref and the session's memory carry it) or compact the session in place and continue; a heuristic, not a gate.
+- **Atomic work-claiming.** Entering `In Progress` is an atomic ownership transition; no double-claims. The `BACKLOG.md` backend implements it as a **forge ref** — `scripts/board-claim.sh claim` pushes `refs/claims/<ROW-ID>` and the forge's non-fast-forward rule refuses the second claimant, naming the first. It stops accidental double-work between cooperating sessions; it is **not** an actor with push rights, who overwrites or deletes the ref with or without `--force` (`docs/work-tracking/adapters.md`).
+- **Worktree / branch isolation.** Parallel agents work in isolated git worktrees / short-lived branches. **The conductor** is the standing main session (solo, or lanes plus one coordinator); its duties, the relayed-GO record and the pinned review checkout are in `agents/orchestrator.agent.md`, each labelled enforced or conduct. Briefs, seat returns and relays carry pointers, not copies: a path, a section or a card key, with every pointer into the tree pinned to a sha, and never a paste of what the other side already holds.
+- **Integration cadence.** Trunk-based with frequent, small integrations — avoid big-bang merges across streams.
+- **Conflict resolution.** Defined precedence today: serialize board-touching PRs, and let parallel sessions work disjoint seams (the interim cross-session conventions). A re-sync procedure for genuinely overlapping parallel work was proposed and **rejected** by the design sitting (mirroring the issue into the repo); a mechanism for that case is open work, not yet built.
+- **Review routing / ownership.** CODEOWNERS-style mapping of who/which agent/lens reviews what. **An agent never reviews-and-merges its own work.** A **validation / field-test** task under review carries a third terminal state (`skills/review` FAITHFUL-FAILURE) — a faithful test that surfaces a real defect is a test success (not NEEDS-FIXES); the defect routes to the originating backlog, never a repair in the vehicle. Ratification authority by role → §13 and `docs/enterprise/ratification-rbac.md`. **Seats before the push:** both seats — **reviewer and security** — are dispatched **against the working tree, BEFORE the push**, not after the PR exists, their verdicts and every fix round logged in the slice design's amendment log (narrative, committed, visible to the human on the PR); the reason is economic and measured — a finding that arrives after the PR opens has already cost a CI round trip, the most expensive way to learn it. **What ships, and its ceiling (this paragraph used to read "there is no machine-checked 'the seats ran' record, and none ships").** The old text accepted that a record an agent issues about its own conduct is written by the same actor whose conduct it attests, and concluded that any gate here would be vacuous. **The premise stands; the conclusion was wrong,** and a harvest measured why: 7 of the 17 process defects nobody recorded shared one mechanism, and it was not that the record was self-attested — it was that **no record existed at all**, in any shape. Existence and shape are checkable, and there is one attesting actor who is **not** the builder: the non-author approver the merge already requires. So **what ships is `conformance/review-lane.sh` + the required `review-lane` context** — a sensitive/control-plane PR (or an ordinary, non-docs-only one; on a tracker backend `review-lane` cannot read the size, so every non-docs ordinary PR owes a plan and a record until a later change reads it from the tracker) must carry `Kit-Plan:` and `Kit-Review:` trailers naming a tracked plan file and a review record, graded for Builder ≠ Reviewer, rounds citing commits inside the PR closing on APPROVE, every finding disposed in a grammar, every design-promised control resolving to an executable `path::test-name`, and a security-review verdict (or a waiver carrying all four `D-240904-1` criteria). **The non-self-attested half is the FORGE'S, not the check's**: the approver types nothing and clicks Approve, and `required_approving_review_count >= 1` + `dismiss_stale_reviews` + `require_last_push_approval` enforce a non-author approval, bound to that exact head, from someone who did not push it — asserted live by `conformance/branch-protection.sh`. The check itself used to read the review list and return WAITING until an approval existed, which a job can only render RED and which only a manual re-run cleared; it is structural now, one run per push, green or red. **The ceiling, exactly:** it proves **shape, not truth** — that a record exists and is well-formed — and it proves nothing about who approved. It does not prove the reviewer read the diff, the same trust the merge already rests on. What changed is that **"never reviewed" is now RED** rather than invisible. Solo with one account the approval half is **unavailable** rather than weak, so adopters receive the check on an `observe` dial (`REVIEW_LANE_MODE`) whose exit condition is real record discipline. **Still not covered:** that the *seats* ran left of the push — a declared property of the flow, enforced by the human reading the design's amendment log; when it is skipped, seat findings still die left of CI and surface as red batteries.
+- **WIP limits.** Cap concurrent work to protect integration safety and human review bandwidth. On the `BACKLOG.md` backend this is **counted at claim time**: `scripts/board-claim.sh claim` counts the live `refs/claims/*` on the forge — excluding the row being claimed, and refusing rather than guessing when the remote does not answer — and refuses the claim when that count has reached `MAX_WIP` in `.kit/budget.conf`. The count is taken from the forge, not the local board, because a parallel session's In Progress row lives on *its* branch and is invisible locally; raising `MAX_WIP` is a ratified act, like every other ceiling in that file.
+- **Stakeholder visibility.** The board is the live status; beyond it, surface progress to non-builder stakeholders via an on-demand board digest, milestone demos, and the flow/DORA metrics (§14) — on a cadence and in a format the adopting org sets. (A configuration point, not a fixed ritual.)
+- **Context-bound dispatch.** Every qualifying agent step (proportionality rule in the template) carries a **Task Context Contract** (`templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md`) — its Reads (constraints/inputs), Writes, and Prohibitions. It is **advisory and declared, not self-certifying**: a present TCC records the binding, never that the step obeyed it — **the reviewer receives the same contract** and verifies obedience against it (not generically). Tool-neutral: the kit owns the contract; a runtime realizes it (Claude Code as the subagent dispatch + reviewer prompt; others their own way) — "one contract, many runtimes," as with the guard and CI.
+
+---
+
+## 13. Agent Governance
+
+The layer that makes many agents safe and accountable. Built on the same lens: rich model, sensible default, per-project, earned by a track record a person judges.
+
+### Autonomy tiers
+Autonomy is a spectrum; an agent's tier is **how far it proceeds before a human gate**. The tier for a given action is set by **risk × reversibility × blast radius** — reversibility is the master variable.
+
+| Tier | Behavior |
+|------|----------|
+| **L0 · Propose-only** | Read, analyze, draft — no changes without approval |
+| **L1 · Act + report** | Make reversible changes, open PRs, report after |
+| **L2 · Act within bounds** | Merge behind flags / within WIP cap and defined safe lanes |
+| **L3 · Autonomous** | Operate unattended in explicitly defined safe lanes |
+
+**Default action → tier mapping (per-project configurable, set at Inception):**
+
+| Action | Default | Rationale |
+|--------|---------|-----------|
+| Read / analyze / draft spec | L3 | No blast radius |
+| Write code + tests, open PR | L1–L2 | Reversible, gated at merge |
+| Merge to trunk | Recorded GO — a human judgment, on which the agent actuates (the promotion contract below); control-plane changes retain the kill-switch keystroke | Integration risk |
+| Deploy to production | Human gate | High blast radius |
+| Delete data · rotate secrets · incur spend | Human gate | Irreversible |
+
+**Irreversible / high-blast-radius actions are always human-gated regardless of tier.** A project raises an action's tier as the agent-quality metrics earn it.
+
+### Ratification roles & exceptions
+"Humans ratify" (§12) means a **named role**, not merely "a human." Roles and what each may ratify:
+
+| Role | May ratify |
+|------|-----------|
+| **Project owner** | requirements & scope, architecture (ADRs), breaking changes |
+| **Code owner** (per CODEOWNERS) | code PRs in their domain — the independent reviewer (builder ≠ sole merger, §12) |
+| **Security owner** | governing-doc changes (`CLAUDE.md` / STANDARDS / PROCESS), gate definitions, **supply-chain / OIDC posture exceptions**, secret-rotation policy, autonomy-tier raises |
+| **Release manager** | production deploys / promotions, rollbacks |
+
+One person may hold several roles in a small org, but **never both the builder and the sole ratifier of the same change**. Roles map to GitHub via CODEOWNERS + branch-protection required reviewers. **Solo:** the recorded independent agent-review + recorded human ratification (high-risk adds specific acknowledgments tied to findings) is the compensating control for `builder ≠ reviewer`; a teammate joining tightens it to enforced two-human SoD with a single `enforce_admins: true` flip (zero rework of recorded evidence) — `docs/operations/review-lane.md`.
+
+**Governed exceptions.** Required gates (§14 of the standards) and security posture are **universally required — never silently "conditional."** An exception is an auditable event: a **security-owner-ratified, time-boxed** record stating what is waived, why, the expiry, and the compensating control. → `docs/enterprise/ratification-rbac.md`. For **brownfield adoption**, this is operationalized as `templates/WAIVER-REGISTER.md` (validate it yourself with `sh conformance/waivers-valid.sh` — no shipped pipeline runs it for you; `secret-scan` and `branch-protection` are non-negotiable) — see `docs/adoption/brownfield.md` §5.
+
+### Change-class & the promotion contract
+
+The autonomy tiers answer *who acts*; the **change-class** — **Ordinary** / **Sensitive** / **Control-plane** (path-derived via `is_control_plane_path`; default to the higher class when uncertain) — answers *what's changing*. Together they set how much ceremony a change carries on the way to users: the **promotion contract** (`docs/governance/promotion-contract.md`). **GO/NO-GO is a recorded judgment, not a keystroke** (execution delegable post-GO — **now operative**: see the promotion contract's *Delegable execution* section — Ordinary/Sensitive delegable after a recorded GO; **control-plane judgment stays human; actuation is delegable on a SHA-bound, per-merge recorded GO**; `gh pr merge --admin` stays human). The **Control-plane class stays human-ratified at every rung** — never agent-self-governable; locked by `conformance/promotion-contract-documented.sh`. For **non-control-plane** promotions the **`approve→execute→log`** protocol makes the delegated keystroke auditable: the agent provides the means and waits, the human's GO is explicit/recorded/per-gate/**never inferred**, then the agent executes + logs (`scripts/promotion-verify.sh record` → a git note under `refs/notes/promotions` (view: `promotion-verify.sh log`)) + verifies **`shipped == approved`** at merge and tag (`conformance/promotion-verify-wired.sh` — wired live in the kit's own CI; it ships to you, and the portable aggregate runs its selftest). **`builder ≠ ratifier`** is a first-class invariant, peer to `builder ≠ reviewer`.
+
+**The honest actuation model.** The **GO is the only validation**; on the GO the agent *executes*; a human keystroke is *never a control* — only ever a **kill-switch** against a compromised/malfunctioning agent. The retained control-plane keystroke is honestly a **kill-switch + a temporary bootstrap**, not "human control" (ending it is a later slice, gated on recovery/rollback). **`lean` is the honest baseline** (agent actuates on a recorded GO, kill-switch off); **`enterprise` is the superset** that *adds* scaffolding — it strengthens, never removes an applicable gate. The kill-switch is a **posture, not a gate**: no enforcement-surface script reads the process mode (`conformance/mode-enforcement-blind.sh`). Full model: [`docs/governance/promotion-contract.md`](docs/governance/promotion-contract.md).
+
+### Auditability
+Every agent action is **traceable**: which agent, what, when, against which work item, and bound by which governing clauses (its Task Context Contract) — via commit/PR attribution, work-item ownership, and L1 retro notes. No anonymous agent changes.
+
+### Agent-quality metrics
+Track per agent (or agent type) and use to adjust autonomy: **rework rate · review-rejection rate · escalation rate · retro-action quality**. Reliability earns autonomy; regressions revoke it. The kit ships no tool that computes these; a project that wants them computes them from its own traces. (Conduct, not enforced:) an agent never moves its own tier; a downgrade needs no Security-owner ratification; a raise needs the Security owner's. A tier held in `CLAUDE.md` still takes control-plane ratification.
+
+### Enforcement reference
+This matrix is tool-neutral. For **Claude Code** it is enforced by the committed `.claude/` layer: `settings.json` permission globs + a `PreToolUse` guard hook (`.claude/hooks/guard.sh`) that denies the irreversible/high-blast set above and protects its own integrity, plus `reviewer`/`security-reviewer` subagents for the §12 separations. Conformance: `conformance/agent-autonomy.sh` proves a tier breach is actually denied. Other agent runtimes express the same matrix their own way.
+
+The guard is a **best-effort speed bump for honest agent mistakes, not a security boundary** — a deny-list over a shell cannot contain a determined or compromised agent. Two refinements: the guard additionally **enforces a deny-by-default MCP capability gate** in-process (`guard_check_mcp` — real enforcement, by tool name only), and the four platform controls are now kit-referenced + verify-wired (**Kit-assisted**). The real boundary remains platform-owned (network-egress allowlist, separate prod credentials, sandboxed filesystem, scoped tokens); see [`docs/enterprise/platform-safety-boundary.md`](docs/enterprise/platform-safety-boundary.md). Adopt both.
+**The agent-boundary CI gate (harness-independent enforcement).** Every PR is checked by `conformance/agent-boundary.sh` (job: `control-plane-ratification`, in its own workflow `.github/workflows/ratification.yml` — the job KEY is the required status context): a diff touching a control-plane path (the set defined in `guard-core.sh::is_control_plane_path`) must carry a CODEOWNER (non-author) approval, or the gate **waits**. **A waiting gate is GREEN, with a notice** — because the thing that blocks the merge is the branch-protection **review requirement** (`required_approving_review_count ≥ 1`, server-side), not this check's colour, and a red that means "nothing is wrong" trains a team to stop reading reds. The check reds only where something is genuinely wrong: an approval is **present** and the gate still does not ratify (the approver is the author, the review list was unreadable, the change-class fail-safed), or the gate could not evaluate the diff. ⚠️ **Declared dependency:** the rendering is honest only while the review requirement exists — set `required_approving_review_count` to 0 and an unratified control-plane PR shows green with nothing blocking it; the setting and the check are one control. Greening the waiting state also cured a **worst-wins** defect: `pull_request` and `pull_request_review` both run the job on one head and GitHub keeps the worst conclusion, so a pre-approval red could outvote the post-approval green. (History: the waiting state was a yellow POSTED check-run — deleted because branch protection stopped matching API-posted runs — then RED for a day.) An approval re-triggers the gate — and only the gate — which then confirms the ratification. Solo maintainers ratify via a logged `enforce_admins: false` admin-merge (`START-HERE.md`). The rule holds on every harness, including one with no inline guard. **The gate is adjudicated from the base tree and takes the changed-file listing from the PR files API — it never checks out or executes code from the PR it is judging, or a PR could rewrite the gate that judges it.** It is a §13 governance gate, not one of the 7 required build gates. Honest ceiling: CI is post-hoc; the real boundary remains platform-owned (`docs/enterprise/platform-safety-boundary.md`). The gate now also emits the honest team/solo SoD state label (`RATIFIED-BY-SECOND-REVIEWER` for a non-author approval, `SOLO-ADMIN-OVERRIDE-LOGGED` for a logged solo admin-override) and is change-class-aware — a pre-merge projection surfacing the merge's SoD reality in plain language; it changes no solo behaviour. **Platform applicability.** This is a conditional gate — **Control-plane ratification** *(GitHub check-runs)* — built on GitHub check-runs and `pull_request_review`, which GitLab does not provide; on a GitLab host the same separation-of-duties obligation is met by the documented manual path (`docs/operations/gitlab-adoption.md`), so `conformance/proportional-gate-wired.sh` returns N/A-with-reason there rather than failing an adopter over an absent trigger, and `conformance/conditional-gates.sh` locks this declaration — those two are wired in the kit's own CI and ship to you to run on demand, not in an emitted pipeline. **Sibling gates:** `profiles/adopter-gates.yml` (Inception-installed, every stack, unconditionally) adds three more merge-time gates, each a job keyed with its own context name — `backlog-presence` (a gated PR binds a board row), `ceremony-binding` (a gated PR carries a recorded design GO), `loop-state` (the Entry-Declaration refusal floor, shipped ACTIVE with its `LOOP_STATE_MODE` dial defaulting to `enforce` — the gate's own rc is the job's exit, so a missing or invalid declaration blocks the merge; set the dial to `observe` at the top of `.github/workflows/adopter-gates.yml` to opt out, in which case the job runs the gate, prints the verdict and always exits 0, and you should unbind the context in the same edit. **Every class owes the same two trailers:** `Kit-Row` + `Kit-Class`. A `Kit-Plan`, `Kit-Review` or `Kit-Scope` you carry is checked too; any other `Kit-*` field is ignored) — same conditional shape, **Board and loop gates** *(GitHub check-runs)*, same GitLab manual-equivalent path (`docs/operations/gitlab-adoption.md`), locked by `conformance/adopter-gates-parity.sh` (kit-only, not in your export) + `conformance/conditional-gates.sh`.
+
+---
+
+## 14. Flow Metrics
+
+Replacing velocity/estimation, mapped to the industry-standard **DORA** four for portability:
+
+| Our metric | DORA equivalent | Measures |
+|------------|-----------------|----------|
+| Cycle time (intake → Done) | Lead time for changes | Speed |
+| Release cadence | Deployment frequency | Throughput |
+| Rework / defect rate | Change-failure rate | Quality |
+| Time-to-resolve (Operate) | MTTR | Resilience |
+| **Review latency** | — | The human bottleneck (agentic-specific) |
+| **Retro-action closure** | — | Does the learning loop actually close? |
+
+The last two have no DORA equivalent and are the agentic-specific signals: review latency (the real constraint) and whether *adjust* actually lands. **Collect them:** `docs/operations/dora-metrics.md` (per-metric GitHub data source + the maturity-gating path + a dashboard pattern); `scripts/dora.sh` reports the GitHub-derivable subset (release cadence, PR lead time, review latency).
+
+---
+
+## 15. Artifact Flow & Recurring Work
+
+Artifacts are created **and maintained**, not written once. Each has a producing stage, a refresh trigger, and an owner.
+
+| Artifact | Produced at | Refreshed when | Owner |
+|----------|-------------|----------------|-------|
+| Project `CLAUDE.md` | Inception (from template) | config/stack change | lead |
+| ADR (incl. ADR-000 stack) | Inception / Plan | decision superseded | deciding agent + human |
+| Spec (design) — a small control-plane slice may commit a short design file (note + lens table) as its only GO basis | Plan | scope changes | author agent + human |
+| Design assets / UX handoff | Discover → Plan (referenced in spec) | UX surface changes | designer (informs intent owner) |
+| Plan file `docs/plans/<date>-<row-slug>.md` (`templates/PLAN-RECORD-TEMPLATE.md`) — named by the head's `Kit-Plan:` trailer; carries the task list and the team table (the design-promised controls live in the design) | Plan | the slice's task list or team changes | planning agent |
+| Code + tests | Build | every change | building agent |
+| Review record `docs/reviews/<date>-<row-slug>.md` (`templates/REVIEW-RECORD-TEMPLATE.md`) — named by the head's `Kit-Review:` trailer, **appended per review round**. `review-lane` grades the record; the non-author Approve beside it is enforced by branch protection, not by that check | Review (first round) | every round, and every fix push | reviewing agent (record) + non-author approver (the Approve, typing nothing) |
+| Task Context Contract | Build (dispatch) | per qualifying agent step | building agent / controller |
+| README | Build / Done | feature or setup change | building agent |
+| `.env.example` | Inception / Build | any new env var | building agent |
+| `RUNBOOK.md` | Inception, then Release | deploy or ops change | shipping agent |
+| CHANGELOG | Release | every user-facing change | shipping agent |
+| L1 retro note — carries a `Disposition:` (row / ruling / `none — <reason>`; form advisory, a named row/ruling must resolve) | Build (final push of the slice PR; the merge is the close) | per increment | building agent |
+| Postmortem (`templates/POSTMORTEM-TEMPLATE.md`) | Incident (P0/P1) | — | responder + human |
+| Pattern library | L2 / L3 retro | new reusable pattern found | lead |
+
+The Definition of Done *requires* several of these; this flow says *when in the loop* each appears and who keeps it current.
+
+### Recurring & maintenance work
+Cadence-triggered (not intake-triggered) work that flows through the same board as a distinct item type, with the same gates and Definition of Done:
+- Dependency audits / vulnerability scans + SBOM refresh — the **deeper, full-tree** periodic audit (monthly + pre-release) complementing the per-PR dependency gate (`DEVELOPMENT-STANDARDS.md` §14)
+- Security scans
+- Stale feature-flag cleanup (flag debt)
+- Backup-restore verification (prove DR actually works — how: `docs/continuity/backup-restore-drill.md`; gate: `conformance/dr-readiness.md`)
+- Resilience drill refresh (re-run fault-injection + load/soak after any dependency or failure-path change — how: `docs/operations/resilience-verification.md`; gate: `conformance/resilience-readiness.md`)
+- Documentation-freshness sweeps (RUNBOOK/README still accurate)
+
+---
+
+## 16. Quick Reference
+
+```
+START   Inception (Phase 0, once): charter · pick stack (ADR-000) · repo+env · CI green
+        · instantiate project CLAUDE.md/RUNBOOK/backlog · set config · assign roles → enter loop
+LOOP    Discover → Plan → Build → Review → Release → Done → Operate ↺ Discover
+        flow-based, WIP-limited, pull when ready; Operate feeds Discover
+BACKLOG ordered by value×urgency÷risk (intent-owner ranks, lead breaks ties)
+        feature·bug·tech-debt·spike·recurring share one board; tech-debt = paydown allocation
+ROLES   intent-owner · lead/integrator · builder · reviewer · on-call · security-owner
+        (functions, human OR agent; builder ≠ reviewer; humans ratify)
+GATES   Ready · [threat-model] · Design · Review(+security) · [eval] · [compliance] · [15-factor] · [deployable] · [DR] · [resilience] · Accept · Done
+RETROS  L0 in-action · L1 increment (agent) · L2 milestone (human) · L3 process · Event
+        every retro exits into an artifact (PR → memory → backlog → docs) = "adjust"
+SHIP    flags (kill-switch · retire stale=debt) · expand-contract migrations · canary/blue-green
+        rollback > forward-fix (flag-off→redeploy→revert) · SBOM+provenance (required CI gates §14) · semver+tag
+OPERATE monitor → triage → resolve → feed Discover; SLO/error-budget + cost soft→gating by maturity
+OUTCOME validate shipped feature vs its success-metric hypothesis; misses → Discover (value, not output)
+VISIBILITY board digest · milestone demos · DORA metrics → stakeholders (cadence set per org)
+COORD   shared board claim-queue · atomic claim · worktree isolation · no self-merge · WIP
+GOVERN  autonomy L0–L3 by risk×reversibility · irreversible=human-gated · audit all · earn by metrics
+METRICS cycle time · review latency · rework · retro-closure  (↔ DORA: lead time/freq/CFR/MTTR)
+KEEP    DoR · acceptance criteria · INVEST slicing · acceptance demo · spike · adversarial review
+DROP    estimation · sprint planning · standup-meeting · velocity
+RULE    manages-effort rituals die · clarifies-intent rituals get stronger
+        define rich model · ship default · per-project · raise the bar by maturity/metrics
+```
+
+---
+
+**Remember:** the loop is only real when *adjust* changes an artifact, and only *closed* when production feeds the next idea. A project earns its place in the loop by passing Inception first.

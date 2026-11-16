@@ -1,0 +1,4 @@
+reach	ok
+auth	ok
+type	atlassian
+via	proxy

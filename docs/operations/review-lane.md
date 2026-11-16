@@ -1,0 +1,210 @@
+# Review Lane — Risk-Tiered, Solo-to-Team
+
+**How `builder ≠ reviewer` is satisfied when you're solo — without faking it, and without a second
+human.** This is the operational detail behind the one-line clause in `../../DEVELOPMENT-PROCESS.md`
+§12. It is **not a new gate**; it is *which review evidence is recorded at which risk*, and how that
+evidence converts to real two-human segregation of duties the moment a teammate joins.
+
+> **The record is GRADED.** `conformance/review-lane.sh` is a required status context (`review-lane`)
+> that refuses a sensitive/control-plane PR — and an ordinary one whose row is Size M+ or unreadable
+> (unknown is owed; an XS/S ordinary PR owes none) — whose head commit does not carry
+> `Kit-Plan:` and `Kit-Review:` trailers naming a tracked plan file and a graded review record.
+> See *The graded record* below. The
+> **approval** is enforced beside it by branch protection, not by this check.
+>
+> **What the gate does not prove.** It proves **shape, not truth**: it cannot prove the reviewer read the
+> diff, and it proves nothing at all about **who approved** — that is the forge's,
+> and the three settings the Attested-by row names are what carry it. **Solo with one account the
+> approval half is unavailable**, not merely weaker: there is no non-author identity to click Approve.
+> Adopters receive the lane on an `observe` dial (`REVIEW_LANE_MODE` in
+> `.github/workflows/adopter-gates.yml`) whose exit condition is *record discipline is real* —
+> every code PR carrying a `Kit-Plan` and a `Kit-Review` trailer — because that, not a second identity,
+> is what the check itself grades. Under that dial the record is process discipline, not a fail-closed
+> gate: a solo human *can* skip writing it, and the compensating-control section below is what carries
+> the weight.
+
+## The graded record
+
+The review stage leaves a file, and a gate refuses without it.
+
+| | |
+|---|---|
+| **Plan artifact** | `docs/plans/<date>-<row-slug>.md` from [`PLAN-RECORD-TEMPLATE`](../../templates/PLAN-RECORD-TEMPLATE.md) · trailer `Kit-Plan:` |
+| **Review artifact** | `docs/reviews/<date>-<row-slug>.md` from [`REVIEW-RECORD-TEMPLATE`](../../templates/REVIEW-RECORD-TEMPLATE.md) · trailer `Kit-Review:` (comma-separated for a consolidated PR) |
+| **Graded for** | Builder ≠ Reviewer · rounds citing commits inside the PR, closing on APPROVE (a later non-bookkeeping commit WARNs) · every finding disposed (`fixed <sha>` \| `accepted — <reason>` \| `waived — WAIVER-<id>`) · every design-promised control resolving to an executable `path::test-name` · a security-review verdict, or a waiver carrying all four required criteria |
+| **Attested by** | **branch protection, not this check**. The approver types **nothing** and clicks **Approve**; three server-side settings carry it — `required_approving_review_count >= 1` (a non-author approval exists), `dismiss_stale_reviews` (a push dismisses every prior approval, so an approval carried across a fix push does not count), `require_last_push_approval` (whoever pushed the head cannot approve their own push). `conformance/branch-protection.sh` FAILs when any of the three is false or absent, and that leg is the required context `branch-protection-live`. **One exception, a solo-declared repository (SWAS-901):** one account cannot approve its own PR, so its `--replace` can write zero approvals and `require_last_push_approval:false` with `enforce_admins:true`, and then the required check `solo-go-bound` (the owner's recorded GO bound to the head sha, run from the base branch) carries the attestation instead. The verifier accepts that state only when the check is declared, installed and live, and the dial reads solo; it prints `OK-solo`, and every other tree keeps the three-setting rule above. *(The gate does not read the forge's review list: a gate that returned WAITING while no approval existed would render RED, cleared only by a manual re-run. The forge enforces the same properties on every merge attempt, with no run to wait on. There is no typed attestation line either — author-controlled text proved only that someone could copy a string a command printed for them.)* |
+| **Scope cut** | two cuts are N-A: an **ordinary AND docs-only** change-set (the classifier's cut, unchanged), and an **ordinary** change-set whose `Kit-Row` is Size XS/S at the merge-base with its own row line changed by the PR and not Done/Released at the base (unknown, tracker-backed or unbound = owed). For that class the forge Approve is the only graded evidence of review. |
+| **Seat roles** (rule 10) | the first word of the `Builder:` line, of every Rounds seat cell and of the word after `seat` on a `ran` security line is a role declared by `agents/*.agent.md` (one `Seat role:` line each: `builder`, `reviewer`, `security`, `conductor`), **read from the merge-base** so a PR cannot widen the set. Every Rounds seat is `reviewer`; on a Sensitive or Control-plane change the security seat is `security` and a `waived` security section is refused. Refusals: `RL-SEAT-UNKNOWN`, `RL-SEAT-NOT-REVIEWER`, `RL-SEAT-SECURITY-MISSING`, `RL-SEAT-SECURITY-NOT-DISTINCT`, `RL-SEAT-SECURITY-WAIVED-CP`, `RL-SEAT-VOCAB` (no merge-base, or a broken definition set: fail closed). A `--pre-push` run with no base reds with `RL-SEAT-VOCAB` once a record is owed: there is no trusted vocabulary without a merge-base. The text after the role word (a model, a tier) is free and never graded. **The ceiling:** a green means the record *names* declared seats. It does not show that any seat ran or that two seats were two dispatches; a conductor that reviewed inline can type `reviewer` and pass. The dispatch is conduct, not enforced. |
+| **Design lenses** | a design doc (`docs/architecture/*-design.md`) that the change **adds** needs a `## Lens review` section (a section prefix such as `9.`, `9a.` or `§9` is fine) with a row for each of the twelve lenses in [`skills/design/SKILL.md`](../../skills/design/SKILL.md); `RL-DESIGN-NO-LENS-TABLE` and `RL-DESIGN-LENS-MISSING` refuse, presence only (an N/A with a reason is an answer, and the content is never read). Lens 8 is `Cost and efficiency`; it also accepts its legacy name `Cost and size`. XS/S ordinary is exempt; a docs-only change-set that adds a design doc is graded. |
+| **Verdicts** | `0` pass/N-A · `2` refusal — a missing, malformed or self-reviewed **record**, or a change-set the gate could not derive. Two values, and no third: the check runs **once per push** and is green or red like every other gate. *(`1` is unused: the check never waits — see the Attested-by row.)* |
+
+**What makes "never reviewed" RED is the record, not the keystroke.** Approvals over work with
+no review record at all are refused by the record grading above, which is
+where it belongs. The approval proves a second identity looked at *this tree*; it has never proved
+they read anything, and the kit does not claim it does.
+
+Run `sh conformance/review-lane.sh --pre-push` before pushing: it grades everything CI will except the
+approval, which no local run can see.
+
+## The two tiers
+
+Review rigor follows the kit's existing **risk × reversibility** gradient — not a blanket checklist
+(effort-management ritual → faked), and not agent-review-only on everything (too thin where it matters).
+
+| Tier | Triggers | What is recorded |
+|------|----------|------------------|
+| **Default** | features · fixes · docs · refactors | The kit's **`reviewer`** subagent performs a **recorded, independent** review; the human **ratifies, recorded** — a [`REVIEW-RECORD`](../../templates/REVIEW-RECORD-TEMPLATE.md). That logged pair **is** the independent review. No separate human checklist. Fast. |
+| **High-risk** | control-plane (the `agent-boundary` set) · security/auth boundary · data/schema migration · prod deploy · money / irreversible | The above **plus a human structured self-review**: in the `REVIEW-RECORD` *Acknowledgments* section, a **specific acknowledgment tied to each material agent-reviewer finding** (not a bare "approved"). This is the **anti-theater** requirement — it forces the maintainer to engage with what the reviewer actually found. |
+
+For a security/auth/data/AI boundary, the independent review adds the **`security-reviewer`** subagent
+(the §7 security gate), and its findings are recorded the same way.
+
+## The trigger is already wired
+
+You do not configure the high-risk tier — it keys off mechanisms that already exist:
+
+- **Control-plane** is exactly the `agent-boundary` set (`../../conformance/agent-boundary.sh`, reusing
+  `guard-core.sh::is_control_plane_path`, including the adapter union). A PR touching it already *must* be
+  ratified; the solo lane attaches a recorded review to that ratification.
+- **The §13 autonomy tiers** already classify security/data/prod/irreversible actions.
+
+So "high-risk" is not a new judgment call layered on top — it is the union of triggers the kit already
+enforces.
+
+## Compliance honesty — compensating controls
+
+True segregation of duties (a *different human* builds vs. approves) is **impossible solo**. Auditors
+accept **compensating controls** for small orgs, *provided they are real and recorded*. The solo bundle —
+
+1. a recorded **independent agent-review** (`reviewer`/`security-reviewer`),
+2. an **accountable, recorded human ratification** (the `REVIEW-RECORD`, with specific acknowledgments on
+   high-risk), and
+3. the **automated gates** (the 7 required CI gates, the `agent-boundary` control-plane gate, the guard)
+
+— is a legitimate, defensible control set for the SoD / independent-code-review control, mapped in
+`../../conformance/audit-evidence-checklist.md`. Because it is recorded **from day one**, it is not a
+"we'll add review later" deferral — it is the control,
+operating, with an audit trail.
+
+## Upgrade to two-human SoD — one verb, zero rework of evidence
+
+GitHub branch protection on `main` already requires **one non-author approval**. Solo, you merge on the
+owner's recorded GO in a repository that declares solo (`MERGE_RELATIONSHIP=solo`, `D-241014-1`), or by the
+owner's own hand when it is undeclared; with `enforce_admins: false` GitHub logs any admin bypass, and that log
+and the recorded GO are the audit trail of "solo maintainer self-ratified" (see `../../START-HERE.md`). When a
+**second human with write access** joins, you tighten to real, *enforced* two-human SoD:
+
+- first, a person runs **`sh scripts/sparkwright team <@handle> [<@handle> ...]`** on a branch. It declares
+  team in the three tracked files `land` and `conformance/branch-protection.sh` read (the `CLAUDE.md`
+  Governance value, a `solo` dial in `.kit/dials.conf`, and the `CODEOWNERS` governing rule), prints the
+  invitation and protection steps, and writes no protection and makes no forge call. You read the diff and
+  merge it like any PR. Solo stays a supported shape: this is optional, never the expected path.
+- *they* approve the PR — the existing required-review rule is now met by a real second party, **and**
+- an admin runs **`sh scripts/branch-protection-apply.sh --replace --team`** so an owner admin-merge can
+  no longer bypass that required review. It writes `enforce_admins:true`, `require_code_owner_reviews:true`,
+  one approving review, `dismiss_stale_reviews:true` and `require_last_push_approval:true` together, and pins
+  the repo's merge methods to squash-only. *(With `enforce_admins: false`, an admin keeps the `--admin`
+  bypass even after a second approval exists — so the flip is what actually enforces the second human.)*
+
+> **The trap, stated before it springs.** With `enforce_admins:true` an admin can no longer merge their
+> own PR; a second person with write access must approve every PR. **If you are alone, the flip locks you
+> out** until you `--replace` back to solo (`sh scripts/branch-protection-apply.sh --replace`). The verb
+> prints this at its typed, tty-gated confirmation, and it WARNs (never refuses) when the repo has no second
+> collaborator with write access or a `CODEOWNERS` login has only a pending invitation — that review can never
+> count. Invite and let them accept **before** you flip.
+
+**Prove the flip — by the verifier's output, not a UI click.** `sh conformance/branch-protection.sh` prints
+one `settings:` line on every live read. After the flip it must read
+`settings: enforce_admins=true code_owner_reviews=true approvals=1 last_push=true dismiss_stale=true merge_methods=squash-only`.
+A tree whose `CLAUDE.md` declares `**Governance** (§ solo/team): team` turns RED — naming the setting and this
+verb as the cure — while `enforce_admins` or code-owner review is off or a merge commit is still allowed (merge
+methods unreadable with the token — a CI token that cannot read them — is a loud ADVISORY that the
+squash-only pin is UNVERIFIED, not a red); a solo or undeclared tree keeps its verdicts, and
+non-squash merge methods are only an ADVISORY there. **CI does not prove squash-only:** the
+`branch-protection-live` job's read-only token cannot read the merge-method fields (measured), so in CI that
+line reads `merge_methods=unknown`. Confirm the pin with an admin's show-only run of
+`sh scripts/branch-protection-apply.sh`, which prints `merge-methods: current=…`.
+
+That is the **only** change: no process is rebuilt and no evidence re-created — every `REVIEW-RECORD` you
+wrote solo remains valid history. Code-owner review is part of the team profile because a second human
+exists by then; **enabling it while you are the only code owner traps you (see the caveats below).** So the
+solo→team upgrade is **one verb with zero rework of the recorded compensating-control evidence** — not a
+re-architecture.
+
+> **Caveat — a private repo needs a paid plan for this flip.** Full branch protection (including
+> `enforce_admins`) on a **private** repo requires GitHub **Pro / Team / Enterprise**; on a private
+> *free-tier* repo the `enforce_admins` API returns **404** and the protection can't be set. **Public**
+> repos and **paid** private repos are unaffected. On a private free-tier repo the solo `--admin` lane
+> still holds — CI plus the recorded `REVIEW-RECORD` remain your compensating control — and the one-flip
+> upgrade lands the moment the repo is on a plan that supports `enforce_admins`. (The kit verifies the
+> SoD *logic* regardless of plan; only the server-side *enforcement* is plan-gated.)
+>
+> **Caveat — until that flip, `main` is admin-writable from *any* clone.** With solo
+> `enforce_admins: false`, a plain `git push` by the repository owner will land on `main`, bypassing the
+> PR and required-check rules; GitHub records the bypass, and that log is the audit trail. The local
+> `pre-push` hook reduces the chance of doing this by accident — but `git clone` copies neither
+> `.git/hooks/` nor `.git/config`, so a **fresh clone has no local guard at all** until one is installed.
+> `sh scripts/preflight.sh` refuses when it is missing and prints the install command. That is a *signal*,
+> not a boundary: the bypass itself is server-side, where no local hook can see it (see *Solo +
+> agent-authored PRs*, caveat 1, below), and the residual is **disclosed, not closed** — the one flip
+> above is what closes it.
+
+## Solo + agent-authored PRs — two honesty caveats
+
+Solo is the one-account case. The minimum identity model gives the agent its own account, which is the team relationship by default: see [`separation-of-duties.md`](separation-of-duties.md) §The minimum identity model and [`docs/adoption/vc-hosts.md` §Solo or team](../adoption/vc-hosts.md#solo-or-team--pick-the-merge-relationship-declared-in-your-repo-the-default-is-team).
+
+When the agent opens PRs under your identity, two things are true that the headline "humans ratify via code-owner approval" wording can hide:
+
+1. **`gh pr merge --admin` is server-side — the runtime guard never sees it.** The guard/`pre-push` hook gates only *local* git; an `--admin` merge is a GitHub API call outside its reach. So the admin-merge is an **audit-trailed convention, not a kit-enforced gate** — and the agent must **prepare the green PR and hand you the merge command**, never run it itself (see [`runtime-guards.md`](./runtime-guards.md) "Honesty boundary" and [`../../AGENTS.md`](../../AGENTS.md)). This `--admin` bypass stays human. A *normal* (non-`--admin`) merge of an Ordinary/Sensitive PR is delegable **after a recorded GO** — execution is delegable post-GO, control-plane stays human (see [`../governance/promotion-contract.md`](../governance/promotion-contract.md)).
+2. **Don't require code-owner review while solo + agent-authored.** If the sole owner is also the sole code owner, GitHub **forbids self-approval**, so a required code-owner approval is **structurally unsatisfiable** — the PR stays `BLOCKED` with green CI, and only `--admin` clears it (observed live). Rely on required status checks + the logged admin-merge instead. For a *real* approval gate, have the agent author PRs under a **separate identity** so author ≠ approver — the bot-identity pattern, which the kit documents but does not wire for you. Once a distinct ratifying identity exists (a GitHub App token, a machine user, or GitLab's native approval rules), see [`separation-of-duties.md`](separation-of-duties.md) for the full wiring.
+
+## The ratification seat (solo)
+
+This kit's own repo runs a **ratification seat**: a second GitHub account (`@ratifier`) belonging to
+the same human as the author (`@SeaBrad72`), declared in
+`.kit/ratification-seats.conf` (kit-internal, export-ignored — deliberately a code span, not a link:
+a kept doc must not link to a file the adopter export prunes). It is the concrete answer
+to caveat 2 above, and it is worth being exact about what it buys, because the honest version is
+narrower than a PR page suggests and wider than "it's fake".
+
+**What it is designed to enforce.** `agent ≠ ratifier`: by design, and only while no agent session can act as the seat's login or bypass the review requirement; where either is possible it rests on convention plus the audit trail. The building agent then cannot mint that
+approval: it has no credential for the seat, and no amount of model cooperation gets it one —
+**so long as no seat credential is present in the agent's environment (unchecked; environmental, not
+enforced)**. That survives the friction test — it still binds if the agent stops cooperating — which
+is exactly why a proposal to *retire* the seat was rejected.
+Retiring it would have discarded a working control to fix a labelling problem.
+
+**What it does NOT provide.** Two-person review. One human still writes and approves the change.
+On this repo two-person review is **declared absent**, not satisfied, and
+[`separation-of-duties.md`](separation-of-duties.md) is the statement of record.
+
+**The disclosure — detected, not typed.** When a declared seat is among the approvers, the
+ratification check says so itself, as a GitHub **notice** on the run:
+
+> `<login>` is a declared ratification seat — a second account of the repository owner, not a
+> second person; agent != ratifier holds only while no agent session can act as this login or
+> bypass the review requirement, and this is NOT a second-person review
+
+`scripts/sod-check.sh --seat-approvals` does the detection **by login**, wired into the ratify step of
+`.github/workflows/ratification.yml`; the workflow renders the prose. It is a notice: it never changes
+the verdict, and a seat approval is never treated as worse than any other.
+
+**There is nothing to type into an approval box.** A fixed seat sentence in the approval body would
+grade the approver's typing rather than the change — the login is what the forge vouches for, and no
+body text can make the disclosure truer — and would add a way for a healthy approval to park a
+governance gate. (`scripts/sod-check.sh --seat-bodies` survives as a deprecated alias of the
+detection mode, so an older caller does not break.)
+
+**Ceiling:** this detects an identity, never that a human read the diff. Its value is that the
+disclosure is emitted beside the approval instead of living in a doc.
+
+**The flip.** When a second human with write access joins: delete the seat line from
+`.kit/ratification-seats.conf`, stop declaring two-person review absent, and flip
+the team profile per the upgrade section above (`sh scripts/branch-protection-apply.sh --replace --team`; read its lock-out warning first). One person, one file, one verb.
+
+## See also
+- [`drift-self-check.md`](./drift-self-check.md) — the agent's in-loop re-check; **run it before requesting review** so the reviewer inherits less drift (the cheapest catch is the earliest one).
+- [`../../templates/REVIEW-RECORD-TEMPLATE.md`](../../templates/REVIEW-RECORD-TEMPLATE.md) — the recorded artifact.
+- [`../../DEVELOPMENT-PROCESS.md`](../../DEVELOPMENT-PROCESS.md) §12 (coordination / builder ≠ sole merger) · §13 (ratification roles).
+- [`../../conformance/audit-evidence-checklist.md`](../../conformance/audit-evidence-checklist.md) — the SoD/code-review evidence row.
+- [`../enterprise/ratification-rbac.md`](../enterprise/ratification-rbac.md) — which named role may ratify what.

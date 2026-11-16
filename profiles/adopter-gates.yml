@@ -1,0 +1,1058 @@
+# Reference ADOPTER-GATES workflow — the board/loop merge-time gates the kit uses on itself,
+# ported for an adopted project: `backlog-presence` (a gated PR binds a board row), `ceremony-binding`
+# (a gated PR carries a recorded design GO), `loop-state` (the Entry-Declaration refusal floor —
+# shipped ACTIVE and ENFORCING; `observe` is the one-line opt-out, see the dial
+# below) and `review-lane` (a code PR names a graded plan and review record; ships `observe`). The
+# after-the-fact trunk-side trace is NOT here: it is `trunk-trace` in adopter-trunk-trace.yml, its own file,
+# so that no push run can skip a required job of this one. THE SINGLE, STACK-NEUTRAL SOURCE — like
+# profiles/ratification.yml, this file runs no toolchain step, so it is identical for every stack and
+# lives here once (a shared, non-stack asset), NOT once per profile. scripts/incept.sh installs it for
+# EVERY stack, unconditionally; conformance/adopter-gates-parity.sh locks that it stays the sole,
+# wired, stack-neutral copy.
+# COPY & ADAPT: incept copies this file to your project's .github/workflows/adopter-gates.yml. It is
+# INERT here in the kit repo (GitHub only runs workflows under .github/workflows/). The kit's own
+# equivalents live in .github/workflows/ci.yml — this file is not dogfooded as a second copy (see the
+# honest ceiling below).
+#
+# ⚠️ EVERY JOB KEY HERE IS A REQUIRED-CHECK NAME — DO NOT RENAME ONE.
+# These gates used to compute a verdict and then POST it as a check-run through the API, from jobs
+# whose keys deliberately DIFFERED from the check name (`gate-backlog-presence` + a `post-*` twin).
+# That indirection existed to render a WAITING state YELLOW, which a workflow job cannot do. It broke:
+# GitHub branch protection stopped MATCHING the posted runs, and PRs stranded at "Expected — waiting
+# for status to be reported" with no way to clear them but an admin merge. A merge gate that
+# intermittently cannot be satisfied teaches people to bypass it, which is worse than a coarse colour.
+# So the posters are deleted. Each gate is now ONE REAL JOB whose key IS the required context and
+# whose own conclusion IS the verdict — nothing to match up, and no `checks: write` anywhere in this
+# file. Renaming a job key silently unbinds a required check; treat it as a branch-protection change.
+#
+# WAITING IS RED, AND THE CHECK SAYS SO IN WORDS. A job reports only success/failure/skipped/cancelled.
+# So "no human has approved yet" reds, exactly like a broken build does — and the compensation is
+# prose: every gate below prints, to the log AND the step summary, a title/summary stating plainly that
+# this is NOT a build failure and naming the remedy. Tell your team once: on these checks, red means
+# "read the title".
+#
+# HONEST CEILING — READ BEFORE TRUSTING A GREEN.
+#   * This is REACH, not RUNTIME: conformance/adopter-gates-parity.sh proves the source is present,
+#     marked, wired, stack-neutral and installed universally, and its behavioural incept witness
+#     proves the file LANDS byte-identical for a real (non-typescript) stack. It does NOT re-run this
+#     YAML on GitHub's own runners — the kit's own equivalents in .github/workflows/ci.yml are what
+#     actually execute on every push, and this document's runtime greps + the incept witness are the
+#     compensating proof, not a substitute for it.
+#   * backlog-presence proves a board row's `PR` cell bears this PR's number or branch name as a whole
+#     token — NOT that the row describes the work, that its state is accurate, or that a human put it
+#     there.
+#   * ceremony-binding is the BACKSTOP, not the control — it proves a `--gate design` GO record scoped
+#     to this PR exists in refs/notes/promotions; the control is the human recording it. It presumes
+#     the recording ceremony has been adopted (`scripts/promotion-verify.sh record`); until it has, a
+#     gated PR waits (red, with the remedy in the title) and the check's own text names the record
+#     command.
+#   * loop-state is shipped ACTIVE and ENFORCING; `observe` is the one-line opt-out — see the dial
+#     below. In enforce mode the gate's own rc is the job's exit, so a missing or invalid Entry
+#     Declaration BLOCKS the merge.
+#
+# ── THE loop-state OBSERVE/ENFORCE DIAL ──
+# Ported as-is, loop-state is a plain red ✗ on every adopter PR forever: no adopter commit carries
+# Kit-* trailers on day one, and the declaration legs have no N/A route. A commented-out block was
+# considered and rejected — the kit's own rollout doctrine is "observe-only first, then enforcing
+# behind a flag" (the exact shape the kit shipped for its own tree), and a dead comment never gets
+# adopted. So this gate ships ACTIVE, gated on the single dial below:
+#
+#     LOOP_STATE_MODE: enforce   (DEFAULT — the gate's REAL verdict; can BLOCK the merge)
+#     LOOP_STATE_MODE: observe   (opt-out — a NUDGE, never a block; one line, at the top of this file)
+#
+# ⚠️ THE DEFAULT USED TO BE `observe` AND THE FLIP HAS A NAMED REASON — do not revert it
+# as tidying. The kit's rule is that no dial is left in bare observe: every observe state carries
+# its named TRIGGER for flipping. loop-state's trigger was "the required trailer set is agent
+# self-attested" — Kit-Stage and Kit-Skill are checked only for resolvability, so an adopter was
+# being asked to block merges on fields nothing could verify. That trigger fired in the same change
+# that flips this line: the required set was cut to the two fields
+# checked against an authority outside the author (Kit-Row against the board, Kit-Class against
+# the classifier). What an adopter's first PR now owes is TWO trailers, and `Kit-Row` N/As on a
+# pristine board — so first-run-green survives (see scripts/incept.sh's first-green hint, which
+# prints the exact two-line block). EVERY class now owes exactly those two:
+# the class no longer widens the set, and Kit-Stage / Kit-Skill are not read by the gate at all.
+# ⚠️ THE HOOK DEFAULTS ARE UNTOUCHED, and that is the other half of the same ruling: flipping a
+# shipped HOOK default would leak enforce at every hook re-copy. This is the EMITTED WORKFLOW
+# default — one line in the adopter's own tree, which they own and can edit.
+#
+# ⚠️⚠️ AND THAT EDITABILITY IS ALSO THE CEILING — SAY IT PLAINLY RATHER THAN LET A GREEN IMPLY MORE.
+# This workflow is read from the PR's own branch, so the dial is editable ON THE BRANCH THE GATE IS
+# JUDGING: a PR may set `LOOP_STATE_MODE: observe` in the same commit that would have failed the
+# gate, and the gate then passes itself. That is the SAME SELF-SERVICE CLASS as a PR
+# flipping the backlog backend to N/A the row leg, and it is not
+# closed here. WHAT ACTUALLY HOLDS IT is `loop-state` being bound as a REQUIRED CONTEXT — which
+# scripts/incept.sh now declares in REQUIRED-CHECKS.md — because flipping to observe while the
+# context is bound re-creates the silent pass-through (an always-exit-0 job satisfying a required
+# check), and that is a visible, reviewable diff of the declaration rather than a silent bypass.
+# Never describe this dial as "the adopter's choice, safely" without the binding half.
+#
+# In `observe` mode the job RUNS THE GATE, PRINTS ITS VERDICT to the log and the step summary, and
+# ALWAYS EXITS 0 — green, every time, whatever the gate found. That is the nudge: the finding is
+# visible to anyone who opens the run, and nothing is blocked. (This replaces the earlier
+# `conclusion: neutral` check-run, which is gone with the poster. Neutral and always-exit-0 are the
+# same promise — non-blocking — reached without an API call.)
+# ⚠️ THE OBSERVE-vs-BOUND INTERPLAY — READ THIS BEFORE ADDING `loop-state` TO REQUIRED-CHECKS.md.
+# A job that always exits 0 SATISFIES a required check. So binding `loop-state` as a required context
+# while this dial reads `observe` is a SILENT PASS-THROUGH: every PR shows green on a context
+# that is enforcing nothing. Flip the mode to `enforce` FIRST, then bind the context — never the other
+# way around. In `enforce` mode the gate's own rc is the job's exit (0 pass · non-zero blocks).
+# As shipped the dial reads `enforce`, so binding the context is safe out of the box — but IF YOU
+# OPT OUT to `observe`, unbind the context in the same edit, or you have re-created the silent
+# pass-through in your own tree.
+name: Adopter Gates
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # THE DIAL. Ships `enforce` since 2026-08-30. Change this one line to `observe` to opt out and
+  # make loop-state a nudge instead of a merge-gate. See the header for why the default flipped.
+  LOOP_STATE_MODE: enforce
+  # ── THE review-lane DIAL (LOOP-STAGE-ARTIFACT-GATE, 2026-09-04). Ships `observe`, with its EXIT
+  # CONDITION NAMED — the `D-240811-2.1` shape, which forbids leaving a dial in bare observe:
+  #
+  #   EXIT CONDITION: flip to `enforce` when your record discipline is real — when every code PR in
+  #   this repo carries a Kit-Plan and a Kit-Review trailer naming a graded plan and review record.
+  #
+  # ⚠️ THE EXIT CONDITION HAS CHANGED. It used to be "a
+  # SECOND FORGE IDENTITY exists on this repository", because the gate's last leg was an attestation
+  # by a non-author approver and a solo adopter with one account could not produce one — the half was
+  # UNAVAILABLE, not merely weaker. That leg is deleted: the forge-side attestation is branch
+  # protection's own review requirement now, so what is left here is STRUCTURAL and a solo adopter can
+  # satisfy all of it. What they still cannot satisfy on day one is the artifacts themselves — a fresh
+  # export's first code PR has no plan file and no review record — so the dial stays, with the
+  # first-run-green rule this file already documents for loop-state, and the condition now names the
+  # thing the adopter actually has to build.
+  # In `observe` the job RUNS THE GATE, prints its verdict to the log and the step summary, and ALWAYS
+  # EXITS 0. THE KIT'S OWN REPO RUNS `enforce` (see REQUIRED-CHECKS.md).
+  # ⚠️ SAME OBSERVE-vs-BOUND INTERPLAY as loop-state: an always-exit-0 job SATISFIES a required
+  # context, so binding `review-lane` in REQUIRED-CHECKS.md while this reads `observe` is a silent
+  # pass-through. Flip the mode FIRST, then bind the context — never the other way around.
+  REVIEW_LANE_MODE: observe
+
+jobs:
+  # ── backlog-presence ────────────────────────────────────────────────────────────────────────────
+  # A gated-change-class (control-plane / sensitive) PR must bind its number OR branch name to a row
+  # on the project's BACKLOG.md `PR` column. First-run-green by construction: an ordinary PR, a
+  # pristine template board, or an undeclared/non-md backend all N/A (conformance/backlog-presence.sh
+  # decides — this workflow never re-derives that ladder).
+  #
+  # ⚠️ THE BASE-TREE CHECKOUT IS STILL LOAD-BEARING — do not "simplify" it into a plain PR checkout.
+  # It once protected a `checks: write` token from PR-controlled code; that token is gone, but the
+  # reason survives in a stronger form: THIS JOB'S EXIT CODE IS THE REQUIRED CONTEXT, so a PR that
+  # could rewrite the script judging it could forge its own green. The shape is unchanged: the SCRIPT
+  # comes from the BASE tree (the copy a human already ratified), the changed-file listing from the PR
+  # files API, and BACKLOG.md + CLAUDE.md from the PR HEAD via the read-only Contents API — DATA, never
+  # code. A forged board ROW is exactly as trustworthy as it always was (an author writes their own PR
+  # number into their own board — the check's ceiling is unchanged), while the judging script is not
+  # the PR's to change.
+  backlog-presence:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read  # the PR files-API listing below 403s without this (probe #500, measured)
+    steps:
+      # base.sha, never head.sha: load-bearing for --base-dir "$GITHUB_WORKSPACE" below —
+      # pinned by conformance/adopter-gates-parity.sh::assert_t2_base_checkout (a dedicated leg;
+      # proportional-gate-wired.sh's generic taint scanner is scoped to ratification.yml/ci.yml and
+      # allows either subject, so it does not pin THIS job's checkout).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Compute changed files (from the PR files API — never from the PR's own tree)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Rename-safe (emits both filename + previous_filename) and newline-guarded — mirrors
+          # profiles/ratification.yml's own listing step (T2). See that file for the full rationale.
+          gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '[.[] | .filename, (.previous_filename // empty)] | if any(test("\n")) then error("changed path contains a newline byte — refusing to emit a splittable listing") else .[] end' > /tmp/changed.txt
+          echo "backlog-presence: changed files seen by the gate:"
+          cat /tmp/changed.txt
+      - name: Fetch the board + backend declaration from the PR HEAD (data only — never executed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # The board row this PR is BINDING may exist ONLY at the PR head (P1-CI: a row bound by
+          # branch name lands in the PR-opening commit, before any base-tree copy has it) — so the
+          # board must be read from the HEAD, never the base. Fetched as DATA via the Contents API
+          # (never checked out, never executed) so this job still runs no PR-controlled code. A 404
+          # (file absent at head) is not an error — backlog-presence.sh's own N/A ladder handles a
+          # missing board. ANY OTHER failure (rate limit, 5xx, auth) is NOT absence — see the next
+          # step's escalation, which treats it as a gate error rather than "no board here".
+          #
+          # `?ref=${SHA}` as a QUERY PARAM, never `-f ref=`: `gh api` switches to POST the moment any
+          # -f/-F flag is present, and POST against the read-only Contents endpoint 404s — that was
+          # the bug (C-1/H-1: the board gate was permanently vacuous-green). `$f` is a fixed literal
+          # from the loop below and `$SHA` is forge-hex, so both are URL-safe with no encoding step.
+          # The `raw+json` media type returns the file's raw bytes directly (no base64 decode), and
+          # it does not hit the Contents API's >1MB base64 field going silently empty — a second,
+          # independent route to the same false "absent" this fix also closes.
+          # WAIVER-REGISTER.md IS FETCHED TOO, and it is not optional (security S-H1). The gate
+          # reads `<dir>/WAIVER-REGISTER.md` to decide whether a ratified `board-governance` waiver
+          # renders a hosted-tracker NOT ENFORCED verdict green-with-notice. Without the file in
+          # /tmp/board, `--active` was rc 1 on EVERY adopter run, while this same job's summary and
+          # annotation told them to ratify a waiver that could never clear it — a remedy the gate
+          # was structurally unable to honour. A 404 leaves the file absent, which the validator
+          # already reads as "no waiver": the fail-closed posture is unchanged.
+          # ⚠️ NOTE WHAT THE PATHS THEN ARE, because it is STRONGER than it looks: the register is
+          # fetched from the PR HEAD (self-service, like the board), but `conformance/waivers-valid.sh`
+          # — the validator that grades it — is the BASE CHECKOUT's copy, so a PR cannot both write
+          # itself a waiver and rewrite the rules that judge it in the same commit. The remaining
+          # self-ratification ceiling (author == owner == ratifier, in one commit) is the register's
+          # own, stated in docs/work-tracking/adapters.md, not introduced here.
+          # `|| fetch_rc=$?` below is load-bearing: under the run: shell's `-e`, a failing `x=$(cmd)`
+          # assignment aborts the step before the 404 branch (ADOPTER-GATES-JIRA-BLOCKERS; measured
+          # on the cold test's PR #1).
+          mkdir -p /tmp/board
+          : > /tmp/board.err
+          for f in BACKLOG.md CLAUDE.md WAIVER-REGISTER.md; do
+            fetch_rc=0
+            err=$(gh api "repos/${REPO}/contents/${f}?ref=${SHA}" \
+                    -H "Accept: application/vnd.github.raw+json" \
+                    2>&1 >"/tmp/board/$f") || fetch_rc=$?
+            if [ "$fetch_rc" -eq 0 ]; then
+              echo "backlog-presence: fetched $f from the PR head"
+            else
+              rm -f "/tmp/board/$f"
+              if printf '%s' "$err" | grep -q 'HTTP 404'; then
+                echo "backlog-presence: $f absent at the PR head (404) — N/A ladder handles this"
+              else
+                echo "backlog-presence: $f fetch FAILED (non-404, rc=$fetch_rc) — this is a gate error, not absence."
+                printf '=== %s ===\n%s\n' "$f" "$err" >> /tmp/board.err
+              fi
+            fi
+          done
+      - name: Fetch the base branch's LIVE required contexts (TRACKER-TRUSTED-JOB-REQUIRED-CONTEXT T2)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # BASE_REF is PR-influenceable (the target branch) — env-bound and referenced only as a
+          # shell variable below, never interpolated as a `${{ }}` expression into the run: line.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # A FAILED call here leaves /tmp/live-contexts ABSENT (the `||` fallback below removes any
+          # partial file), which is a DIFFERENT state from a SUCCESSFUL call against an unprotected
+          # base: an unprotected base has no required-context entries to emit, so a successful read
+          # leaves the file EMPTY (fail-closed), not absent. Either way the gate step's --live-
+          # contexts arm fails closed: bp_tracker_delegated requires the file to exist and be
+          # non-empty to step aside, and a tracker-declaring base then reads NOT ENFORCED (rc 3)
+          # rather than silently skipping the board-presence check. This step itself never fails the
+          # job — only the gate's own rc does.
+          #
+          # `select(.name == env.BASE_REF)` (RT2-Q2): the contexts must be BASE_REF's own — reading
+          # a single-branch endpoint's `.protection...` field without first confirming `.name`
+          # matches BASE_REF means a branch name the URL path mis-parses (a raw `#` or `%` BASE_REF
+          # could otherwise reach a differently-resolved branch) would silently yield ANOTHER
+          # branch's required contexts instead of empty/fail-closed.
+          gh api "repos/${REPO}/branches/${BASE_REF}" --jq 'select(.name == env.BASE_REF) | .protection.required_status_checks.contexts[]?' > /tmp/live-contexts 2>/tmp/live-contexts.err || { rm -f /tmp/live-contexts; echo "backlog-presence: could not read the base branch's required contexts — the tracker step-aside stays off (rc 3 if a tracker is declared)"; }
+      - name: Board-presence merge-gate — the gate's rc is this job's exit
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          # The BRANCH NAME exists BEFORE the PR is opened, so a row bound by branch can land
+          # in the PR-opening commit. Untrusted (attacker-influenceable) — env-bound, passed by
+          # ARGUMENT, never interpolated into the shell line.
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set +e
+          # Every real PR changes at least one file — an EMPTY listing means the gate could not SEE
+          # the diff, not "nothing changed". Escalate to a gate error rather than reading it as N/A.
+          if [ ! -s /tmp/changed.txt ]; then
+            echo "backlog-presence: the changed-file listing is EMPTY. A pull request always changes at least one file, so this is a gate ERROR (the diff could not be computed). Escalating."
+            rc=2
+            out="backlog-presence: gate error — the changed-file listing came back empty; the diff could not be computed."
+          elif [ -s /tmp/board.err ]; then
+            # H-1: a non-404 board/backend fetch failure is NOT absence — the N/A ladder cannot be
+            # trusted to have seen the real board. Escalate to the same gate-error path as an empty
+            # diff (rc 2) rather than letting backlog-presence.sh read a missing file as N/A.
+            echo "backlog-presence: the board/backend fetch hit a non-404 failure — cannot trust the N/A ladder. Escalating."
+            rc=2
+            out="$(printf 'backlog-presence: gate error — fetching BACKLOG.md/CLAUDE.md/WAIVER-REGISTER.md from the PR head failed (non-404). Fetch error(s):\n%s' "$(cat /tmp/board.err)")"
+          else
+            # VERSION SKEW: this job checks out the BASE tree, so the workflow can call a conformance
+            # mode the checked-out script does not have yet — guaranteed on the PR introducing it, and
+            # the normal upgrade path for an adopter whose profiles/ and conformance/ advance out of
+            # step. Mirrors profiles/ratification.yml's own --check-complete skew guard.
+            cap_rc=0
+            if grep -q -- '--check-complete' conformance/agent-boundary.sh 2>/dev/null; then
+              CI= sh conformance/agent-boundary.sh --check-complete --changed /tmp/changed.txt
+              cap_rc=$?
+            else
+              echo "backlog-presence: this checkout's conformance/agent-boundary.sh predates --check-complete, so TRUNCATION IS UNCHECKED for this run. Expected during an upgrade where profiles/ and conformance/ advance out of step."
+            fi
+            if [ "$cap_rc" != 0 ]; then
+              rc=2
+              out="backlog-presence: gate error — the changed-file listing could not be verified COMPLETE (see the step above). An unverifiable change-set cannot be classified."
+            else
+              out=$(sh conformance/backlog-presence.sh --dir /tmp/board --pr "$PR" --changed /tmp/changed.txt --branch "$HEAD_REF" --base-dir "$GITHUB_WORKSPACE" --live-contexts /tmp/live-contexts 2>&1); rc=$?
+            fi
+          fi
+          set -e
+          case "$rc" in
+            # rc 3 = NOT ENFORCED — you declared a hosted-tracker backlog backend and this kit reads
+            # BACKLOG.md only, so board-bound governance is NOT verified on this tree. Red by ruling
+            # (governance may never switch off silently); enumerated here so it is not reported as a
+            # gate ERROR, which would send you looking for a break that does not exist.
+            0|1|2|3) ;;
+            *) echo "backlog-presence: unexpected rc=$rc from the gate; reporting 2 (anomaly)."; rc=2 ;;
+          esac
+          # The WAITING/error PROSE comes from agent-boundary.sh's single-sourced, --selftest-able
+          # wording. Only title=/summary= are read: its status=/conclusion= lines are INERT since the
+          # posters were deleted (nothing is posted, so nothing consumes them). `backlog-presence` is
+          # not a declared --for-gate token (that registry is kit-internal scope), so this takes the
+          # GENERIC path — which is why the generic wording is LABELLED below and the actionable text
+          # is the gate's own verdict ($out).
+          title=""; summary=""
+          CI= sh conformance/agent-boundary.sh --conclusion "$rc" --for-class control-plane > /tmp/bpmap.txt 2>/dev/null || true
+          while IFS='=' read -r k v; do
+            case "$k" in title) title=$v ;; summary) summary=$v ;; esac
+          done < /tmp/bpmap.txt
+          case "$rc" in
+            0) head="backlog-presence: PASS — board row bound, or not required." ;;
+            1) head="backlog-presence: WAITING — NOT a build failure, and no test failed. To proceed: add or update a BACKLOG.md row whose PR cell names this pull request (or its branch), then push." ;;
+            3) head="backlog-presence: NOT ENFORCED — your repo declares a hosted-tracker backlog backend and the kit reads BACKLOG.md only, so board-bound governance is NOT verified on this tree. No edit to this PR clears it: bind tracker-board-gates (jira; a repo admin runs sh scripts/branch-protection-apply.sh --replace the first time, on an unprotected main), or have the owner (a human, never an agent) ratify a board-governance waiver (WAIVER-REGISTER.md — incept stamped the row for you; a human fills Owner and Ratified-by), or move the board to BACKLOG.md. The NOT ENFORCED line below names the cure for your backend." ;;
+            *) head="backlog-presence: GATE ERROR or misconfiguration — board presence could not be adjudicated. This one IS a real error and needs fixing." ;;
+          esac
+          # ONE body, written to BOTH surfaces: the log and the step summary (what a reviewer reads
+          # before approving). printf, never a multi-line assignment — a continuation line at column 0
+          # would close this YAML block scalar.
+          {
+            printf '%s\n\n' "$head"
+            printf '%s\n' "$out"
+            [ "$rc" = 0 ] || printf '\n[generic mapping wording — this gate has no per-gate text; the actionable remedy is the line above]\n%s\n%s\n' "$title" "$summary"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # rc 0 -> green. rc 1 (WAITING) and rc 2 (error) both -> RED, because a job cannot be yellow.
+          # The colour does not distinguish them; the first word of the title does.
+          #
+          # ★ AND AN ANNOTATION CARRIES THAT TITLE TO THE CHECKS LIST. A failed job renders there as
+          # "backlog-presence — failing" and nothing else, so without this the WAITING-vs-BROKEN
+          # distinction is invisible until someone opens the run. SINGLE LINE (workflow commands are
+          # line-delimited, and $out is multi-line), bounded, and NO COMMA IN THE TITLE — annotation
+          # properties are comma-separated.
+          if [ "$rc" != 0 ]; then
+            case "$rc" in
+              1) _title='backlog-presence: WAITING — NOT a build failure'
+                 _msg='To proceed: add or update a BACKLOG.md row whose PR cell names this pull request (or its branch) then push. No test failed and nothing is broken.' ;;
+              3) _title='backlog-presence: NOT ENFORCED — a hosted-tracker backend is not board-governed'
+                 _msg='Your repo declares a non-BACKLOG.md backlog backend. The kit reads BACKLOG.md only so board-bound governance is NOT verified here. No edit to this PR clears it: bind tracker-board-gates (jira) or have the owner (a human and never an agent) ratify a board-governance waiver in WAIVER-REGISTER.md or move the board to BACKLOG.md. The NOT ENFORCED line in the log names the cure for your backend.' ;;
+              *) _title='backlog-presence: GATE ERROR — board presence could not be adjudicated'
+                 _msg=$(printf '%s' "$out" | tr '\n\r\t' '   ' | cut -c1-400) ;;
+            esac
+            printf '::error title=%s::%s\n' "$_title" "$_msg"
+          fi
+          # THE EXIT STAYS ON ITS OWN LINE — the kit's parity locks anchor this exact literal per job.
+          [ "$rc" = 0 ] || exit 1
+
+  # ── ceremony-binding ────────────────────────────────────────────────────────────────────────────
+  # A Sensitive/Control-plane PR must carry a recorded `--gate design` GO scoped to this change.
+  #
+  # ONE JOB, KEYED `ceremony-binding` — and it holds NO TOKEN. This was a two-job split
+  # (gate-ceremony-binding decides / post-ceremony-binding posts), and the split was a security
+  # control: the deciding step executes conformance/ceremony-binding.sh FROM THE PR'S OWN TREE (it
+  # needs the PR's commit trailers), so it could not be the job holding `checks: write`. With the
+  # poster deleted there is no `checks: write` in this file at all, so the property is structural
+  # rather than arranged. What survives is the credential drop below: PR-controlled code still runs
+  # here, and it still must not run with a token in .git/config.
+  ceremony-binding:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          # NO persist-credentials: false HERE — the notes fetch below runs AFTER checkout and needs
+          # the persisted credential. It is removed EXPLICITLY at the end of that step, before any
+          # PR-controlled code executes. See ci.yml's ceremony-binding for the measured reason.
+      # Trunk-name tag tripwire. Git resolves a short name such as `origin/main` with refs/tags/ ahead of
+      # refs/remotes/, so a pushed tag of that name becomes "the trunk" for every short-name read in this
+      # job (the class derivation included). A forge tag ruleset may not bind the repository owner's
+      # account, so this step binds every pusher: the job is RED while any such tag exists in this
+      # checkout, and on the forge too (this job held the checkout credential for its notes fetch below,
+      # so the mode switch `TRUNK_TAG_REMOTE: "1"` also reads the forge with `ls-remote`, retried then
+      # fail-closed). It sits before the credential drop and is an inline step, so no PR-controlled code
+      # runs while the token is present. Any other value of the switch is a red, never "off".
+      # Detects, does not prevent. The run: body is kept byte-identical to the kit's own ci.yml step;
+      # keep commentary here, never inside the body.
+      - name: Trunk-name tag tripwire (fail while a tag shadows the trunk or a remote-tracking ref)
+        env:
+          TRUNK_TAG_REMOTE: "1"
+        run: |
+          L=$(mktemp)
+          if ! git for-each-ref --format='local%09%(refname)' refs/tags refs/remotes/origin > "$L"; then
+            echo "trunk-tag-tripwire: cannot list this checkout's refs (git for-each-ref failed) - refusing (fail-closed)."; exit 1
+          fi
+          case "${TRUNK_TAG_REMOTE-}" in
+            "")
+              remote=0
+              ;;
+            1)
+              remote=1
+              ;;
+            *)
+              echo "trunk-tag-tripwire: TRUNK_TAG_REMOTE must be empty or 1 - refusing (fail-closed)."; exit 1
+              ;;
+          esac
+          if [ "$remote" = 1 ]; then
+            R=$(mktemp); ok=0
+            for pause in ${TRUNK_TAG_WAITS:-0 2 5}; do
+              sleep "$pause"
+              if git ls-remote --symref origin > "$R"; then ok=1; break; fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "trunk-tag-tripwire: cannot list the remote's refs (git ls-remote failed 3 times) - refusing (fail-closed)."; exit 1
+            fi
+            cat "$R" >> "$L"
+          fi
+          awk -v remote="$remote" 'BEGIN { FS = "\t" }
+            $1 ~ /^ref: refs\/heads\// && $2 == "HEAD" { d = substr($1, 17); next }
+            $1 == "local" && $2 ~ /^refs\/remotes\/origin\// { b = substr($2, 21); if (b != "HEAD") { rbr++; br[b] = 1 }; next }
+            $1 != "local" && $2 ~ /^refs\/heads\// { heads++; br[substr($2, 12)] = 1; next }
+            $2 ~ /^refs\/tags\// {
+              t = substr($2, 11); sub(/\^\{\}$/, "", t)
+              w = ($1 == "local") ? "local" : "origin"
+              if (!((t, w) in seen)) { seen[t, w] = 1; where[t] = where[t] " " w }
+            }
+            END {
+              if (rbr == 0) { print "trunk-tag-tripwire: this checkout holds no refs/remotes/origin branch - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && heads == 0) { print "trunk-tag-tripwire: the remote lists no branches - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && d == "") { print "trunk-tag-tripwire: the remote advertises no HEAD symref (no default branch) - refusing (fail-closed)."; exit 1 }
+              bad = 0
+              for (t in where) {
+                if (t == "main" || t == "master" || t == "origin" || (d != "" && t == d) || (t in br) || t ~ /^([A-Z_]*_)?HEAD$/ || t ~ /^origin\// || t ~ /^(refs|remotes)\// || t ~ /\/refs\//) {
+                  printf "trunk-tag-tripwire: tag \"%s\" shadows the trunk, a branch or a remote-tracking ref (refs/tags/%s; found:%s). Delete it on the forge.\n", t, t, where[t]
+                  bad = 1
+                }
+              }
+              if (bad) exit 1
+              print "trunk-tag-tripwire: OK - no tag shadows the trunk or a branch (" (remote == 1 ? "local and remote" : "local only") ")."
+            }' "$L"
+      - name: Fetch the promotion GO ledger (refs/notes/promotions), then drop the credential
+        run: |
+          git fetch --no-tags origin '+refs/notes/*:refs/notes/*'
+          # CRED-DROP-BEGIN (SWAS-250)
+          set -f
+          cd_count() {  # <label>: counts only, never a value
+            _l=$(git config --local --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+            case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+            _a=$(git config --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+            case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+            _f=0; [ -z "${RUNNER_TEMP:-}" ] || _f=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config' | wc -l | tr -d ' ')
+            echo "cred-drop: $1 - local extraheader keys=$(printf '%s' "$_l" | grep -c . || true), includes-following=$(printf '%s' "$_a" | grep -c . || true), credential files=$_f"
+          }
+          cd_count before
+          _keys=$(git config --local --name-only --get-regexp '^includeif\..*\.path$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_keys; do
+            _vals=$(git config --local --get-all "$_k") || { echo "cred-drop: cannot read $_k - refusing"; exit 1; }
+            for _p in $_vals; do
+              case "$_p" in */git-credentials-*.config) rm -f -- "$_p" ;; esac
+            done
+            git config --local --unset-all "$_k" 'git-credentials-[0-9a-fA-F-]*\.config$' && _r=0 || _r=$?
+            case $_r in 0|5) ;; *) echo "cred-drop: unset failed (rc=$_r) - refusing"; exit 1 ;; esac
+          done
+          [ -z "${RUNNER_TEMP:-}" ] || find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config' -exec rm -f {} +
+          _keys=$(git config --local --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_keys; do
+            git config --local --unset-all "$_k" && _r=0 || _r=$?
+            case $_r in 0|5) ;; *) echo "cred-drop: unset failed (rc=$_r) - refusing"; exit 1 ;; esac
+          done
+          # CRED-DROP-VERIFY
+          _left=$(git config --show-origin --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+          case $_r in
+            1) ;;
+            0) printf 'cred-drop: a credential header is STILL readable (origin and key only):\n%s\n' "$_left"; exit 1 ;;
+            *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;;
+          esac
+          _inc=$(git config --name-only --get-regexp '^include(if\..*)?\.path$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_inc; do
+            _vals=$(git config --get-all "$_k") || { echo "cred-drop: cannot read $_k - refusing"; exit 1; }
+            case "$_vals" in *git-credentials-*) echo "cred-drop: $_k still names a credentials file - refusing"; exit 1 ;; esac
+          done
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -n "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config')" ]; then
+            echo "cred-drop: a credentials file remains in RUNNER_TEMP - refusing"; exit 1
+          fi
+          # CRED-DROP-VERIFY-END
+          cd_count after
+          set +f
+          # CRED-DROP-END
+          echo "ceremony-binding: GO ledger fetched; checkout credential removed."
+      - name: DESIGN GATE binding (Sensitive/Control-plane change requires a recorded, scoped design GO)
+        id: gate
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The SECOND scope key (MIRRORED from ci.yml): a design GO is
+          # recorded before the PR exists and carries `scope: branch/<name>`, so matching that
+          # key is what removes the PR-creation re-record. github.head_ref is AUTHOR-CONTROLLED —
+          # bound through env, passed as an ARGUMENT, never interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          # MIRRORED from ci.yml — the base the CONTAINMENT leg measures "already
+          # integrated" against. Reachability alone does NOT close the reused-name class: once a
+          # historic same-named branch is merged into the base its approved commit is on the
+          # mainline and a new branch inherits it. Without this the gate discloses a reachable-only
+          # run rather than refusing. Env-bound, passed as an ARGUMENT, never interpolated.
+          BASE_REF: ${{ github.base_ref }}
+        # THIS STEP exits 0 whatever the gate says, and that is a SEQUENCING choice, not a colour
+        # choice: the render step below is load-bearing (the matched GO record must reach a reviewer's
+        # field of view) and a red step here would be free to skip it. The rc is carried as this step's
+        # output and the JOB ends on it in the Verdict step at the bottom.
+        run: |
+          set +e
+          sh conformance/ceremony-binding.sh --scope "PR-$PR_NUMBER" --head-branch "$HEAD_REF" \
+            --base-ref "$BASE_REF"
+          rc=$?
+          set -e
+          case "$rc" in
+            0|1|2) ;;
+            *) echo "ceremony-binding: unexpected rc=$rc from the gate; reporting 2 (anomaly)."; rc=2 ;;
+          esac
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "ceremony-binding => rc=$rc (0 pass/N-A · 1 WAITING, red-but-not-a-failure · 2 anomaly, red)"
+      # The judgment-surface render, MIRRORED from ci.yml (the gate once shipped
+      # to adopters without the visibility half of the disposition, which is the mirror-divergence
+      # class that once cost a Critical finding). The GO record this merge rides on walks INTO the reviewer's
+      # field of view on the run page BEFORE the click; WAITING/anomaly render one line each.
+      # Detection at the judgment surface, not prevention — a note BINDS, it does not AUTHENTICATE.
+      # ⚠️ THE RENDER'S BODY IS NO LONGER HERE — MIRRORED
+      # from ci.yml. It lived in THREE places (this step, ci.yml's, and the gate script's matcher)
+      # and a SECOND scope key (the branch name) was added; a copy left matching the PR key alone would render NOTHING
+      # on exactly the PRs the branch key enables — the gate green, the reviewer clicking with no
+      # record in view. The behaviour is single-sourced into `ceremony-binding.sh --render` and this
+      # step INVOKES it. Every property is preserved IN THE SCRIPT: ALL matches, bodies
+      # VERBATIM inside ONE GROWN FENCE (untrusted ledger content — a forged field closed a code
+      # span and emitted `<br>` to render a second, stronger `approved-by` line, measured in a
+      # security review), and an 8 KB bound TOTAL across records with the cut ANNOUNCED (GitHub drops a whole
+      # >1 MiB summary). DO NOT RE-INLINE ANY OF IT — conformance/adopter-gates-parity.sh refuses a
+      # leg that regrows a copy or drops this invocation.
+      # Nothing is `${{ }}`-interpolated into the script and the only sink is $GITHUB_STEP_SUMMARY
+      # (a markdown file; this job holds no token). Stack-neutral: POSIX sh and git only. This step
+      # never fails the build — the Verdict step after it does that, on the gate's rc.
+      - name: Render the matched GO record into the step summary (the judgment surface)
+        if: ${{ !cancelled() }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+        run: |
+          case "$GATE_RC" in
+            1) printf '%s\n' 'ceremony-binding: **WAITING** — no design-gate GO record scoped to this PR yet. This check will be RED and that is NOT a build failure: a human has not approved yet.' >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+            2) printf '%s\n' 'ceremony-binding: **ANOMALY** — the gate could not evaluate, or the scoped record is defective (a real error; see the gate step log above).' >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+            0) : ;;
+            *) printf '%s\n' 'ceremony-binding: no usable gate rc reached the render step — nothing rendered (the Verdict step still ends the job on the rc).' >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+          esac
+          # rc 0: the SAME two keys the gate matched on, from the SAME matcher.
+          sh conformance/ceremony-binding.sh --render --scope "PR-$PR_NUMBER" --head-branch "$HEAD_REF" \
+            >> "$GITHUB_STEP_SUMMARY"
+      # ★ THE JOB ENDS HERE, ON THE GATE'S rc. This step replaces the deleted `post-ceremony-binding`
+      # poster job. `!cancelled()`, not `always()`: a cancelled run must not manufacture a red verdict
+      # for a run the operator themselves cancelled.
+      - name: Verdict — the gate's rc is this job's exit (waiting reds, and says it is not a failure)
+        if: ${{ !cancelled() }}
+        env:
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+        run: |
+          # VALIDATE THE ONE VALUE THAT CROSSES A STEP BOUNDARY. An empty rc means the gate step died
+          # before emitting one — a gate that could not evaluate, which is rc 2, not a silent pass.
+          case "$GATE_RC" in
+            0|1|2) rc=$GATE_RC ;;
+            *) echo "ceremony-binding: the gate produced no usable rc ('$GATE_RC'); reporting 2."; rc=2 ;;
+          esac
+          # ceremony-binding IS a declared --for-gate token (unlike backlog-presence/loop-state, it
+          # already ships in agent-boundary.sh's CONCLUSION_GATES) — so this genuinely can skew on an
+          # OLDER checkout that predates --for-gate itself, which is why the guard below is a real
+          # version probe, not a permanent fallback. Only title=/summary= are read; the script's
+          # status=/conclusion= lines are inert now that nothing is posted.
+          skew=""
+          if grep -q -- '--for-gate' conformance/agent-boundary.sh 2>/dev/null; then
+            CI= sh conformance/agent-boundary.sh --conclusion "$rc" \
+                  --for-gate ceremony-binding --for-class control-plane > /tmp/cbmap.txt 2>/dev/null || true
+          else
+            skew=1
+            echo "ceremony-binding: this checkout's conformance/agent-boundary.sh predates --for-gate, so the per-gate wording is unavailable for this run. The VERDICT is unaffected — it is computed from the gate's rc."
+            CI= sh conformance/agent-boundary.sh --conclusion "$rc" \
+                  --for-class control-plane > /tmp/cbmap.txt 2>/dev/null || true
+          fi
+          title=""; summary=""
+          while IFS='=' read -r k v; do
+            case "$k" in title) title=$v ;; summary) summary=$v ;; esac
+          done < /tmp/cbmap.txt
+          if [ -n "$skew" ]; then
+            title="[generic wording — see summary] $title"
+            summary="$(printf 'NOTE: the wording below is the generic ratification text — this run adjudicated with a conformance copy that predates per-gate wording, so ignore any instruction to seek a code approval. This is the DESIGN GATE: what it wants is a recorded design GO.\n\n%s' "$summary")"
+          fi
+          {
+            printf '%s\n' "$title"
+            printf '%s\n' "$summary"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # rc 0 -> green. rc 1 (WAITING on a human) and rc 2 (the gate broke) both -> RED, because a
+          # job cannot be yellow. The title above is what separates them, in words.
+          #
+          # ★ AND THE ANNOTATION PUTS THAT TITLE WHERE IT IS SEEN — the checks list shows only
+          # "ceremony-binding — failing" otherwise. SINGLE LINE (workflow commands are line-delimited),
+          # bounded, NO COMMA IN THE TITLE (comma-separated property list).
+          if [ "$rc" != 0 ]; then
+            case "$rc" in
+              1) _title='ceremony-binding: WAITING — NOT a build failure'
+                 _msg='To proceed: record the scoped design GO (scripts/promotion-verify.sh record --gate design --scope PR-<n> ...) then `git push origin refs/notes/promotions` and RE-RUN this job — recording notes triggers no workflow on its own. No test failed.' ;;
+              *) _title='ceremony-binding: GATE ERROR — the recorded GO is defective or the gate could not evaluate'
+                 _msg=$(printf '%s' "$summary" | tr '\n\r\t' '   ' | cut -c1-400) ;;
+            esac
+            printf '::error title=%s::%s\n' "$_title" "$_msg"
+          fi
+          # THE EXIT STAYS ON ITS OWN LINE — the kit's parity locks anchor this exact literal per job.
+          [ "$rc" = 0 ] || exit 1
+
+  # ── loop-state (ACTIVE, observe-mode dial) ─────────────────────────────────────────────────
+  # The universal Entry-Declaration refusal floor — see the workflow header for the observe/enforce
+  # dial. ONE JOB, keyed `loop-state`, holding no token: loop-state.sh reads the PR HEAD's commit
+  # trailers (and, via promotion-readiness.sh --class, executes conformance/*.sh FROM THAT TREE), so
+  # this job runs PR-controlled code — which is precisely why it must never hold a write scope. The
+  # poster twin that used to hold one is deleted.
+  loop-state:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The head SHA must be present as an object for `git log -1 <sha>` to read its trailers.
+          fetch-depth: 0
+          # This job needs no authenticated fetch (unlike ceremony-binding's notes pull) — so the
+          # credential drops at checkout, before the PR-controlled loop-state.sh (and, via
+          # promotion-readiness.sh --class, PR-tree conformance/*.sh) runs.
+          persist-credentials: false
+      # A SECOND, base checkout, added AFTER the head checkout
+      # above so base content wins: a head-carried, non-repo `.kit-base/` directory is wiped
+      # by actions/checkout's own `prepareExistingDirectory` step before this checkout writes into
+      # it (NOT `clean: true`, which acts on an existing git repo, not a bare/absent one). A
+      # symlink- or file-shaped `.kit-base` makes this checkout fail (red) or resolve to base
+      # content, never silently keep head content at gate time. Shallow and credential-free: this
+      # step reads no PR-controlled code, and the base tree it lands is public repository content,
+      # not a secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .kit-base
+          fetch-depth: 1
+          persist-credentials: false
+      # Trunk-name tag tripwire. Git resolves a short name such as `origin/main` with
+      # refs/tags/ ahead of refs/remotes/, so a pushed tag of that name becomes "the trunk" for the
+      # class derivation in this job (promotion-readiness.sh --class). This job's own checkout fetched the
+      # tags, so a decoy tag plus a rerun of this one job would derive a narrow class: the step reds the job
+      # while any such tag exists in this checkout (a LOCAL read: no network, no credential, so this job's
+      # `persist-credentials: false` head checkout is untouched). It sits after both checkouts, before any
+      # PR-controlled code. Inline, never a PR-tree script; the run: body is byte-identical to every other copy
+      # (the kit's ci.yml included), so commentary lives HERE, never in the body. Detects, does not prevent.
+      - name: Trunk-name tag tripwire (fail while a tag shadows the trunk or a remote-tracking ref)
+        run: |
+          L=$(mktemp)
+          if ! git for-each-ref --format='local%09%(refname)' refs/tags refs/remotes/origin > "$L"; then
+            echo "trunk-tag-tripwire: cannot list this checkout's refs (git for-each-ref failed) - refusing (fail-closed)."; exit 1
+          fi
+          case "${TRUNK_TAG_REMOTE-}" in
+            "")
+              remote=0
+              ;;
+            1)
+              remote=1
+              ;;
+            *)
+              echo "trunk-tag-tripwire: TRUNK_TAG_REMOTE must be empty or 1 - refusing (fail-closed)."; exit 1
+              ;;
+          esac
+          if [ "$remote" = 1 ]; then
+            R=$(mktemp); ok=0
+            for pause in ${TRUNK_TAG_WAITS:-0 2 5}; do
+              sleep "$pause"
+              if git ls-remote --symref origin > "$R"; then ok=1; break; fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "trunk-tag-tripwire: cannot list the remote's refs (git ls-remote failed 3 times) - refusing (fail-closed)."; exit 1
+            fi
+            cat "$R" >> "$L"
+          fi
+          awk -v remote="$remote" 'BEGIN { FS = "\t" }
+            $1 ~ /^ref: refs\/heads\// && $2 == "HEAD" { d = substr($1, 17); next }
+            $1 == "local" && $2 ~ /^refs\/remotes\/origin\// { b = substr($2, 21); if (b != "HEAD") { rbr++; br[b] = 1 }; next }
+            $1 != "local" && $2 ~ /^refs\/heads\// { heads++; br[substr($2, 12)] = 1; next }
+            $2 ~ /^refs\/tags\// {
+              t = substr($2, 11); sub(/\^\{\}$/, "", t)
+              w = ($1 == "local") ? "local" : "origin"
+              if (!((t, w) in seen)) { seen[t, w] = 1; where[t] = where[t] " " w }
+            }
+            END {
+              if (rbr == 0) { print "trunk-tag-tripwire: this checkout holds no refs/remotes/origin branch - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && heads == 0) { print "trunk-tag-tripwire: the remote lists no branches - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && d == "") { print "trunk-tag-tripwire: the remote advertises no HEAD symref (no default branch) - refusing (fail-closed)."; exit 1 }
+              bad = 0
+              for (t in where) {
+                if (t == "main" || t == "master" || t == "origin" || (d != "" && t == d) || (t in br) || t ~ /^([A-Z_]*_)?HEAD$/ || t ~ /^origin\// || t ~ /^(refs|remotes)\// || t ~ /\/refs\//) {
+                  printf "trunk-tag-tripwire: tag \"%s\" shadows the trunk, a branch or a remote-tracking ref (refs/tags/%s; found:%s). Delete it on the forge.\n", t, t, where[t]
+                  bad = 1
+                }
+              }
+              if (bad) exit 1
+              print "trunk-tag-tripwire: OK - no tag shadows the trunk or a branch (" (remote == 1 ? "local and remote" : "local only") ")."
+            }' "$L"
+      # NO TOKEN AND NO API CALL ON AN `md` ADOPTER. This step runs ONLY when the base branch
+      # declares a hosted tracker (.kit/tracker.conf present in the base checkout above); on `md`
+      # the file is absent, the `if:` short-circuits, and the step (its token included) never runs.
+      # The `gh api` command is byte-identical to the backlog-presence job's own copy
+      # (its step of the same name) — same target, jq filter and env: shape, so the two gates
+      # can never silently diverge on the same predicate. The fallback echo differs by design (it
+      # names `loop-state`, not `backlog-presence`), so the reader knows which gate logged it. The
+      # `GH_TOKEN` here is HYGIENE, NOT ISOLATION (see adopter-tracker-gates.yml):
+      # `${{ github.token }}` is reachable by any head through the workflow file, and it is
+      # confined to this one step's env:, which runs no head code, so nothing downstream inherits it.
+      - name: Fetch the base branch's LIVE required contexts (TRACKER-TRUSTED-JOB-REQUIRED-CONTEXT T2)
+        if: hashFiles('.kit-base/.kit/tracker.conf') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          gh api "repos/${REPO}/branches/${BASE_REF}" --jq 'select(.name == env.BASE_REF) | .protection.required_status_checks.contexts[]?' > /tmp/live-contexts 2>/tmp/live-contexts.err || { rm -f /tmp/live-contexts; echo "loop-state: could not read the base branch's required contexts — the tracker step-aside stays off"; }
+      - name: Entry Declaration on the PR head commit (row · class)
+        id: gate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          # VERSION SKEW (mirrors :280's --check-complete guard): the workflow can pass flags the
+          # checked-out conformance/loop-state.sh does not have yet — guaranteed on the PR
+          # introducing them, and the normal upgrade path for a tree whose profiles/ and
+          # conformance/ advance out of step. Fall back to the old call shape rather than break.
+          if grep -q -- '--base-dir' conformance/loop-state.sh 2>/dev/null; then
+            sh conformance/loop-state.sh --head "$HEAD_SHA" --base-dir "$GITHUB_WORKSPACE/.kit-base" --live-contexts /tmp/live-contexts
+          else
+            echo "loop-state: this checkout's conformance/loop-state.sh predates --base-dir, so the tracker step-aside is OFF for this run (old call shape). Expected during an upgrade where profiles/ and conformance/ advance out of step."
+            sh conformance/loop-state.sh --head "$HEAD_SHA"
+          fi
+          rc=$?
+          set -e
+          case "$rc" in
+            0|1|2) ;;
+            *) echo "loop-state: unexpected rc=$rc from the gate; reporting 2 (anomaly)."; rc=2 ;;
+          esac
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "loop-state => rc=$rc (0 declaration present · 1 absent/invalid · 2 anomaly)"
+      - name: Verdict — observe reports and passes, enforce exits on the gate's rc
+        if: ${{ !cancelled() }}
+        env:
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+        run: |
+          case "$GATE_RC" in
+            0|1|2) rc=$GATE_RC ;;
+            *) echo "loop-state: the gate produced no usable rc ('$GATE_RC'); reporting 2."; rc=2 ;;
+          esac
+          case "$rc" in
+            0) reason="this commit already carries a valid Entry Declaration." ;;
+            1) reason="this commit carries no Entry Declaration (or an invalid one)." ;;
+            *) reason="the gate could not evaluate this commit (see the gate step log above)." ;;
+          esac
+          mode="${LOOP_STATE_MODE:-observe}"
+          case "$mode" in
+            enforce)
+              title="loop-state: ENFORCE mode"
+              summary="$(printf 'ENFORCE mode (LOOP_STATE_MODE: enforce): %s The gate rc is this job'"'"'s exit, so a missing or invalid Entry Declaration BLOCKS the merge. See the gate step log for the full verdict.' "$reason")"
+              ;;
+            *)
+              title="loop-state: observe mode — not enforcing yet"
+              summary="$(printf 'OBSERVE mode: %s Enforcement is OFF — this job ALWAYS exits 0, so this check can never block a merge while LOOP_STATE_MODE is observe. To enforce, IN THIS ORDER: (1) flip LOOP_STATE_MODE to enforce at the top of .github/workflows/adopter-gates.yml; (2) THEN declare loop-state as a required context in REQUIRED-CHECKS.md. Binding the context before flipping the mode gives a green that enforces nothing. (3) re-run this check.' "$reason")"
+              ;;
+          esac
+          {
+            printf '%s\n' "$title"
+            printf '%s\n' "$summary"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "loop-state => mode=$mode rc=$rc"
+          # THE DIAL, expressed as the exit. observe: always 0 (a nudge — the finding is in the log and
+          # the summary above, and nothing is blocked). enforce: the gate's own rc decides.
+          #
+          # ⚠️ NO ANNOTATION IN OBSERVE MODE, DELIBERATELY. `::error` renders as a red annotation on the
+          # run even when the job exits 0, which would make a NUDGE look like a failure — the exact
+          # cry-wolf this design is trying not to recreate. The observe verdict stays in the log and the
+          # step summary; only an ENFORCING run, which actually blocks, annotates.
+          [ "$mode" = enforce ] || exit 0
+          if [ "$rc" != 0 ]; then
+            case "$rc" in
+              1) _title='loop-state: BLOCKING — no valid Entry Declaration on the head commit'
+                 _msg='To proceed: add the entry trailers as the LAST contiguous paragraph of the head commit message and push. Every change owes Kit-Row + Kit-Class, whatever its class. A Kit-Plan, Kit-Review or Kit-Scope you carry is checked too; any other Kit-* field is ignored. LOOP_STATE_MODE is enforce (the shipped default) so this blocks the merge; set it to observe at the top of this workflow to opt out.' ;;
+              *) _title='loop-state: GATE ERROR — could not evaluate the head commit'
+                 _msg=$(printf '%s' "$summary" | tr '\n\r\t' '   ' | cut -c1-400) ;;
+            esac
+            printf '::error title=%s::%s\n' "$_title" "$_msg"
+          fi
+          # THE EXIT STAYS ON ITS OWN LINE — the kit's parity locks anchor this exact literal per job.
+          [ "$rc" = 0 ] || exit 1
+
+  # ── review-lane ─────────────────────────────────────────────────────────────────────────────────
+  # A sensitive/control-plane PR (and any non-docs-only ordinary one) must
+  # name a plan file and a review record on its head commit, both graded.
+  #
+  # ⚠️ STRUCTURAL ONLY. This job used to end on a leg
+  # that read the forge's review list and returned WAITING — a value a job cannot render as anything
+  # but RED, cleared only by a manual re-run after the Approve. It is deleted. The forge-side
+  # attestation is branch protection's own review requirement (`required_approving_review_count >= 1` +
+  # `dismiss_stale_reviews` + `require_last_push_approval`), which `conformance/branch-protection.sh`
+  # asserts live. This job runs once per push and never waits on a human.
+  #
+  # SHIPS `observe` (REVIEW_LANE_MODE at the top of this file) with its exit condition named there: a
+  # fresh export's first code PR has no plan file and no review record, so enforce would red PR #1 for
+  # a reason nobody has had a chance to fix. In observe the gate RUNS and REPORTS and the job always
+  # exits 0.
+  #
+  # THE GRADER RUNS FROM THE BASE TREE and reads head artifacts as OBJECTS — PR code never executes in
+  # this job. The head objects are fetched because the containment legs need them; nothing about the PR
+  # is read from the forge.
+  review-lane:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    permissions:
+      # `contents: read` only — `pull-requests: read` went with the leg that called `gh pr view`.
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+      # Trunk-name tag tripwire. Git resolves a short name such as `origin/main` with
+      # refs/tags/ ahead of refs/remotes/, and this job's checkout is the BASE tree at fetch-depth 0, so
+      # the tags are here and the grader's `rl_base` tries a short name (`origin/<base_ref>`) before the
+      # full ref. A decoy tag plus a rerun of this one job would grade against the wrong base: the step
+      # reds the job while any such tag exists in this checkout (a LOCAL read: no network, no credential).
+      # It sits after the checkout and before the head fetch that drops the credential, so no
+      # PR-controlled code has run. Inline, never a PR-tree script; the run: body is
+      # byte-identical to every other copy (the kit's ci.yml included), so commentary lives HERE, never
+      # in the body. Detects, does not prevent.
+      - name: Trunk-name tag tripwire (fail while a tag shadows the trunk or a remote-tracking ref)
+        run: |
+          L=$(mktemp)
+          if ! git for-each-ref --format='local%09%(refname)' refs/tags refs/remotes/origin > "$L"; then
+            echo "trunk-tag-tripwire: cannot list this checkout's refs (git for-each-ref failed) - refusing (fail-closed)."; exit 1
+          fi
+          case "${TRUNK_TAG_REMOTE-}" in
+            "")
+              remote=0
+              ;;
+            1)
+              remote=1
+              ;;
+            *)
+              echo "trunk-tag-tripwire: TRUNK_TAG_REMOTE must be empty or 1 - refusing (fail-closed)."; exit 1
+              ;;
+          esac
+          if [ "$remote" = 1 ]; then
+            R=$(mktemp); ok=0
+            for pause in ${TRUNK_TAG_WAITS:-0 2 5}; do
+              sleep "$pause"
+              if git ls-remote --symref origin > "$R"; then ok=1; break; fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "trunk-tag-tripwire: cannot list the remote's refs (git ls-remote failed 3 times) - refusing (fail-closed)."; exit 1
+            fi
+            cat "$R" >> "$L"
+          fi
+          awk -v remote="$remote" 'BEGIN { FS = "\t" }
+            $1 ~ /^ref: refs\/heads\// && $2 == "HEAD" { d = substr($1, 17); next }
+            $1 == "local" && $2 ~ /^refs\/remotes\/origin\// { b = substr($2, 21); if (b != "HEAD") { rbr++; br[b] = 1 }; next }
+            $1 != "local" && $2 ~ /^refs\/heads\// { heads++; br[substr($2, 12)] = 1; next }
+            $2 ~ /^refs\/tags\// {
+              t = substr($2, 11); sub(/\^\{\}$/, "", t)
+              w = ($1 == "local") ? "local" : "origin"
+              if (!((t, w) in seen)) { seen[t, w] = 1; where[t] = where[t] " " w }
+            }
+            END {
+              if (rbr == 0) { print "trunk-tag-tripwire: this checkout holds no refs/remotes/origin branch - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && heads == 0) { print "trunk-tag-tripwire: the remote lists no branches - refusing (fail-closed)."; exit 1 }
+              if (remote == 1 && d == "") { print "trunk-tag-tripwire: the remote advertises no HEAD symref (no default branch) - refusing (fail-closed)."; exit 1 }
+              bad = 0
+              for (t in where) {
+                if (t == "main" || t == "master" || t == "origin" || (d != "" && t == d) || (t in br) || t ~ /^([A-Z_]*_)?HEAD$/ || t ~ /^origin\// || t ~ /^(refs|remotes)\// || t ~ /\/refs\//) {
+                  printf "trunk-tag-tripwire: tag \"%s\" shadows the trunk, a branch or a remote-tracking ref (refs/tags/%s; found:%s). Delete it on the forge.\n", t, t, where[t]
+                  bad = 1
+                }
+              }
+              if (bad) exit 1
+              print "trunk-tag-tripwire: OK - no tag shadows the trunk or a branch (" (remote == 1 ? "local and remote" : "local only") ")."
+            }' "$L"
+      - name: Fetch the PR head as OBJECTS (never a checkout), then drop the credential
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          fetched=$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head")
+          if [ "$fetched" != "$HEAD_SHA" ]; then
+            echo "review-lane: refs/pull/${PR_NUMBER}/head resolved to $fetched but the event reports $HEAD_SHA — refusing to grade an object the forge and the event disagree about."
+            exit 1
+          fi
+          # CRED-DROP-BEGIN (SWAS-250)
+          set -f
+          cd_count() {  # <label>: counts only, never a value
+            _l=$(git config --local --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+            case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+            _a=$(git config --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+            case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+            _f=0; [ -z "${RUNNER_TEMP:-}" ] || _f=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config' | wc -l | tr -d ' ')
+            echo "cred-drop: $1 - local extraheader keys=$(printf '%s' "$_l" | grep -c . || true), includes-following=$(printf '%s' "$_a" | grep -c . || true), credential files=$_f"
+          }
+          cd_count before
+          _keys=$(git config --local --name-only --get-regexp '^includeif\..*\.path$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_keys; do
+            _vals=$(git config --local --get-all "$_k") || { echo "cred-drop: cannot read $_k - refusing"; exit 1; }
+            for _p in $_vals; do
+              case "$_p" in */git-credentials-*.config) rm -f -- "$_p" ;; esac
+            done
+            git config --local --unset-all "$_k" 'git-credentials-[0-9a-fA-F-]*\.config$' && _r=0 || _r=$?
+            case $_r in 0|5) ;; *) echo "cred-drop: unset failed (rc=$_r) - refusing"; exit 1 ;; esac
+          done
+          [ -z "${RUNNER_TEMP:-}" ] || find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config' -exec rm -f {} +
+          _keys=$(git config --local --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_keys; do
+            git config --local --unset-all "$_k" && _r=0 || _r=$?
+            case $_r in 0|5) ;; *) echo "cred-drop: unset failed (rc=$_r) - refusing"; exit 1 ;; esac
+          done
+          # CRED-DROP-VERIFY
+          _left=$(git config --show-origin --name-only --get-regexp '^http\..*extraheader$') && _r=0 || _r=$?
+          case $_r in
+            1) ;;
+            0) printf 'cred-drop: a credential header is STILL readable (origin and key only):\n%s\n' "$_left"; exit 1 ;;
+            *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;;
+          esac
+          _inc=$(git config --name-only --get-regexp '^include(if\..*)?\.path$') && _r=0 || _r=$?
+          case $_r in 0|1) ;; *) echo "cred-drop: git config failed (rc=$_r) - refusing"; exit 1 ;; esac
+          for _k in $_inc; do
+            _vals=$(git config --get-all "$_k") || { echo "cred-drop: cannot read $_k - refusing"; exit 1; }
+            case "$_vals" in *git-credentials-*) echo "cred-drop: $_k still names a credentials file - refusing"; exit 1 ;; esac
+          done
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -n "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'git-credentials-*.config')" ]; then
+            echo "cred-drop: a credentials file remains in RUNNER_TEMP - refusing"; exit 1
+          fi
+          # CRED-DROP-VERIFY-END
+          cd_count after
+          set +f
+          # CRED-DROP-END
+      - name: STAGE ARTIFACTS (the plan file and the review record the head names, graded)
+        id: gate
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          # (`GH_TOKEN` was here for the attestation leg's `gh pr view`. Deleted with the leg — an env
+          # credential no command reads is a standing exposure that buys nothing.)
+        run: |
+          # THE VERSION-SKEW PROBES — TWO OF THEM (same arms as the kit's own ci.yml; design §4.3). A
+          # `pull_request` run pairs THIS PR's workflow file with the BASE tree's grader, and those two
+          # can disagree in either direction. Each disagreement would red the very PR that installs or
+          # upgrades the gate, which an adopter reads as "the review gate is broken". rc 0 with a loud
+          # N/A notice instead; the change is ungraded HERE and the notice says so rather than implying
+          # a review happened.
+          #   PROBE 1 — the base copy has no `--pr` mode and would exit 2 on its usage arm.
+          #   PROBE 2 — the base copy still calls `gh pr view` (a grader older than
+          #   REVIEW-LANE-WAITING-IS-GREEN, 2026-09-05) and would fail with RL-FORGE-UNREADABLE, because
+          #   this job no longer exports a token for the leg that PR deletes. MEASURED on the kit's own
+          #   PR #647. The grep SKIPS COMMENT LINES and that is load-bearing: the new grader mentions
+          #   `gh pr view` in a selftest comment, so a comment-blind grep would match it too and N/A
+          #   this check forever — a permanent silent bypass.
+          # BOTH SELF-RETIRE: a base carrying the new grader has `--pr` and no executable `gh pr view`.
+          if ! grep -q -- '--pr)' conformance/review-lane.sh; then
+            echo "::notice title=review-lane N/A (base predates the grader)::The BASE tree's conformance/review-lane.sh has no --pr mode, so nothing was graded on this PR. Expected on the PR that introduces or upgrades the grader; the next PR is graded normally."
+            echo "review-lane => rc=0 (RL-BASE-PREDATES — N/A, not a pass)"
+            echo "rc=0" >> "$GITHUB_OUTPUT"
+            echo "skew=RL-BASE-PREDATES" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -v '^[[:space:]]*#' conformance/review-lane.sh | grep -q 'gh pr view'; then
+            echo "::notice title=review-lane N/A (base grader still reads the forge)::The BASE tree's conformance/review-lane.sh predates REVIEW-LANE-WAITING-IS-GREEN: it still calls gh pr view to read the review list, which needs a GH_TOKEN this job no longer carries because the upgrade removes that leg. Nothing was graded on this PR. Expected on the PR that upgrades the grader; the next PR is graded normally."
+            echo "review-lane => rc=0 (RL-BASE-READS-FORGE — N/A, not a pass)"
+            echo "rc=0" >> "$GITHUB_OUTPUT"
+            echo "skew=RL-BASE-READS-FORGE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          sh conformance/review-lane.sh --pr "$PR_NUMBER" --head "$HEAD_SHA" --base-ref "$BASE_REF"
+          rc=$?
+          set -e
+          # rc 1 is still accepted as a VALUE: the grader that runs is the BASE tree's, which on a PR
+          # opened against an older base still carries the retired WAITING arm. It maps to a refusal
+          # below rather than crashing this step on an rc it never expected.
+          case "$rc" in
+            0|1|2) ;;
+            *) echo "review-lane: unexpected rc=$rc from the gate; reporting 2 (anomaly)."; rc=2 ;;
+          esac
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "review-lane => rc=$rc (0 pass/N-A · 1 the base tree's retired WAITING arm, treated as a refusal · 2 anomaly/refusal)"
+      - name: Verdict — observe reports and passes, enforce exits on the gate's rc
+        if: ${{ !cancelled() }}
+        env:
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+          GATE_SKEW: ${{ steps.gate.outputs.skew }}
+        run: |
+          case "$GATE_RC" in
+            0|1|2) rc=$GATE_RC ;;
+            *) echo "review-lane: the gate produced no usable rc ('$GATE_RC'); reporting 2."; rc=2 ;;
+          esac
+          # A skew N/A is rc 0 in the same green as a real pass, so the WORDS are the only thing that
+          # separates them. Say "nothing was graded" rather than let a green imply a review.
+          if [ -n "${GATE_SKEW:-}" ]; then
+            # THE TITLE NAMES WHICH PROBE FIRED — two different skews reach this branch, with different
+            # causes. No comma in the title (workflow-command properties are comma-separated).
+            case "$GATE_SKEW" in
+              RL-BASE-READS-FORGE) _skewwhy='that copy still calls gh pr view and this job carries no token for it' ;;
+              *)                   _skewwhy='that copy has no --pr mode' ;;
+            esac
+            title="review-lane: N/A — nothing was graded ($GATE_SKEW)"
+            summary="This job runs the BASE tree grader and $_skewwhy, so NOTHING was graded on this PR. Expected on the PR that introduces or upgrades the grader; the next PR is graded normally. Do not read this green as \"reviewed\"."
+            {
+              printf '%s\n' "$title"
+              printf '%s\n' "$summary"
+            } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 0
+          fi
+          case "$rc" in
+            0) reason="the stage artifacts are present and graded; approval is branch protection's." ;;
+            # rc 1 cannot come from the current grader — it is the BASE tree's retired WAITING arm, on
+            # a PR opened against a base older than REVIEW-LANE-WAITING-IS-GREEN. Reported as a refusal
+            # (in enforce mode this job still exits non-zero) with words that name the real blocker.
+            1) reason="the base tree's grader predates REVIEW-LANE-WAITING-IS-GREEN and its retired WAITING arm fired — the stage artifacts are fine, and the merge is blocked by branch protection's review requirement, not by this check. On the introducing PR only: re-run this single job after the non-author Approve." ;;
+            *) reason="a stage artifact is missing, malformed, or self-reviewed (see the gate step log)." ;;
+          esac
+          mode="${REVIEW_LANE_MODE:-observe}"
+          case "$mode" in
+            enforce)
+              title="review-lane: ENFORCE mode"
+              summary="$(printf 'ENFORCE mode (REVIEW_LANE_MODE: enforce): %s The gate rc is this job'"'"'s exit, so a missing, malformed or self-reviewed record BLOCKS the merge. This check says nothing about WHO APPROVED: the forge-side attestation is branch protection'"'"'s review requirement (required_approving_review_count >= 1 + dismiss_stale_reviews + require_last_push_approval), asserted live by conformance/branch-protection.sh. This job runs once per push and never waits on a human.' "$reason")"
+              ;;
+            *)
+              title="review-lane: observe mode — not enforcing yet"
+              summary="$(printf 'OBSERVE mode: %s Enforcement is OFF — this job ALWAYS exits 0. The forge-side attestation is branch protection'"'"'s review requirement; flip to enforce when your record discipline is real — when every code PR here carries a Kit-Plan and a Kit-Review trailer naming a graded plan and review record. IN THIS ORDER: (1) flip REVIEW_LANE_MODE to enforce at the top of this workflow; (2) THEN declare review-lane as a required context in REQUIRED-CHECKS.md; (3) re-run this check.' "$reason")"
+              ;;
+          esac
+          {
+            printf '%s\n' "$title"
+            printf '%s\n' "$summary"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "review-lane => mode=$mode rc=$rc"
+          # NO ANNOTATION IN OBSERVE MODE, deliberately: an `::error` on a job that exits 0 makes a
+          # nudge look like a failure — the cry-wolf this dial exists to avoid.
+          [ "$mode" = enforce ] || exit 0
+          if [ "$rc" != 0 ]; then
+            printf '::error title=%s::%s\n' "$title" "$(printf '%s' "$summary" | tr '\n\r\t' '   ' | cut -c1-400)"
+          fi
+          # THE EXIT STAYS ON ITS OWN LINE — the kit's parity locks anchor this exact literal per job.
+          [ "$rc" = 0 ] || exit 1

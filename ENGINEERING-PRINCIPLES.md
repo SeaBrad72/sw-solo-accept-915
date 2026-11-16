@@ -1,0 +1,138 @@
+# Engineering Principles & Definition of Done
+
+## 1. Entry contract — do this BEFORE any mutating action
+
+⚠️ **Start the session in this repository's root, not a parent or a subfolder:** Claude Code loads the guard hooks only from the launch directory. If your launch directory (it is in your context) is not this root, stop before any edit and tell the human, who can confirm with `/hooks`. **Five acts, every slice, before the first edit / commit / PR.** The skills in `skills/` govern process work here (index: `skills/using-skills/SKILL.md`).
+
+1. **Derive the change class.** Put the changed paths in a file, one per line, and run `sh conformance/promotion-readiness.sh --class --changed <listing>`. Pass the listing file, never a path — a path argument gets its CONTENTS classified. `conformance/agent-boundary.sh --state` is not a classifier; without `--changed` it answers `NONE`. Never self-assert the class.
+2. **Read the governing skill** — `skills/<name>/SKILL.md`. Design before code, evidence before "done"; search `docs/governance/DECISIONS.md` for a ruling on this surface; a design answers the twelve lenses in `skills/design/SKILL.md`.
+3. **Claim the row by its id** — the backticked `ROW-ID` that leads its Item cell (`[A-Z0-9][A-Z0-9-]*`), with `sh scripts/board.sh claim <ROW-ID>`; that id is your `Kit-Row` value. No row, no build.
+4. **Carry the Entry Declaration as commit trailers** — `Kit-Row` + `Kit-Class`, every class. `conformance/loop-state.sh` checks them on your PR's final commit: present once each, row on the board, class matching. A `Kit-Plan`, `Kit-Review` or `Kit-Scope` you carry is checked too; any other `Kit-*` field is ignored. Enforced by default; `LOOP_STATE_MODE: observe` in `adopter-gates.yml` opts out.
+5. **State the ceremony budget in one line**, derived from the class, so the owner can veto it in a sentence. Push board edits before you ask for review; seek approval only on the final diff. **Seats:** the conductor dispatches each build task to a **builder** seat, each review to a **reviewer** seat, and on Sensitive or Control-plane work a separate **security** seat. Each is typed by its `agents/*.agent.md` definition and dispatched through the harness's native binding where one exists (`START-HERE.md` step 7, `docs/operations/harness-adapters.md`). The conductor prefers a typed builder seat; when it builds, the Builder line says `conductor` (conduct, not enforced). The review record names each seat's role; `review-lane` grades the names and cannot see the dispatch.
+
+**One command:** `sh scripts/sparkwright start <ROW-ID> [--changed <listing>]` runs acts 1 and 3 and prints this trailer block; the printed class is provisional — the gate re-derives it.
+
+> ⚠️ **The trailer block must be the LAST paragraph of the commit message, and contiguous.** A blank line inside it truncates it — git reads only the paragraph after the blank, so every `Kit-*` field above it is lost.
+
+> **Guard refused a command?** See `docs/operations/runtime-guards.md` §*The escape card*: one sanctioned retry per the escape card, else stop and escalate.
+
+## What this document is
+
+**The authoritative guide for any team — human or agent — building with this kit.** It states the *principles* and the *Definition of Done*. The detailed flow lives in `DEVELOPMENT-PROCESS.md`; the quality bar in `DEVELOPMENT-STANDARDS.md` (+ your `profiles/<stack>.md`). When they overlap, **this file wins**.
+
+**Status:** MANDATORY — exceptions require explicit approval. **Inception (Phase 0) is exempt from §1:** the five acts govern *loop* work, while `incept` is the one-time bootstrap that **creates** the repo and its control plane — no board, branch or change class exists yet. §1 binds from the **first feature branch** onward (the "Inception exception" in `skills/design/SKILL.md` + `skills/build/SKILL.md`; "Bootstrap order (incept-first)" in `DEVELOPMENT-PROCESS.md` §3).
+
+## Roster authority (this repo uses its own roster)
+
+§1 states the rule; this is its scope and its ranking. The roster covers **all process work here** — design, plan, build, tdd, review, verification, debugging, evals, discovery, operating. **A foreign skill library in your environment does not govern this repo**: an injected "invoke my skill first" keystone (e.g. superpowers) sits at the *default/skill* tier and does **not** outrank this file.
+**Precedence:** explicit user instruction → the kit's roster → any foreign default; an explicit user request for a foreign skill is always honored — **preference, not prohibition** (say so when you substitute a kit skill, so the user can choose).
+
+---
+
+## The document set
+
+| Document | Role |
+|----------|------|
+| **`ENGINEERING-PRINCIPLES.md`** (this) | Principles + Definition of Done. Authoritative. |
+| **`DEVELOPMENT-PROCESS.md`** | How work flows & improves — the agentic SDLC (Inception → loop → operate). |
+| **`DEVELOPMENT-STANDARDS.md`** | The universal quality bar — stack-neutral. |
+| **`profiles/<stack>.md`** | The concrete *how* for your chosen stack (config, examples, commands). Selected at Inception. |
+| **`templates/`** | Project + intake/ops templates: `PROJECT-CLAUDE`, `BACKLOG`, `RUNBOOK`, `FEATURE-REQUEST` (incl. an optional *Extended spec*), `TASK-CONTEXT-CONTRACT`, `EVAL-PLAN`, `THREAT-MODEL`, `AI-SYSTEM-CARD`, `AI-POLICY`, `AI-TRANSPARENCY-SIGNOFF`, `AI-ARTIFACT-LINEAGE`, `TEST-PLAN`, `UAT-SIGNOFF`, `A11Y-SIGNOFF`, `WAIVER-REGISTER`, `POSTMORTEM`, `BIA` (+ tracker-setup templates). |
+| **`START-HERE.md`** | Run this first — it walks you through Inception, including choosing your stack. |
+| **`MAINTAINING.md`** | How the kit is versioned (`VERSION`, `CHANGELOG.md`) — the contract/reference/conformance convention; contributing is in `CONTRIBUTING.md`. |
+| **`conformance/`** | Executable checks/checklists proving a reference implementation satisfies its contract. |
+| **`docs/enterprise/`** | Enterprise addendum — compliance crosswalk (SOC 2 · ISO 27001:2022 · NIST SSDF · SLSA) + AI-governance crosswalk (NIST AI RMF · ISO 42001 · US state law · OWASP), secrets-at-scale, ratification RBAC, audit-evidence. |
+| **`docs/`** (other) | `work-tracking/adapters.md` (backlog backends), `adoption/brownfield.md` (existing-repo adoption + `.claude/` hygiene), `adoption/vc-hosts.md` (bring-your-own git host), `adoption/DEPLOYMENT-ENVIRONMENT.md` (bring-your-own deploy target), `operations/` (live-system guidance: progressive delivery, resilience verification, DORA metrics, secrets-for-AI), `continuity/` (recovery/DR: backup-restore drill, BIA). |
+
+New here? **Read `START-HERE.md`.**
+
+---
+
+## Core Principles
+
+1. **Production-grade from day one** — no demos. Everything is shippable.
+2. **Test-driven** — tests (and, for AI features, evals) are written with the code, not after. Quality is built in.
+3. **Architecture before implementation** — design and discuss trade-offs before building.
+4. **Automated quality gates** — if it isn't automated, it isn't enforced. CI on every push. Every process step is gated, or kept and labelled "conduct, not enforced" with its reason, or deleted. Keeping a step needs a measured catch or a ratified reason.
+5. **Security & governance are foundational** — built into every line from the start, not bolted on.
+6. **The loop closes** — production teaches the next iteration; learning routes back into an artifact (the "adjust" step).
+7. **Honest by default** — every claim says what is proved, what is only attested and what is estimated; numbers are labelled measured or estimate; a green never claims more than its check reads.
+8. **Neutral by construction** — stack, harness and model are chosen for fit and recorded with a revisit trigger; no seat depends on one vendor's model; enforcement is equal on every harness.
+
+## Working style (human ↔ agent)
+
+- **Architecture first** — discuss approach before code.
+- **Agents propose, humans ratify** — agents never silently change the standards/process that govern them.
+- **Concise** — lead with the answer.
+- **Full lifecycle, every time** — every stage is visited; its weight scales with the derived change class × size; one review round plus one security pass is the norm, and reviewer round N notifies the owner (conduct, not enforced). See `DEVELOPMENT-PROCESS.md`.
+
+---
+
+## Security (non-negotiable)
+
+> **Authoritative summary.** These are the non-negotiable rules in brief; the full bar (secrets-at-scale, cost governance, per-rule detail) is their expansion in `DEVELOPMENT-STANDARDS.md` §2. This summary and that expansion must agree.
+
+- **Secrets:** never commit keys/passwords/tokens. Env vars + a committed `.env.example`. Never read, print, measure, copy or reuse a secret or a token pasted into the conversation, not even its length or prefix; a human sets secrets; if a token appears in the conversation, stop and ask the human to rotate it; the kit's own board and tracker scripts (`sh scripts/board.sh`) are the sanctioned credential reader; never run a secret-store or Keychain command yourself (conduct, not enforced; the guard is a seatbelt only where it is loaded). **Disclosure:** ship a `SECURITY.md` (coordinated-disclosure + a real contact); verified by `conformance/security-policy.sh`.
+- **Input validation:** validate and sanitize all input at system boundaries (schema-validate).
+- **Injection:** parameterized queries / ORM — never string-interpolate untrusted input.
+- **AuthN/Z:** hash passwords (strong adaptive hash); least-privilege tokens, short expiry.
+- **PII:** never send to third parties without consent; redact in logs; deletable on request.
+- **Audit logging:** immutable trail for critical operations.
+- **AI features:** runtime guards (output validation, prompt-injection defense) **and** dev-time evals (see standards).
+
+> Concrete libraries/config for these live in your `profiles/<stack>.md`.
+
+---
+
+## Definition of "Ready"
+
+The **entry gate** — an item is NOT ready to enter Build until ALL mandatory items are true. (The Definition of Done below is the **exit gate**: safe to ship.) Conditional items are quick applicability checks — mark **N/A** when they don't apply.
+
+**Mandatory**
+- **Acceptance criteria** — written and testable (how we'll know it's done).
+- **INVEST-sliced** — a small, independent, vertical increment (not a phase or an epic).
+- **Dependencies known** — blocking deps, data, and access identified.
+- **Success metric / hypothesis** — a measurable statement of what "worked" means (§5 Discovery).
+
+**Conditional flags** *(flag the obligation now so no downstream gate is a surprise)*
+- **Threat-model / privacy review** *(if sensitive/regulated/personal data)* — flagged for the §7 security gate; threat model + a DPIA-lite when Confidential/Restricted (`templates/THREAT-MODEL-TEMPLATE.md`, `templates/PRIVACY-REVIEW-TEMPLATE.md`; verified by `conformance/readiness.sh privacy-ready`).
+- **UX/a11y obligation** *(if a user-facing surface)* — flagged; recorded later in the a11y sign-off (the Accessibility item below).
+- **Eval criteria** *(if an AI feature)* — flagged for the §7 eval gate; the feature carries an AI System Card (`templates/AI-SYSTEM-CARD-TEMPLATE.md`).
+- **Compliance obligation** *(if a regulated domain)* — flagged for the §7 compliance gate.
+
+- **Change-class** *(always — derived, not self-asserted)* — Ordinary / Sensitive / Control-plane is **derived at promotion** (path-heuristics + the guard's `is_control_plane_path`), defaulting to the higher class when uncertain; Sensitive / Control-plane raise the downstream gate. See the promotion contract (`docs/governance/promotion-contract.md`).
+
+If any **mandatory** box is unchecked, the item is **not Ready** — it does not enter Build.
+
+---
+
+## Definition of "Done"
+
+A feature is NOT done until ALL are true:
+
+**Code** — implemented · self- and peer/agent-reviewed · no lint/type/compiler warnings.
+**Tests** — unit + integration (+ e2e for critical flows) passing · 80%+ coverage (100% on critical paths) · edge/error cases covered · **AI features: evals pass and don't regress**.
+**CI/CD** — pipeline green · build succeeds · the 7 required gates pass, incl. secret-scan and SBOM+provenance · the conditional gates (the five in `DEVELOPMENT-STANDARDS.md` §14) pass where their trigger applies, else N/A-with-reason · no known high/critical vulnerabilities in production/runtime dependencies.
+**Docs** — README, API docs, ADRs updated · **RUNBOOK** updated when the diff touches deploy workflows, `Dockerfile`, `.env*`, infra/runtime config, or ops runbooks (the §15 artifact-table trigger, `DEVELOPMENT-PROCESS.md`), else **N/A with the reason** · `.env.example` current · known issues/tech-debt captured · **project resumable cold by another engineer or agent**.
+**Review & merge** — PR reviewed (builder ≠ sole reviewer; **builder ≠ ratifier**) · approved · merged · branch left intact (deletion is a separate act). The merge is a recorded **GO/NO-GO** judgment (not a keystroke) against a **promotion-readiness** surfacing whose content is the DoD + acceptance criteria; on that recorded GO the **agent may actuate** the merge/tag (control-plane included) bound to the approved SHA — see the promotion contract (`docs/governance/promotion-contract.md`). The judgment is the control; the keystroke is not.
+**Accessibility** — keyboard-navigable · screen-reader/contrast checks pass (for user-facing UI); recorded in an a11y sign-off (`templates/A11Y-SIGNOFF-TEMPLATE.md`).
+**Production** — deployed · smoke-tested (post-deploy gate; `docs/operations/progressive-delivery.md`) · no errors in logs · rollback path ready · monitoring/alerting on critical paths · **DR proven for data services** (`conformance/dr-readiness.md`).
+
+**If any box is unchecked, it isn't done.**
+
+---
+
+## Quality standards (universal)
+
+- **Functions** small and single-purpose; prefer early returns over deep nesting.
+- **Naming** meaningful; no throwaway names except loop counters.
+- **Money** in exact decimal types, never floats.
+- **DB** indexed, paginated, no N+1; schema changes via versioned migrations.
+- **Errors** structured with codes; retry external calls with backoff; circuit-break unreliable deps.
+- **Observability** structured logs, error tracking, performance monitoring.
+
+> Language-specific expression of these is in your `profiles/<stack>.md`.
+
+---
+
+**Remember:** this kit is portable by design. Keep this file stack-neutral — anything stack-specific belongs in a profile, anything project-specific belongs in the project's own `CLAUDE.md`.

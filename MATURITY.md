@@ -1,0 +1,38 @@
+# Maturity & validation status
+
+Sparkwright tracks maturity as a **stage**, separate from its version. This page states the current stage, the evidence behind it, and how runtime enforcement differs by harness.
+
+## Maturity is a stage, not a version
+
+`VERSION` (semver) answers *what changed*; maturity answers *what is validated*.
+
+```
+pre-adoption → [release-candidate] → adopted
+```
+
+**Current stage: `release-candidate`** — hardened, dogfooded, and ready to adopt. The kit reaches the `adopted` stage when an external team ships real software through the loop. The kit versions its own releases on its own cadence (currently `v3.247.0`); adoption is a maturity stage, not a version reset.
+
+| Stage | What it means |
+|-------|---------------|
+| **pre-adoption** | Built by dogfooding its own loop; not yet packaged for others. |
+| **`release-candidate`** *(now)* | Safe and ready to adopt: the adopter path is walked, the readiness gate is hardened, the machinery runs on every push, and the loop has built real software end-to-end. **Next milestone:** the first external adoption. |
+| **adopted** | An external team has shipped real software through the kit. |
+
+## Evidence
+
+- **The kit builds itself.** Its conformance harness, control-plane guard, and CI gates run on this repository on every push — the kit holds itself to the same Definition of Done it gives adopters, continuously.
+- **The loop ships real software.** It has been run end-to-end to build and deploy working software, where the `builder ≠ reviewer` review layer caught real high-severity fail-open bugs an agent had shipped as green tests — including a production path that failed open, and a gate that was green only because it had been skipped.
+- **Exercised across vehicles** — from that build through smaller service builds.
+- **Separation of duties on this repo, stated exactly: `agent ≠ ratifier` by design; two-person review absent (declared).** The kit's own ratifying account is a *ratification seat* — the same human as the author, declared in `.kit/ratification-seats.conf` and named by the ratification check, as a notice, on every seat approval it detects. The ratifier is a different forge identity by design, held by `land`'s forge-review check and branch protection; this repo's own agent sessions still run under the owner's login until the identity switch is complete (two follow-on changes), so today the agentic half rests on convention plus the audit trail. The human half does not bind, and this repo does not claim it. It retires when a second human with write access joins ([`docs/operations/review-lane.md`](docs/operations/review-lane.md#the-ratification-seat-solo)).
+
+## Runtime enforcement by harness
+
+Enforcement is strongest under **Claude Code** (the reference harness), which adds an inline **`PreToolUse`** denial — a risky write blocked *before it lands*. A **hookless harness** (Codex, Cursor, Copilot — anything that reads `AGENTS.md` but has no inline pre-execution hook) runs at the enforcement **floor**:
+
+- `AGENTS.md` routing to the canonical governance docs,
+- an installed `pre-push` git hook, and
+- the `agent-boundary` CI backstop.
+
+At the floor, nothing merges unsafely — CI gates every change — though a risky *local* write isn't intercepted before it lands the way it is under Claude Code. This is why `claude-code` is the reference harness and other adapters are certified to the floor. Per-harness status lives in **`adapters/`**.
+
+**`codex` is floor-verified** — the one named non-Claude adapter whose floor is *exercised* end-to-end, not merely declared. A cold CP-7 field test (operator-run on the `codex-pulse-6` vehicle, no Claude assistance) drove Codex through the surfaces live and passed all five acceptance criteria non-vacuously: the `pre-push` guard refused a genuine protected-ref push, the caller-agnostic ratification gate blocked a real control-plane PR, and the emitted CI was green on first run yet reddened a bad change — see [the field-test evidence](docs/operations/harness-enforcement-evidence.md). Floor-verified is `codex`'s honest maximum: with no inline `PreToolUse`-equivalent interception it does not reach `verified (first-class)`. `gemini` and `cursor` remain experimental (declared, not yet exercised).

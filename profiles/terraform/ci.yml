@@ -1,0 +1,257 @@
+# Reference CI pipeline for the Terraform/IaC profile.
+# COPY & ADAPT: copy to your project's .github/workflows/ci.yml. Inert here in the kit.
+# Satisfies DEVELOPMENT-STANDARDS.md §14 via IaC analogs (no contract change) PLUS gate-policy.
+#   gate-build = terraform plan (the plan is the artifact)
+#   gate-dep-scan = Trivy config scan (incl. tfsec-style misconfig — tfsec is merged into Trivy)
+#   gate-sbom = Trivy CycloneDX provider/module inventory
+# conformance/ci-gates.sh asserts the 8 standard ids; gate-policy is an allowed extra.
+# HARDENING (do before production):
+#  - Pin every `uses:` to a full 40-char commit SHA (e.g. actions/checkout@<sha>  # v4.x).
+#  - Pin tool installs to exact versions.
+#  - The conftest binary is downloaded over HTTPS; verify its checksum for production.
+#  - OIDC is least-privilege here: id-token:write lives only on the push-only `provenance`
+#    job, so PR-triggered steps cannot mint a token. Your cloud trust policy MUST restrict
+#    `sub` to `repo:<org>/<repo>:ref:refs/heads/main` (never `pull_request`).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The weekly run does NOT re-run the kit's own selftests: the aggregate below passes --kit-selftests-on-change, so a
+  # run with no changed-path listing (a first push, this cron, a push to another branch) skips them. A change
+  # that names a control-plane path still runs them in full (see the "Changed-path listing" step).
+  # It also carries this profile's ONLY all-branches secret sweep (the secret-scan step scans a PR's
+  # own commits and main's history, and every ref on a schedule): removing the schedule removes that
+  # sweep. Its cadence is yours to tune.
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      # Surfaces gate-build's own presence check to the (different-job) provenance gate below —
+      # hashFiles() is NOT a valid job-level `if:` expression (actionlint: only steps.* contexts
+      # allow it), so a step output is the correct plumbing, not a job-level hashFiles() call.
+      has_build: ${{ steps.gate-build.outputs.has_build }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      # >>> kit:owned changed-listing
+      - name: Install pinned shellcheck v0.11.0 (sha256-verified; the runner image's 0.9.0 can run out of memory on the aggregate's lint)
+        run: sh scripts/install-shellcheck.sh "$RUNNER_TEMP/sc" && echo "$RUNNER_TEMP/sc" >> "$GITHUB_PATH"
+      - name: Shellcheck is the pinned v0.11.0 (fail loudly if not)
+        run: sh scripts/install-shellcheck.sh --check
+      - name: Clear the changed-path listing (nothing an earlier step wrote may survive to the verify step)
+        run: echo "KIT_CHANGED=" >> "$GITHUB_ENV"
+
+      - name: Changed-path listing (default-branch pull request or push)
+        # ADOPTER-KIT-SELFTESTS-ON-CHANGE: write the run's changed paths so verify.sh can skip the kit's own
+        # selftests when none of them is a control-plane path. A pull request into the default branch lists
+        # BASE...HEAD; a push to the default branch lists the TWO-dot BEFORE..SHA (two trees, so a force-push
+        # over-lists, the safe direction). Both shas are ENV-BOUND, never interpolated into the script, and
+        # must be 40 or 64 hex. The all-zero before of a first push writes no listing and exits here, so that run skips
+        # the kit's own selftests (--kit-selftests-on-change). Past that check, a bad sha, a failed diff, an empty diff or a
+        # path containing a newline writes the one-line listing `.github/kit-listing-refused`, which verify's literal floor
+        # reads as a control-plane path: that run is FULL. A schedule run or any other event gets no listing and skips them.
+        # Default branch only (security S2): a PR into another base branch, or a push to another branch, gets no listing,
+        # so it skips them too. The clear step above empties KIT_CHANGED, so nothing an earlier step wrote can survive.
+        if: (github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          z="$RUNNER_TEMP/kit-changed.z"
+          refuse() { printf '%s\n' '.github/kit-listing-refused' > "$RUNNER_TEMP/kit-changed.txt" && echo "KIT_CHANGED=$RUNNER_TEMP/kit-changed.txt" >> "$GITHUB_ENV" && exit 0; exit 1; }
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base="$BASE_SHA"; range="$BASE_SHA...HEAD" ;;
+            push) base="$BEFORE_SHA"; range="$BEFORE_SHA..$GITHUB_SHA" ;;
+            *) exit 0 ;;
+          esac
+          case "$base" in *[!0]*|'') : ;; *) exit 0 ;; esac
+          case "$base" in *[!0-9a-f]*|'') refuse ;; esac
+          [ "${#base}" -eq 40 ] || [ "${#base}" -eq 64 ] || refuse
+          if git diff -z --name-only --no-renames "$range" > "$z" \
+            && [ -s "$z" ] && [ "$(tr -cd '\n' < "$z" | wc -c)" -eq 0 ]; then
+            tr '\0' '\n' < "$z" > "$RUNNER_TEMP/kit-changed.txt"
+            echo "KIT_CHANGED=$RUNNER_TEMP/kit-changed.txt" >> "$GITHUB_ENV"
+          else
+            refuse
+          fi
+
+      - name: Conformance aggregate (required — DEVELOPMENT-STANDARDS.md §14)
+        # No `gate-*` id: this is the aggregate, not one of the eight §14 gate ids
+        # that conformance/ci-gates.sh REQUIREs. Blocks on the CONTROL battery — `[doc]` failures
+        # exit 0 by design (verify.sh's RESULT lines), so a day-one adopter is not blocked by an
+        # unwritten RPO/RTO. Placed before toolchain setup because the aggregate is POSIX sh with
+        # no toolchain dependency; identical placement across every emitted pipeline is what makes
+        # `conformance/verify-enforced-wired.sh --fleet` cheap to lock.
+        # KIT_CHANGED is set only by the listing step above (a default-branch pull request or push); empty on
+        # a schedule or any unknown. --kit-selftests-on-change makes a run with no listing skip the kit's own
+        # selftests (rows N-A, one notice); a listing that names a control-plane path still runs them all.
+        # Keep this ONE line (verify-enforced-wired reads it).
+        run: sh conformance/verify.sh --require --kit-selftests-on-change ${KIT_CHANGED:+--changed "$KIT_CHANGED" --summary-file "$GITHUB_STEP_SUMMARY"}
+      # <<< kit:owned changed-listing
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3
+        with:
+          terraform_version: '1.9'
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6  # v4
+
+      - name: Init (offline)
+        id: gate-install
+        run: terraform init -backend=false
+
+      - name: Lint
+        id: gate-lint
+        run: |
+          terraform fmt -check -recursive
+          tflint --init
+          tflint
+
+      - name: Validate
+        id: gate-type-check
+        run: terraform validate
+
+      - name: Test
+        id: gate-test
+        run: terraform test
+
+      - name: Build (terraform plan)
+        id: gate-build
+        # The plan is the IaC build artifact. Needs provider creds — wire read-only/plan
+        # credentials in your repo (e.g. OIDC to the cloud). -backend=false for pure validation.
+        # `find` (not a shallow `ls *.tf`) so a config nested in a subdir, or a *.tf.json config,
+        # is not missed — a shallow root-only glob would false-green-skip on either shape.
+        run: |
+          if find . -name '*.tf' -o -name '*.tf.json' | grep -q .; then
+            echo "has_build=true" >> "$GITHUB_OUTPUT"
+            terraform plan -out=tfplan -input=false
+          else
+            echo "has_build=false" >> "$GITHUB_OUTPUT"
+            echo "gate-build: N/A — no *.tf/*.tf.json config yet (DEVELOPMENT-STANDARDS.md §14 build gate); skipping"
+          fi
+
+      - name: Policy-as-code (Checkov + OPA/conftest)
+        id: gate-policy
+        run: |
+          if find . -name '*.tf' -o -name '*.tf.json' | grep -q .; then
+            pipx run --spec 'checkov==3.2.533' checkov -d . --quiet --compact
+            CONFTEST_VERSION=0.56.0
+            curl -sSfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" | tar -xz conftest
+            ./conftest test .
+          else
+            echo "gate-policy: N/A — no *.tf/*.tf.json config yet (DEVELOPMENT-STANDARDS.md §14 SAST/policy gate); skipping"
+          fi
+
+      - name: Secret scan
+        id: gate-secret-scan
+        # History scan via the pinned gitleaks binary (checksum-verified; H4b supply-chain pattern).
+        # Replaces gitleaks-action's commit-range mode, which failed on PR merge-refs ("Invalid
+        # revision range") and needed pull-requests:read; `gitleaks git` makes no API call
+        # (least-privilege: contents:read suffices) and respects .gitignore. Pinned v8.24.3 + sha256
+        # (gitleaks_8.24.3_checksums.txt).
+        # SCOPE: a pull request scans its own commits (base..head); a push to main scans main's own
+        # history; any other event (the weekly schedule, workflow_dispatch) scans every ref. The
+        # schedule is therefore your only all-branches sweep: removing it removes that sweep. Without
+        # --log-opts gitleaks runs `git log --all`, so one branch's finding would red every PR.
+        # Never put --all inside a PR range (it cancels the range). Event fields enter only via env:.
+        # OTHER FORGES: scan <target-tip>..<source-head> on change requests, the default branch's HEAD
+        # on default-branch pushes, and all refs on a schedule, from a full-depth clone. GitLab:
+        # GIT_DEPTH 0 and $CI_MERGE_REQUEST_DIFF_BASE_SHA..$CI_COMMIT_SHA (the shipped GitLab variant, profiles/typescript-node/ci.gitlab-ci.yml, still scans every branch; tracked separately). Elsewhere:
+        # `git merge-base origin/<target> HEAD` gives the left side of the range.
+        env:
+          GL_EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          GL_VER=8.24.3
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          case "$GL_EVENT" in
+            pull_request) GL_SCOPE="$BASE_SHA..HEAD" ;;
+            push)         GL_SCOPE="HEAD" ;;
+            *)            GL_SCOPE="--full-history --all" ;;
+          esac
+          if [ "$GL_EVENT" = pull_request ]; then
+            { echo "$BASE_SHA" | grep -Eqx '[0-9a-f]{40}([0-9a-f]{24})?' \
+              && git rev-parse -q --verify "$BASE_SHA^{commit}" >/dev/null; } \
+              || { echo "secret-scan: PR range not resolvable in this checkout; refusing to guess a range"; exit 1; }
+            [ -n "$(git rev-list -n 1 "$BASE_SHA..HEAD")" ] \
+              || { echo "secret-scan: PR range is empty; refusing to report a scan of nothing"; exit 1; }
+          fi
+          # shellcheck disable=SC2086  # deliberate: the all-refs scope is TWO words and must split for rev-list.
+          echo "secret-scan scope ($GL_EVENT): $GL_SCOPE ($(git rev-list --count $GL_SCOPE 2>/dev/null || echo '?') commits)"
+          /tmp/gitleaks git . --no-banner --redact --log-opts="$GL_SCOPE"
+
+      - name: Dependency / misconfig scan (Trivy config)
+        id: gate-dep-scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # v0.24.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Generate SBOM (Trivy CycloneDX)
+        id: gate-sbom
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # v0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Upload build artifact (for provenance)
+        # Guarded on the same input gate-build needs (*.tf/*.tf.json, via its own step output) —
+        # an empty scaffoldless incept has no IaC config yet, so gate-build skips and tfplan
+        # never exists; without this guard, if-no-files-found: error would hard-fail every push.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gate-build.outputs.has_build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: build-artifact
+          path: tfplan          # the Terraform plan (the IaC artifact)
+          if-no-files-found: error
+
+      # Attestation needs a public repository or GitHub Enterprise Cloud: say so when the provenance job below skips.
+      - name: Build provenance skipped (notice)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gate-build.outputs.has_build == 'true' && github.event.repository.private != false && vars.KIT_ATTEST_PRIVATE != 'true'
+        run: |
+          echo "::notice::Build provenance skipped: attestations on a private repository need GitHub Enterprise Cloud; set KIT_ATTEST_PRIVATE once you have it"
+
+  # Attestations run on a public repository, or on a private one that declares GitHub Enterprise Cloud with the
+  # KIT_ATTEST_PRIVATE variable (repository or organization level) set to true.
+  provenance:
+    needs: ci
+    # needs.ci.outputs.has_build mirrors the Upload-build-artifact guard above — no IaC config,
+    # no artifact was uploaded, so this job would fail downloading a nonexistent 'build-artifact'.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci.outputs.has_build == 'true' && (github.event.repository.private == false || vars.KIT_ATTEST_PRIVATE == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write       # scoped to this push-only job (build-provenance attestation)
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: build-artifact
+          path: build-artifact
+      - name: Attest build provenance
+        id: gate-provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018  # v1
+        with:
+          subject-path: build-artifact/**

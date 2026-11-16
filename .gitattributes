@@ -1,0 +1,5 @@
+# .gitattributes — an adopter distribution intentionally carries NO export-ignore rules.
+# The upstream kit export-ignores its OWN maintainer-only files from `git archive`; those
+# rules were carved out here (scripts/adopter-export.sh) so YOUR `git archive` KEEPS your
+# work — your CI workflows, ADRs, CHANGELOG, backlog and governance log ship, not vanish.
+# Add your own attributes (text / eol / linguist / merge) below as your project needs them.

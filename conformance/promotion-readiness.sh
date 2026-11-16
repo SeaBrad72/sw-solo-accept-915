@@ -1,0 +1,543 @@
+#!/bin/sh
+# promotion-readiness.sh — derive the change-class of a change-set and emit the promotion-readiness
+# surfacing that INFORMS a human GO/NO-GO. ADVISORY ONLY: it surfaces, it never gates (exit 0
+# always; the proportional GATES are slice 3 of the Proportional Promotion Contract,
+# docs/governance/promotion-contract.md). Reuses the guard's is_control_plane_path as the SINGLE
+# source of control-plane detection (sourced, never duplicated).
+#
+#   conformance/promotion-readiness.sh [--changed FILE] [--rung RUNG] [--class] [--changed-files] [--no-verify]
+# Change-class: control-plane > sensitive > ordinary (highest present wins). FAIL-SAFE: an empty or
+# unreadable change-set, an unavailable guard core, **an unresolvable merge-base**, or **a newline byte in
+# any path name** classifies control-plane (never silently ordinary). Class is DERIVED, never
+# self-asserted — there is no flag to declare a lower class.
+#
+# ⚠️ DISCLOSED CEILING — SUBMODULES. This is a stated LIMIT, not one of the fail-safe conditions above:
+# a changed gitlink is classified on the SUBMODULE PATH ALONE and is NOT escalated. Neither
+# `git diff --name-only` on the superproject nor the forge's PR-files API descends into a gitlink, so a
+# bump of `vendor/dep` emits exactly `vendor/dep` — the interior paths never reach classification.
+# Measured 2026-07-26 with a live superproject+submodule fixture.
+#   WHY NOT ESCALATED: control-plane PATTERNS inside a submodule are not control-plane AUTHORITY in the
+#   superproject — GitHub Actions reads workflows only from the superproject, so a submodule's
+#   `.github/workflows/*` never runs. A gitlink is a PINNED THIRD-PARTY DEPENDENCY WITH A RATIFIED CALL
+#   SITE, structurally like a lockfile bump, a `uses: org/action@sha` pin, or a container digest — none
+#   of which this kit classes as control-plane. Escalating gitlinks alone would be an inconsistency
+#   dressed as a fix.
+#   THE RESIDUAL THAT DOES BITE (this is the half worth knowing): if the superproject EXECUTES content
+#   from the submodule — a workflow step running `vendor/dep/script.sh`, or a symlink from a
+#   control-plane path into it — then that content has authority this gate never classified. Creating
+#   such a call site is ITSELF a control-plane change and is ratified once; only subsequent CONTENT
+#   changes ride free.
+#   Policy for opaque subtrees is deliberately unsettled here and is boarded as `SUBMODULE-CLASS-POLICY`
+#   (likely shape: an adopter-declared submodule policy, declared ONCE rather than per bump). Adopters
+#   using submodules carry this residual today.
+#   NOTE FOR LOCAL USE: the base is resolved as `origin/main` then `main` ONLY. On a checkout whose default
+#   branch is `master`/`trunk`/`develop`, or a detached HEAD with no remote, no base resolves — so a local
+#   run reports `control-plane` for EVERYTHING. That is deliberate (the old fallback compared the WORKTREE
+#   to HEAD, which one dirty ordinary file could use to hide every committed control-plane change). To
+#   classify a specific set instead, pass `--changed FILE`. CI is unaffected: every CI caller passes it.
+#   --changed FILE  newline-delimited path list (default: git diff --name-only vs the merge-base)
+#   --rung RUNG     spike|integration|rc|staging|production (default rc — the meaningful go/no-go)
+#   --class         print only the aggregate class and exit (the stable seam slice 3 consumes)
+#   --changed-files print only the DERIVED CHANGE-SET (one path per line) and exit — the second stable
+#                   seam, and the reason it exists is SINGLE AUTHORITY. A consumer that needs the file
+#                   list (conformance/ceremony-binding.sh's governance diff-shape guard is the first)
+#                   must NOT re-derive it with its own `git diff`: every hardening this file carries —
+#                   `--no-renames`, `core.quotePath=false`, `-z`, the newline fail-safe, the
+#                   merge-base ladder — would have to be re-earned in the copy, and the FIRST thing a
+#                   missing `--no-renames` buys an attacker is a `git mv` that vanishes the source
+#                   path from the set (measured, PROMOTION-RENAME-CLASS-DOWNGRADE). Exporting the list
+#                   means CLASS and any consumer are computed over the SAME set, by construction.
+#     OUTPUT is NEWLINE-DELIMITED, and that is safe HERE and only here: a path carrying a literal
+#     newline is already a DERIVE FAILURE above (it can never reach this printer), so the delimiter
+#     can never be ambiguous. A NUL stream is therefore not needed by the POSIX-sh consumer this
+#     serves; do not "upgrade" the delimiter without re-reading that fail-safe.
+#     EXIT: 0 = the list was derived (it may legitimately be EMPTY — a head its base already
+#     contains has an empty change-set); 3 = DERIVE FAILURE, nothing printed, diagnosis on stderr.
+#     A consumer MUST treat any non-zero as "I do not know the change-set" and fail CLOSED — the
+#     `--class` fail-safe answers `control-plane` in that state, and a list consumer has no
+#     equivalent safe answer to invent, which is why the failure is an rc and not an empty list.
+#     ⚠️ NOT a class: this mode says nothing about control-plane-ness and is UNAFFECTED by an
+#     unavailable guard core (that degrades CLASSIFICATION, not DERIVATION).
+#   --no-verify     skip the proven-vs-attested verify.sh invocation
+# (selftest lives on conformance/promotion-readiness-wired.sh — this producer has none of its own.)
+# Exit: 0 always (advisory) · 2 = usage · 3 = --changed-files derive failure (that mode only).
+# POSIX sh; dash-clean.
+set -eu
+cd "$(dirname "$0")/.." 2>/dev/null || true
+
+CORE=".claude/hooks/guard-core.sh"
+RUNG=rc; CLASS_ONLY=0; LIST_ONLY=0; NO_VERIFY=0; CHANGED=""; CHANGED_READ_FAIL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --changed) [ $# -ge 2 ] || { echo "usage: --changed needs a FILE" >&2; exit 2; }; CHANGED=$2; shift 2 ;;
+    --rung) [ $# -ge 2 ] || { echo "usage: --rung needs a RUNG" >&2; exit 2; }; RUNG=$2; shift 2 ;;
+    --class) CLASS_ONLY=1; shift ;;
+    # `--changed-files` — the list seam. NOT a spelling of `--changed`: that one CONSUMES a listing,
+    # this one PRODUCES the derived one.
+    --changed-files) LIST_ONLY=1; shift ;;
+    --no-verify) NO_VERIFY=1; shift ;;
+    *) echo "usage: promotion-readiness.sh [--changed FILE] [--rung RUNG] [--class] [--changed-files] [--no-verify]" >&2; exit 2 ;;
+  esac
+done
+# REFUSED, not reconciled (the same rule ceremony-binding applies to --scope + --pre-push): the two
+# seams have DIFFERENT exit contracts — `--class` is advisory-and-always-0 with a control-plane
+# fail-safe, `--changed-files` fails CLOSED with rc 3 — so a run asking for both would have to answer
+# one caller with the other's contract, and a consumer reading a `0` could not tell which it got.
+if [ "$CLASS_ONLY" = 1 ] && [ "$LIST_ONLY" = 1 ]; then
+  echo "usage: --class and --changed-files are mutually exclusive (different exit contracts: --class" >&2
+  echo "       is advisory and always exits 0 with a control-plane fail-safe; --changed-files fails" >&2
+  echo "       CLOSED with rc 3 when the change-set cannot be derived)" >&2
+  exit 2
+fi
+case "$RUNG" in spike|integration|rc|staging|production) ;;
+  *) echo "usage: --rung must be spike|integration|rc|staging|production" >&2; exit 2 ;; esac
+
+# Source the guard core for is_control_plane_path (single source of truth). Fail-safe if absent.
+GUARD_OK=1
+# shellcheck source=/dev/null  # $CORE is a fixed kit path resolved at runtime, not statically followable
+if [ -f "$CORE" ]; then . "$CORE"; else GUARD_OK=0; fi
+command -v is_control_plane_path >/dev/null 2>&1 || GUARD_OK=0
+
+# ── THE ADAPTER UNION — THE SECOND HALF OF THE MERGE-TIME CONTROL-PLANE SET
+# (GUARD-PATH-ENUMERATION-INCOMPLETE S2; design docs/architecture/2026-08-17-guard-class-parity-s2-design.md).
+#
+# WHY IT IS HERE AT ALL. `.github/workflows/ratification.yml` — the REQUIRED §13 gate — unions
+# guard-core with what each harness's adapter manifest DECLARES control-plane. This classifier saw
+# only the guard-core half, so `GEMINI.md`, `.gemini/*` and `.cursor/rules/*` derived `ordinary`
+# here and control-plane there: `loop-state` and `ceremony-binding` (which both derive through this
+# seam) PASSED a PR whose `Kit-Class: ordinary` trailer the ratification gate then contradicted, and
+# the trailer was gate-approved WRONG. The two gates now read the same set.
+#
+# ⚠️ THE GUARD IS **NOT** MADE UNION-AWARE, AND THAT ASYMMETRY IS DELIBERATE. The union is a
+# MERGE-TIME authority (adapters declare what must be ratified before merge); the guard is the
+# RUNTIME deny surface (a harness writing its own GEMINI.md must not be bricked). So `class ⊇ union`
+# while `guard ⊉ union` — read the census lock in promotion-readiness-wired.sh with that in mind.
+#
+# ⚠️ AND BOTH LAYERS ARE THE SHARED ONES. kit_path_in_union is the SAME matcher agent-boundary.sh
+# uses. Re-implementing the matching here would re-fork the semantics one layer down — `.Cursor/rules/x`
+# gating at ratification and deriving ordinary here — which is byte-for-byte the divergence this
+# change exists to close. Do not inline a `case` for it.
+UNION_LIB="${KIT_UNION_LIB:-conformance/union-lib.sh}"
+ADAPTERS_DIR="${KIT_ADAPTERS_DIR:-adapters}"
+# WAS THE SET SELECTED BY THE ENVIRONMENT? Recorded because an env-supplied union that resolves to
+# NOTHING must never be silent — see the OK-EMPTY arm below.
+ADAPTERS_DIR_FROM_ENV=0; [ -z "${KIT_ADAPTERS_DIR:-}" ] || ADAPTERS_DIR_FROM_ENV=1
+UNION_LIST=""; UNION_UNAVAIL=0; UNION_DIAG=""
+# shellcheck source=/dev/null  # a fixed kit path resolved at runtime, not statically followable
+if [ -f "$UNION_LIB" ]; then . "$UNION_LIB"; fi
+if command -v kit_union_derive >/dev/null 2>&1; then
+  # DERIVED ONCE PER RUN, into a variable (vet L-2). The per-path render walks every changed path, so
+  # a per-path derivation would spawn jq x manifests x n on the edit hot path.
+  # `strict` — DISCLOSED, and on STDERR only (vet L-1): loop-state and ceremony-binding both read
+  # this script's `--class` stdout with `tail -1`, so one line of prose there turns every degraded
+  # run into a DERIVE FAILURE at both merge gates.
+  UNION_LIST=$(kit_union_derive "$ADAPTERS_DIR" strict) && _u_rc=0 || _u_rc=$?
+  # PRE-FOLD ONCE, HERE, so the matcher's own fold is a no-op on every one of the n calls the render
+  # makes. Same reason the union is derived once (vet L-2): this runs on the edit hot path.
+  case "$UNION_LIST" in *[A-Z]*) UNION_LIST=$(printf '%s' "$UNION_LIST" | LC_ALL=C tr 'A-Z' 'a-z') ;; esac
+  case "$_u_rc" in
+    0) ;;                       # OK — manifests present, all parsed
+    3)                          # OK-EMPTY — no manifests at all. The guard-core floor alone, and
+                                # NEVER a fail-safe: an adapter-less or hand-rolled tree that
+                                # classified every PR control-plane is a ceremony DoS, and "no
+                                # adapters" is a legitimate state, not a failure.
+      # ⚠️ BUT AN **ENV-SUPPLIED** EMPTY UNION IS NEVER SILENT (review REV-I1). OK-EMPTY is
+      # legitimate when it describes the TREE; it is a downgrade when it describes an ambient
+      # variable. Measured before this disclosure existed:
+      #   KIT_ADAPTERS_DIR=<empty dir> … --class --changed <GEMINI.md>  ->  `ordinary`, rc 0, ZERO
+      #   bytes of stderr — one environment variable moved a governing path out of the
+      #   control-plane set with no trace anywhere. The class STILL degrades (that is OK-EMPTY's
+      #   contract, and fail-safing here would hand any caller a ceremony DoS by setting one
+      #   variable), but it can no longer do so unannounced. The consumers that must not be
+      #   steered at all scrub the variable instead — loop-state.sh and ceremony-binding.sh both
+      #   `env -u` it at their call sites, which is the control; this is the disclosure.
+      if [ "$ADAPTERS_DIR_FROM_ENV" = 1 ]; then
+        echo "promotion-readiness: KIT_ADAPTERS_DIR is set to '$ADAPTERS_DIR', which contains NO adapter manifest." >&2
+        echo "  The adapter-declared half of the control-plane set is therefore EMPTY and this run classifies on" >&2
+        echo "  the guard-core floor ALONE — paths declared only by a manifest (GEMINI.md, .gemini/*," >&2
+        echo "  .cursor/rules/*) will derive 'ordinary'. If that is not what you intended, unset KIT_ADAPTERS_DIR." >&2
+      fi
+      ;;
+    *) UNION_UNAVAIL=1
+       UNION_DIAG="the adapter-declared control-plane surface under '$ADAPTERS_DIR' could not be read (see stderr above)" ;;
+  esac
+else
+  # The shared library is missing. If this tree declares no adapters at all that is OK-EMPTY; if it
+  # DOES carry manifests, their declared surface is unreadable and the same fail-safe applies.
+  for _u_m in "$ADAPTERS_DIR"/*/adapter.json; do
+    [ -f "$_u_m" ] || continue
+    UNION_UNAVAIL=1
+    UNION_DIAG="conformance/union-lib.sh is missing, so the adapter-declared control-plane surface cannot be read"
+    echo "promotion-readiness: $UNION_DIAG. REMEDY: restore conformance/union-lib.sh." >&2
+    break
+  done
+fi
+# CLASSIFIER DEGRADED = either half of the merge-time set is unreadable. The AGGREGATE already
+# fail-safed on GUARD_OK=0; what did NOT was the PER-PATH RENDER, which printed `[ordinary]` for
+# governing paths directly above an aggregate line saying `control-plane` — a self-contradicting
+# surfacing on the exact artifact a human reads to render the §13 GO. classify_path answers
+# control-plane in this state so the two halves of the surfacing agree.
+CLASSIFIER_DEGRADED=0
+{ [ "$GUARD_OK" = 0 ] || [ "$UNION_UNAVAIL" = 1 ]; } && CLASSIFIER_DEGRADED=1
+
+# classify_path <path> -> ordinary|sensitive|control-plane
+classify_path() {
+  _p=$1
+  # DEGRADED -> the fail-safe class, per path as well as in aggregate (see CLASSIFIER_DEGRADED above).
+  if [ "$CLASSIFIER_DEGRADED" = 1 ]; then echo control-plane; return; fi
+  if [ "$GUARD_OK" = 1 ] && is_control_plane_path "$_p"; then echo control-plane; return; fi
+  # The ADAPTER-DECLARED half, through the SHARED matcher.
+  if [ -n "$UNION_LIST" ] && kit_path_in_union "$_p" "$UNION_LIST"; then echo control-plane; return; fi
+  # A2 (case). The control-plane half above folds inside is_control_plane_path; the SENSITIVE tier below
+  # is a second, independent matcher and was byte-literal — measured: `Auth/x`, `*.PEM` and `.ENV` all
+  # fell through to `ordinary`, lowering the ceremony for exactly the reason A2 exists.
+  #
+  # ⚠️ EVALUATE BOTH SPELLINGS AND TAKE THE HIGHER CLASS — do NOT simply substitute the folded form.
+  # An earlier draft replaced the subject and evaluated once, which is NOT monotone: the `.env.example`
+  # EXEMPT branch comes first, so folding let a path reach an exemption it could not reach unfolded.
+  # Measured downgrade: `secrets/.ENV.EXAMPLE` and `auth/.ENV.TEMPLATE` went sensitive -> ORDINARY.
+  # is_control_plane_path is safe because it ORs (literal OR folded); this function must do the same.
+  _cs=$_p
+  case "$_p" in *[A-Z]*) _cs=$(printf '%s' "$_p" | LC_ALL=C tr 'A-Z' 'a-z') ;; esac
+  if [ "$_cs" != "$_p" ]; then
+    _c_raw=$(_classify_one "$_p")
+    _c_fold=$(_classify_one "$_cs")
+    # highest wins: sensitive > ordinary (control-plane is already returned above)
+    if [ "$_c_raw" = sensitive ] || [ "$_c_fold" = sensitive ]; then echo sensitive; else echo ordinary; fi
+    return
+  fi
+  _classify_one "$_p"
+}
+
+# The literal tier matcher, factored out so classify_path can evaluate both spellings and take the
+# higher class. Returns ordinary|sensitive for a path already known not to be control-plane.
+_classify_one() {
+  _p=$1
+  case "$_p" in
+    .env.example|*/.env.example|.env.sample|*/.env.sample|.env.template|*/.env.template|.env.dist|*/.env.dist)
+      echo ordinary; return ;;
+    auth/*|*/auth/*|payments/*|*/payments/*|migrations/*|*/migrations/*|\
+    *secret*|keys/*|*/keys/*|*id_rsa*|*id_ecdsa*|*id_ed25519*|*.key|*.pem|.env|*/.env|.env.*|*/.env.*)
+      # secret coverage is a SUPERSET of the guard's own read-secret set (guard-core.sh:68) —
+      # the classifier must never under-detect what the guard already flags as secret.
+      echo sensitive; return ;;
+  esac
+  echo ordinary
+}
+
+# Resolve the change-set into $CHANGED_LIST (one path per line); FAIL-SAFE on any failure.
+if [ -n "$CHANGED" ]; then
+  if [ -f "$CHANGED" ]; then CHANGED_LIST=$(cat "$CHANGED"); else CHANGED_LIST=""; CHANGED_READ_FAIL=1; fi
+else
+  base=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || true)
+  # NO RESOLVABLE BASE -> DERIVE FAILURE (H3). Previously an empty $base fell through to the
+  # `git diff --name-only HEAD` fallback, which is WORKTREE-vs-HEAD, not branch-vs-base. Measured: with
+  # a single dirty ORDINARY file the fallback returned exactly that one path, so n=1, the n=0 fail-safe
+  # never fired, and every COMMITTED control-plane change on the branch was invisible -> `ordinary`.
+  # That is fail-OPEN on the derivation feeding a §13 authorization decision. This now matches
+  # obligation-lib.sh's obl_changeset (referenced BY NAME): an underivable base is a DERIVE FAILURE,
+  # which the fail-safe routes to `control-plane`. Removes a divergence that used to be documented as
+  # deliberate. An operator who genuinely wants to classify a specific set passes `--changed FILE`.
+  [ -n "$base" ] || CHANGED_READ_FAIL=1
+  # PATH QUOTING (PROMOTION-PATH-QUOTING; mirrors the `git -c core.quotePath=false … -z` derivation
+  # in obligation-lib.sh's obl_changeset — referenced BY NAME, never by line number: an earlier
+  # citation here drifted twice as that function's commentary grew, which is the same staleness class
+  # BOARD-ROW-ARITY and the T1/T2 comment corrections were about).
+  # Under git's default core.quotePath=true a path with any non-ASCII byte is emitted WRAPPED IN
+  # DOUBLE QUOTES with octal escapes ("\.github/workflows/d\303\251ploy.yml"). The leading '"'
+  # defeats is_control_plane_path, so an accented control-plane file classified `ordinary` and the
+  # §13 promotion ceremony silently downgraded from human-ratified to agent-autonomous.
+  # RENAMES (PROMOTION-RENAME-CLASS-DOWNGRADE; T2 in THREAT-MODEL.md — the same `--no-renames` fix
+  # obligation-lib.sh's obl_changeset carries, again referenced BY NAME, not by line number).
+  # Git detects renames BY DEFAULT and `--name-only` then emits ONLY THE DESTINATION path, so a file
+  # moved OUT of the control-plane set is classified on its destination alone: measured on git 2.48.1,
+  # a repo whose only change is `git mv .github/workflows/deploy.yml docs/x.yml` scores R100, derives
+  # `docs/x.yml` alone, and classified `ordinary` — the §13 ceremony silently downgraded from
+  # human-ratified to agent-autonomous. Same failure shape as PROMOTION-PATH-QUOTING, different door,
+  # same function. `--no-renames` is a FLAG, so it also overrides a user's or a CI host's
+  # `diff.renames` config — a config-only fix would be defeated by the next runner.
+  # MONOTONE: un-collapsing an `R` entry can only ever ADD the source path, and the aggregate is the
+  # HIGHEST class present, so no change-set can classify LOWER after this fix.
+  # MONOTONE: unquoting can only ever ADD matches — no change-set can classify LOWER after this fix.
+  # WHICH HALF IS PROVEN — measured, not reasoned. Mutants run against
+  # `sh conformance/promotion-readiness-wired.sh --selftest`:
+  #   drop `-z` only                   -> quote-in-name leg RED   (that leg is its ONLY killer)
+  #   drop `core.quotePath=false` only -> ALL THREE LEGS SURVIVE   (unproven — see below)
+  #   drop both                        -> nonascii AND quote-in-name RED
+  # So `-z` is the strictly stronger control and is the half that carries this fix: NUL output is
+  # never quoted at all, whereas core.quotePath=false only stops non-ASCII octal escaping and still
+  # quotes a path containing '"'. core.quotePath=false is retained as defense-in-depth for readers
+  # and for any future non-`-z` consumer, but NO leg proves it — do not claim otherwise.
+  # A temp file, NOT a pipe: `git … | tr` makes the pipeline's status tr's and would discard the
+  # derive-failure signal the `CHANGED_READ_FAIL` fail-safe below depends on (by NAME, not by line number —
+  # this file's own rule, and the numeric form had already drifted twice). POSIX sh has no PIPESTATUS.
+  # NEWLINE-IN-NAME: no longer mis-split — DETECTED and routed to the fail-safe (see the detector below).
+  # The old ceiling here said newline-in-name "is not covered"; that was a disclosed FAIL-OPEN, and the
+  # residual that bounded it wrongly claimed control-plane was safe from it. Both are now closed by
+  # refusing to classify a change-set whose NUL stream carries a newline byte.
+  _z=$(mktemp 2>/dev/null) || _z=""
+  if [ -z "$_z" ]; then
+    CHANGED_LIST=""; CHANGED_READ_FAIL=1
+  else
+    if [ -n "$base" ]; then
+      if git -c core.quotePath=false diff --name-only -z --no-renames "$base"...HEAD > "$_z" 2>/dev/null; then _ok=1; else _ok=0; fi
+    else
+      if git -c core.quotePath=false diff --name-only -z --no-renames HEAD > "$_z" 2>/dev/null; then _ok=1; else _ok=0; fi
+    fi
+    # NEWLINE-IN-FILENAME -> DERIVE FAILURE (fail-closed). A path containing a literal newline cannot be
+    # carried through `$()` in POSIX sh, so `tr '\0' '\n'` SPLITS it into fragments and each fragment is
+    # classified separately. That is a real DOWNGRADE, not a cosmetic limit, and the "control-plane is
+    # fail-safe" reading was WRONG: `is_control_plane_path` includes SUFFIX-constrained patterns
+    # (`agents/*.agent.md`), so `agents/x<newline>.agent.md` splits into `agents/x` + `.agent.md` and
+    # NEITHER fragment matches -> ordinary. Sensitive patterns split the same way (`*secret*`, `*.pem`).
+    # We cannot PRESERVE such a path in POSIX sh — but we can DETECT it, which is all fail-closed needs:
+    # the NUL stream from `-z` contains a newline byte ONLY when a filename does. Measured: 0 for every
+    # well-formed change-set, >=1 for a crafted one. So refuse to classify instead of mis-classifying.
+    if [ "$_ok" = 1 ] && [ "$(LC_ALL=C tr -cd '\n' < "$_z" | wc -c | tr -d ' ')" != 0 ]; then
+      _ok=0   # a filename carries a literal newline -> route to the fail-safe, never split-and-classify
+    fi
+    if [ "$_ok" = 1 ]; then
+      CHANGED_LIST=$(tr '\0' '\n' < "$_z") || CHANGED_READ_FAIL=1
+    else
+      CHANGED_LIST=""; CHANGED_READ_FAIL=1
+    fi
+    rm -f "$_z"
+  fi
+fi
+
+# ---- `--changed-files`: EXPORT THE DERIVED CHANGE-SET, then exit. Deliberately placed HERE — after
+# the resolution above and BEFORE the aggregation/render below — so the list is byte-for-byte the set
+# `--class` walks (one derivation, no second read of git) and so no consumer of the list ever pays for
+# the verify.sh invocation. FAIL CLOSED: the same `CHANGED_READ_FAIL` signal the class fail-safes UP on
+# is an rc 3 here, because a list consumer cannot be handed an EMPTY list on a derive failure — an
+# empty list is indistinguishable from the legitimate empty change-set (a head its base already
+# contains), and reading "no paths" as "no paths outside my allowed set" is fail-OPEN by construction.
+if [ "$LIST_ONLY" = 1 ]; then
+  if [ "$CHANGED_READ_FAIL" = 1 ]; then
+    if [ -n "${CHANGED:-}" ]; then
+      echo "promotion-readiness --changed-files: DERIVE FAILURE — the --changed listing '$CHANGED' is not a readable file." >&2
+    elif [ -z "$base" ]; then
+      echo "promotion-readiness --changed-files: DERIVE FAILURE — NO RESOLVABLE BASE (the base is resolved" >&2
+      echo "  as origin/main then main only). A shallow or base-less checkout cannot yield a change-set;" >&2
+      echo "  give the checkout its history (actions/checkout with fetch-depth: 0) or pass --changed FILE." >&2
+    else
+      echo "promotion-readiness --changed-files: DERIVE FAILURE — a path name carries a literal NEWLINE," >&2
+      echo "  which POSIX sh cannot carry through a line-delimited list without splitting it into" >&2
+      echo "  fragments. Refusing to emit a set that would be read wrong (the same fail-safe --class" >&2
+      echo "  routes to control-plane)." >&2
+    fi
+    exit 3
+  fi
+  # `[ -n ]`-filtered so the single empty line `printf` emits for an EMPTY set is not mistaken for a
+  # path named "" — an empty change-set prints NOTHING and exits 0, which is the honest rendering.
+  printf '%s\n' "$CHANGED_LIST" | while IFS= read -r _lp; do [ -n "$_lp" ] || continue; printf '%s\n' "$_lp"; done
+  exit 0
+fi
+
+# Aggregate = highest class present.
+agg=ordinary; n=0
+# `IFS= read` is command-scoped -- never a global IFS assignment (semgrep: ifs-tampering).
+# Heredoc-fed, NOT piped: the loop stays in this shell, so `agg` and `n` survive it.
+# `read` performs no pathname expansion, so the old `set -f` glob guard is now redundant.
+while IFS= read -r _p; do
+  [ -n "$_p" ] || continue
+  n=$((n+1))
+  c=$(classify_path "$_p")
+  case "$c" in
+    control-plane) agg=control-plane ;;
+    sensitive) [ "$agg" = control-plane ] || agg=sensitive ;;
+  esac
+done <<CHANGED_EOF
+$CHANGED_LIST
+CHANGED_EOF
+
+# FAIL-SAFE: no readable change-set, or a degraded classifier -> highest class.
+# `CLASSIFIER_DEGRADED` covers BOTH halves of the merge-time set: GUARD_OK=0 (guard core absent or
+# is_control_plane_path undefined) and UNION_UNAVAIL=1 (adapter manifests EXIST and could not be
+# read). It deliberately does NOT cover OK-EMPTY — a tree with no adapter manifests classifies on the
+# guard-core floor, because fail-safing there would demand control-plane ceremony on every PR in
+# every adapter-less repository.
+if [ "$n" = 0 ] || [ "$CHANGED_READ_FAIL" = 1 ] || [ "$CLASSIFIER_DEGRADED" = 1 ]; then agg=control-plane; fi
+
+if [ "$CLASS_ONLY" = 1 ]; then
+  # ── SAY SO WHEN THE ANSWER IS A FAIL-SAFE RATHER THAN A DERIVATION (S2 M2's replacement for the
+  # deleted YAML reconciliation arms). This seam COLLAPSES four states into the one token
+  # `control-plane`: a genuine control-plane change-set, an empty one, an unreadable one, and a
+  # degraded classifier. Consumers that must fail closed are right to read them the same — but the
+  # ratification workflow ALSO renders this token onto the human's judgment surface, and there
+  # "control-plane, derived" and "control-plane, because we could not tell" are not the same
+  # sentence. The signal goes on STDERR and STDERR ONLY: every consumer parses this stdout with
+  # `tail -1`, so one line of prose there would turn a degraded run into a derive failure at both
+  # merge gates. STDOUT IS UNCHANGED — exactly one class token, exactly as before.
+  if [ "$CLASSIFIER_DEGRADED" = 1 ]; then
+    echo "promotion-readiness --class: FAIL-SAFED to control-plane — the classifier is DEGRADED (${UNION_DIAG:-the guard core at $CORE is absent or does not define is_control_plane_path}). This is not a derivation." >&2
+  elif [ "$CHANGED_READ_FAIL" = 1 ]; then
+    echo "promotion-readiness --class: FAIL-SAFED to control-plane — the change-set could not be derived (unreadable listing, no resolvable base, or a newline in a path name). This is not a derivation." >&2
+  elif [ "$n" = 0 ]; then
+    echo "promotion-readiness --class: FAIL-SAFED to control-plane — the change-set is EMPTY, and an empty set is never silently ordinary. This is not a derivation." >&2
+  fi
+  echo "$agg"; exit 0
+fi
+
+# disposition <class> <rung> -> the matrix cell text (mirrors docs/governance/promotion-contract.md)
+disposition() {
+  case "$1:$2" in
+    ordinary:spike) echo "Agent autonomous (L3); cheap gates advisory; no human gate" ;;
+    ordinary:integration) echo "Automated gates required; agent self-review; GO lightweight/delegable" ;;
+    ordinary:rc) echo "The meaningful go/no-go — human GO vs this surfacing; builder != reviewer; DoD + acceptance-criteria checked" ;;
+    ordinary:staging) echo "smoke + acceptance sign-off" ;;
+    ordinary:production) echo "human-commanded; progressive rollout; rollback ready" ;;
+    sensitive:spike) echo "Human-gated (always)" ;;
+    sensitive:integration) echo "High-risk review lane; human GO" ;;
+    sensitive:rc) echo "full dual review + human GO" ;;
+    sensitive:staging) echo "+ threat/privacy re-check" ;;
+    sensitive:production) echo "human-commanded; irreversible-gated" ;;
+    control-plane:spike) echo "Human-authored (always)" ;;
+    control-plane:integration) echo "Dev-clone authoring + control-plane-ratification" ;;
+    control-plane:rc) echo "human ratify + meta-control" ;;
+    control-plane:staging|control-plane:production) echo "N/A — control-plane does not deploy to runtime rungs" ;;
+    *) echo "(unknown cell)" ;;
+  esac
+}
+
+# Proven-vs-attested: reuse verify.sh's [control] vs [doc] split (the kit's own honesty stance).
+pv="proven-vs-attested: skipped (--no-verify)"
+if [ "$NO_VERIFY" = 0 ]; then
+  if [ -f conformance/verify.sh ]; then
+    pv=$(sh conformance/verify.sh 2>/dev/null | grep -E '^Summary:|UNVERIFIED is NOT a pass' || true)
+    [ -n "$pv" ] || pv="proven-vs-attested: UNAVAILABLE (run conformance/verify.sh)"
+  else
+    pv="proven-vs-attested: UNAVAILABLE (conformance/verify.sh not found)"
+  fi
+fi
+
+# Acceptance-criteria: BACKLOG.md if trivially present, else attest at the gate (slice 3+).
+if [ -f BACKLOG.md ]; then ac="see BACKLOG.md for the story's acceptance criteria"; else ac="attest at gate (tracker-sourced at the RC gate — slice 3+)"; fi
+
+echo "=== Promotion-readiness surfacing ==="
+echo "Rung (destination): $RUNG"
+echo ""
+# RENDER BOUNDARY — strip control bytes from attacker-influenceable path names (H2).
+# WHY: PROMOTION-PATH-QUOTING (v3.184.0) replaced git's default core.quotePath=true — which ESCAPED
+# control bytes — with `-z` + quotePath=false, which passes them through RAW. Nothing then stripped
+# them, and every path is rendered into the surfacing a HUMAN READS to give the §13 GO. Measured: a
+# filename carrying CR + ESC[2K + ESC[1A prints a FORGED "2. Change-class (aggregate): ordinary" line
+# and scrolls the true `control-plane` line away. A PR author names files, so this is untrusted input
+# reaching a decision surface — the class already fixed in a11y-obligation.sh (referenced BY NAME).
+# STRIP AT RENDER ONLY, NEVER BEFORE classify_path: stripping before classification would let a
+# crafted name become a DIFFERENT (lower) class — the fail-OPEN direction. Classification above sees
+# the raw bytes; only the human-facing echo is sanitized.
+# CEILING: removes control bytes, not a merely misleading printable name (e.g. a homoglyph).
+_render_safe() { LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177'; }
+# DERIVE-FAILURE DISCLOSURE. When the base was underivable the class is fail-safed to control-plane, but
+# the listing below is a WORKTREE-vs-HEAD diff — the very derivation this check condemns — so printing it
+# unlabelled next to a `control-plane` verdict makes the two sections contradict each other on the surface
+# a human reads to give the §13 GO. Say so plainly instead.
+# Branch the wording on WHICH cause fired: with no resolvable base the listing below is a worktree diff;
+# with a newline in a path name the listing is EMPTY. Saying "worktree diff" for both is inaccurate in one
+# of its own branches, on the surface a human reads to give the §13 GO.
+# DEGRADED-CLASSIFIER DISCLOSURE (S2). The block below branches on the CHANGE-SET's derivability; it
+# never branched on the CLASSIFIER's. So with the guard core absent — or an adapter manifest that
+# cannot be parsed — section 1 printed `[ordinary]` beside governing paths while section 2 said
+# `control-plane`, and nothing on the page said why. classify_path now answers control-plane in that
+# state, which removes the contradiction; this says WHICH half went dark, so a reader does not take a
+# page of control-plane rows as a derivation.
+if [ "$CLASSIFIER_DEGRADED" = 1 ]; then
+  echo "   (DEGRADED CLASSIFIER — the class below is FAIL-SAFED to control-plane, and every per-path"
+  if [ "$GUARD_OK" = 0 ]; then
+    echo "    label is that same fail-safe rather than a derivation: the guard core ($CORE) is absent or"
+    echo "    does not define is_control_plane_path. REMEDY: restore it.)"
+  else
+    echo "    label is that same fail-safe rather than a derivation: $UNION_DIAG."
+    echo "    REMEDY: see the diagnosis on stderr.)"
+  fi
+fi
+if [ "$CHANGED_READ_FAIL" = 1 ] && [ -z "${CHANGED:-}" ]; then
+  if [ -z "$base" ]; then
+    echo "   (derive failure: NO RESOLVABLE BASE — the class below is FAIL-SAFED to control-plane, and the"
+    echo "    listing that follows is a WORKTREE diff, not the branch's change-set. The base is resolved as"
+    echo "    origin/main then main only; pass --changed FILE to classify a specific set.)"
+  else
+    echo "   (derive failure: A PATH NAME CARRIES A NEWLINE — such a path cannot be carried through POSIX"
+    echo "    sh without splitting into fragments that classify separately, so the class below is"
+    echo "    FAIL-SAFED to control-plane and the listing that follows is EMPTY, not the change-set.)"
+  fi
+fi
+echo "1. What changed ($n path(s)):"
+printf '%s\n' "$CHANGED_LIST" | while IFS= read -r _q; do [ -n "$_q" ] || continue; printf '   [%s] %s\n' "$(classify_path "$_q")" "$(_render_safe "$_q")"; done
+echo ""
+echo "2. Change-class (aggregate): $agg"
+echo ""
+echo "3. Blast-radius (class x rung): $(disposition "$agg" "$RUNG")"
+echo ""
+echo "4. Proven-vs-attested:"
+printf '%s\n' "$pv" | sed 's/^/   /'
+echo ""
+echo "5. DoD + acceptance-criteria:"
+echo "   Definition of Done: see CLAUDE.md \"Definition of Done\""
+echo "   ACCEPTANCE-CRITERIA: $ac"
+echo ""
+echo "6. Regression surface:"
+echo "   REGRESSION-SURFACE: human attests (not auto-derived — this is the judgment, not a fact)"
+echo ""
+echo "7. Demonstrable increment (taste-surface):"
+echo "   If this change has a taste-surface (UI/UX/flow/working-functionality/table), demonstrate it and record the verdict in a UAT sign-off (skills/demonstrate). Advisory — surfaced, not gated this slice."
+echo ""
+# B8 (GATE-PROVENANCE-SELF-DISABLES-AND-NEVER-GATES-THE-MERGE, PHASE-B-SPINE) — honest
+# gate-provenance surfacing. The provenance/image-provenance CI job(s) are PUSH-ONLY
+# (profiles/*/ci.yml: `if: github.event_name == 'push' && github.ref == 'refs/heads/main' && ...`),
+# so at THIS surfacing time (PR/RC) the job has structurally not run — a green PR proves nothing
+# about it. State the SHAPE, not a false reassurance. The real assertion fires at the tag rung
+# (scripts/release-tag.sh provenance_gate), dialed by RELEASE_TAG_PROVENANCE — repo-carried in
+# `.kit/dials.conf` since Δ-C, and `enforce` on the kit's own tree (an adopter export carries no
+# conf and reads observe). See docs/architecture/2026-08-08-b8-provenance-honesty-design.md §4.2 and
+# docs/architecture/2026-08-13-dial-delivery-provenance-design.md.
+echo "8. Gate-provenance (SLSA attestation) honesty:"
+echo "   The provenance/image-provenance CI job(s) are PUSH-ONLY (run after merge, on main) — they"
+echo "   structurally cannot have run yet for this change-set. A green PR here says nothing about them."
+GATE_DISP_FILE="conformance/gate-dispositions.txt"
+_pr_gate_disp() { # <gate-id> -> a one-line rendering: apply | na (REASON) | absent-file | unreadable
+  _pgd_g=$1
+  if [ ! -f conformance/ci-gates.sh ]; then echo "unreadable (conformance/ci-gates.sh not found)"; return; fi
+  _pgd_v=$(sh conformance/ci-gates.sh --disposition "$_pgd_g" "$GATE_DISP_FILE" 2>/dev/null || echo apply)
+  case "$_pgd_v" in
+    na)
+      _pgd_r=$(awk -F'\t' -v g="$_pgd_g" '!/^[[:space:]]*#/ && $1==g && NF>=3 {print $3}' "$GATE_DISP_FILE" 2>/dev/null | head -1 | tr -d '[:cntrl:]')
+      echo "na (${_pgd_r:-no reason on file})" ;;
+    absent) echo "absent-file (no $GATE_DISP_FILE — the adopter default, held to apply)" ;;
+    *) echo apply ;;
+  esac
+}
+echo "   gate-provenance: $(_pr_gate_disp gate-provenance)"
+echo "   gate-sbom:       $(_pr_gate_disp gate-sbom)"
+# Δ-C (D-240811-2.1): the dial is REPO-CARRIED (`.kit/dials.conf`), no longer env-only, and the kit's
+# own tree ships enforce. This is an advisory SURFACING, so it reports the two INPUTS as facts and
+# names where the decision is actually made. It deliberately does NOT re-implement the precedence —
+# rt_dial_mode in scripts/release-tag.sh is the reader, and a fifth copy here could drift into
+# confidently describing a posture the gate does not hold.
+# ROOTED AT THE REPO TOPLEVEL, not cwd [fix round 1, reviewer minor 4]: rt_dial_mode — the reader
+# this surfacing describes — roots at `git rev-parse --show-toplevel`, so a cwd-relative read here
+# could confidently report "<no key>" for a tree whose dial is in fact `enforce`, purely because the
+# operator invoked from a subdirectory. A surfacing that disagrees with the gate is worse than none.
+_pr_dial_root=$(git rev-parse --show-toplevel 2>/dev/null) || _pr_dial_root=""
+_pr_dial_conf=$(grep -E '^[[:space:]]*RELEASE_TAG_PROVENANCE[[:space:]]*=' "${_pr_dial_root:-.}/.kit/dials.conf" 2>/dev/null | tail -n1 \
+  | sed -E "s/^[[:space:]]*RELEASE_TAG_PROVENANCE[[:space:]]*=[[:space:]]*//; s/#.*$//; s/[\"']//g; s/[[:space:]].*$//")
+# SANITIZE BOTH INTERPOLATIONS BEFORE THEY REACH A HUMAN'S TERMINAL [fix round 1, security BLOCKING-3].
+# Both are attacker-influencable at this render boundary: the conf value is REPO-SUPPLIED (it arrives
+# in a PR diff) and the env value is CALLER-SUPPLIED. Echoed raw, either can carry terminal escape
+# sequences that rewrite what the human GO/NO-GO reader sees — the THREAT-MODEL.md:67 closed class,
+# and the same treatment `_pr_gate_disp` above already applies to a disposition reason and
+# rt_dial_mode applies to a dial value. Strip control bytes, then bound the length so neither can
+# forge an extra line on a surface a human reads before approving a release.
+_pr_dial_conf=$(printf '%s' "$_pr_dial_conf" | tr -d '[:cntrl:]' | cut -c1-40)
+_pr_dial_env=$(printf '%s' "${RELEASE_TAG_PROVENANCE:-}" | tr -d '[:cntrl:]' | cut -c1-40)
+echo "   The real assertion fires at the tag rung (scripts/release-tag.sh provenance_gate), dialed by"
+echo "   RELEASE_TAG_PROVENANCE — .kit/dials.conf says '${_pr_dial_conf:-<no key>}', the env says '${_pr_dial_env:-<unset>}'."
+echo "   The conf is authoritative; the env may only ESCALATE observe->enforce, never de-escalate;"
+echo "   absence reads observe (an adopter export carries no conf, so a first run is never red)."
+echo "   Under enforce a FAILED provenance query REFUSES the tag. The honest-N/A arms that still"
+echo "   proceed are: gh NOT INSTALLED, or no CI run for the SHA. Note a non-GitHub tree WITH gh"
+echo "   installed is NOT one of them — the query fails there, so enforce refuses it."
+echo ""
+echo "(Advisory surfacing — informs the human GO/NO-GO. It does not gate; exit 0.)"
+exit 0

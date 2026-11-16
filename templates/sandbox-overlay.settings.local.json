@@ -1,0 +1,15 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": false,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyWrite": [
+        "./.claude", "./hooks", "./.kit", "./.git/hooks", "./.git/config", "./.mcp.json",
+        "~/.gitconfig", "~/.config/git", "~/.zshrc", "~/.zshenv", "~/.zprofile",
+        "~/.bashrc", "~/.bash_profile", "~/.profile"
+      ]
+    }
+  }
+}

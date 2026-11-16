@@ -1,0 +1,12 @@
+# EDIT before enabling require_code_owner_reviews: replace the commented @your-org/*
+# placeholder teams below with REAL teams/users, then uncomment. An active @your-org
+# owner does not exist and would block EVERY merge (K3 / DEVELOPMENT-PROCESS.md §12).
+
+# Reference CODEOWNERS for the Terraform profile.
+# COPY & ADAPT: copy to .github/CODEOWNERS (or repo root). Routes review so the
+# builder is never the sole reviewer/merger (DEVELOPMENT-PROCESS.md §2, §12).
+# Replace @your-org/* with real teams.
+
+# *            @your-org/engineering
+# /.github/    @your-org/platform
+# /src/        @your-org/engineering

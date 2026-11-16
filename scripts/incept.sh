@@ -1,0 +1,2000 @@
+#!/bin/sh
+# incept.sh — Inception bootstrap (DEVELOPMENT-PROCESS.md §3 / START-HERE.md).
+# Transforms a freshly-cloned Sparkwright kit into a configured, Inception-complete
+# project, in place. Interactive by default; --noninteractive for automation/CI.
+#
+#   sh scripts/incept.sh [--name N] [--intent-owner O] [--stack S] [--team solo|team] \
+#                        [--backlog md|github|jira|ado|linear|gitlab] \
+#                        [--ci github|gitlab] [--harness claude-code[,generic,...]] \
+#                        [--operator-fluency novice|adjacent|practitioner] \
+#                        [--mode lean|enterprise] [--date YYYY-MM-DD] [--noninteractive]
+#
+# --date pins the stamped **Created:** date (default: today). Reproducible-reconstruction seam for
+# `kit-update`: re-running incept over the vendored kit-base must reproduce the adopter's ADOPTION
+# date, not today's, or the diff shows a phantom conflict in files nobody touched.
+#
+# It frees the root Claude-Code memory slot (CLAUDE.md = kit principles) by renaming the
+# principles doc to ENGINEERING-PRINCIPLES.md and rewriting the principles-sense references,
+# then stamps the PROJECT's CLAUDE.md/RUNBOOK.md/BACKLOG.md/ADR-000 and wires the profile CI.
+# What it changes: Rewrites the cloned kit IN PLACE — renames CLAUDE.md -> ENGINEERING-PRINCIPLES.md, stamps the project CLAUDE.md/RUNBOOK.md/BACKLOG.md/ADR-000, wires the profile CI, replaces the KIT's own SECURITY.md/README.md with the project's when (and only when) they match the digest the export recorded, and (non-DB) strips the kit:db-backed CI region + .db-backed marker.
+# Guardrails: Run on a fresh clone; interactive by default (--noninteractive for CI); the DB-region strip refuses an open-ended range (both markers required) so it can never wipe gates to EOF.
+set -eu
+
+# --- DB-archetype curation (KW3) — defined FIRST so the internal `__db-curate` seam needs none of the
+#     inception preamble (adapters registry, preflight, safety guards). The ts-node profile ships the
+#     `kit:db-backed` CI region (Postgres service + DATABASE_URL) + a scaffold/.db-backed marker ACTIVE
+#     because its default reference archetype is DB-backed. A NON-DB archetype (--no-db) strips both so
+#     first-run-green stays honest — no idle database service, and the detector marks db-postgres N/A. ---
+strip_db_region() {  # FILE — delete the `# >>> kit:db-backed` … `# <<< kit:db-backed` region in-place; no-op if absent
+  [ -f "$1" ] || return 0
+  # GUARD (Security-Medium): a `sed '/start/,/end/d'` range with NO closing match deletes to EOF — which
+  # would silently wipe EVERY gate below the region (sast/secret/agent-trace/provenance), leaving a
+  # gateless-but-green CI. Only strip when BOTH markers are present; otherwise no-op, loudly.
+  grep -q '# >>> kit:db-backed' "$1" || return 0   # no opening marker — nothing to strip
+  grep -q '# <<< kit:db-backed' "$1" || { echo "warn: kit:db-backed closing marker missing in $1 — leaving CI untouched (refusing an open-ended range that would wipe gates to EOF)" >&2; return 0; }
+  sed '/# >>> kit:db-backed/,/# <<< kit:db-backed/d' "$1" > "$1.kwtmp" && mv "$1.kwtmp" "$1"
+}
+curate_db_backed() {  # MODE(1|0) — 0=non-DB: strip the CI region(s) + marker + DB env lines + the DR drill; 1=DB-backed: keep
+  [ "${1:-1}" = 0 ] || return 0
+  strip_db_region .github/workflows/ci.yml
+  strip_db_region .gitlab-ci.yml
+  rm -f .db-backed
+  # CP-3: a non-DB archetype must not LOOK like a data project. Two leftovers made a stateless CLI
+  # fail conformance/readiness.sh dr-ready with "data project has no BIA / no RUNBOOK DR section":
+  #   1. .env.example still carried the COMMENTED `# DATABASE_URL=` / `# REDIS_URL=` backing-service
+  #      lines, and has_data_surface() (conformance/surface-lib.sh) greps .env.example UNANCHORED — so the
+  #      comment ALONE raised the obligation.
+  #   2. the profile scaffold's scripts/dr-drill.sh was copied into a project with no database.
+  # We remove the false SIGNAL, never the detector: has_data_surface is conservative BY DESIGN
+  # ("a MISS escalates, never exempts"), and anchoring its grep to uncommented assignments would let
+  # a real DB project with a commented DATABASE_URL escape DR entirely — a fail-open.
+  if [ -f .env.example ]; then
+    sed '/^# Backing services/d; /^# DATABASE_URL=/d; /^# REDIS_URL=/d' .env.example > .env.example.kwtmp \
+      && mv .env.example.kwtmp .env.example
+    # I1 (K12 sibling): the three stripped lines are .env.example's EOF, sitting below a blank
+    # separator — deleting them orphans that blank as the new EOF (`git diff --check`: "new blank
+    # line at EOF"), so the adopter's first `git add -A` import is dirty. Re-emit only through the
+    # last non-blank line (the same idiom adopter-export.sh uses for the CLAUDE.md carve). Runs on
+    # the ADOPTER's .env.example, never on kit source. Idempotent on an already-clean file.
+    awk 'NF{p=NR} {a[NR]=$0} END{for(i=1;i<=p;i++) print a[i]}' .env.example > .env.example.kwtmp \
+      && mv .env.example.kwtmp .env.example
+  fi
+  rm -f scripts/dr-drill.sh
+  echo "non-DB archetype: stripped the kit:db-backed CI region + the .db-backed marker + the DB/Redis .env.example lines + scripts/dr-drill.sh"
+}
+# Internal/testing seam: run ONLY the DB curation on the cwd, then exit (test-incept-postgres.sh drives this).
+if [ "${1:-}" = "__db-curate" ]; then curate_db_backed "${2:-1}"; exit 0; fi
+
+# --- Closing epilogue (step 6 of the main flow) — a FUNCTION so the internal `__emit-epilogue` seam
+#     below can print it standalone: inception-done.sh --selftest's epilogue leg (m) locks this text
+#     (the commit-the-baseline step + the stage-appropriate verify lines) without running a full
+#     inception. Defined up here beside the other pre-preamble seam for the same reason as
+#     strip_db_region: the seam needs none of the inception preamble. Uses the globals NAME VER
+#     STACK CI MODE TEAM PROTECT_HINT GUARD_STEP (set by the main flow, or by the seam's placeholders).
+print_epilogue() {
+cat <<EOF
+
+✅ Inception scaffolding complete for "${NAME}" (kit v${VER}, stack ${STACK}, CI ${CI}, mode ${MODE}, governance ${TEAM}).
+Note: the kit's principles doc moved to ENGINEERING-PRINCIPLES.md; this new CLAUDE.md is YOUR project guide (charter, config, roles).
+
+Do the judgment steps incept does NOT automate (see START-HERE.md):
+  1. Write the charter prose in CLAUDE.md (problem, vision, success metrics, scope).
+  2. Record the real stack decision in docs/architecture/ADR-000-stack.md.
+  3. Commit the incepted baseline — the FIRST commit (see docs/adoption/inception-bootstrap.md).
+     After the first push, share the kit base so teammates can run kit-update: sh scripts/kit-update.sh --publish-base
+  4. ${PROTECT_HINT}
+  5. Declare per-project config in CLAUDE.md §3 (autonomy tiers, SLO, review routing, WIP).
+  6. Assign roles in CLAUDE.md §4.
+  7. ${GUARD_STEP}
+     Other runtimes: pipe proposed commands through scripts/kit-guard (docs/operations/runtime-guards.md).
+
+Start your agent session here: cd "${PWD}" && claude (not a parent or a subfolder; the guard loads only from the launch directory).
+
+Verify now: sh conformance/inception-done.sh --surface
+Verify when a protected remote exists: sh conformance/inception-done.sh
+EOF
+}
+# Internal/testing seam: print ONLY the closing epilogue with placeholder values, then exit
+# (inception-done.sh --selftest's epilogue leg drives this; argument-borne, never an env var).
+if [ "${1:-}" = "__emit-epilogue" ]; then
+  NAME="<project>"; VER=$(cat VERSION 2>/dev/null || echo unknown); STACK="<stack>"; CI="<ci>"
+  MODE="<mode>"; TEAM="<governance>"
+  PROTECT_HINT="Protect main NOW — declare required checks in REQUIRED-CHECKS.md, then run scripts/branch-protection-apply.sh --replace on an unprotected main (first time), --apply once it is protected (see profiles/<stack>/BRANCH-PROTECTION.md); verify with: sh conformance/branch-protection.sh"
+  GUARD_STEP="(runtime-guard status — printed by a real inception run)"
+  print_epilogue; exit 0
+fi
+
+# Inception replaces the kit's OWN reference/dogfooding files (expected in a greenfield kit copy) but
+# must NEVER clobber a genuine adopter file in a brownfield merge. A kit-own file is identified by a
+# marker; an ABSENT destination is also safe to write. (go/no-go #2 — a bare cp silently overwrote an
+# adopter's CI/CODEOWNERS.) Brownfield adopters merge per docs/adoption/brownfield.md.
+cp_kit_replace() {  # <src> <dst> <kit-own-marker-ERE>
+  if [ ! -f "$2" ] || grep -qE "$3" "$2" 2>/dev/null; then
+    cp "$1" "$2"
+  else
+    echo "warning: $2 exists and is not a kit reference file — NOT overwritten (brownfield-safe). Merge $1 into it per docs/adoption/brownfield.md." >&2
+  fi
+}
+
+# CP7R5-GATE-AUTHORITY §4 — the RATIFIED provenance mechanism (option P2): stamp an ORIGIN MARKER into
+# the CI pipeline incept INSTALLS. It lets conformance/verify-enforced-wired.sh tell DRIFT (the kit
+# installed this pipeline and someone stripped a required step) apart from an UNMET DOCUMENTED MERGE
+# OBLIGATION (a brownfield adopter owns their pipeline and merges the gate-ids by hand, exactly as
+# docs/adoption/brownfield.md instructs). Nothing in an adopter tree recorded which of the two it was:
+# .kit-manifest lists the EXPORT's files (workflows are export-ignored), never an installed path.
+# Provenance written by the ACT of installation travels IN the artifact it describes, so it cannot go
+# stale relative to that artifact and survives a rename.
+#
+# TWO PROPERTIES ARE LOAD-BEARING — both locked by conformance/pipeline-origin.sh:
+#  1. NON-COLLISION. The marker must match NEITHER kit-own ERE passed below ('Kit-own CI|Sparkwright',
+#     'Sparkwright'). If it did, installing it would silently flip a LATER cp_kit_replace from PRESERVE
+#     to OVERWRITE and clobber an adopter's edited CI — a data-safety regression by the back door.
+#  2. ONLY STAMP A FILE WE WROTE. cp_kit_replace returns 0 whether it copied or preserved, so a blind
+#     post-call prepend would stamp a brownfield-PRESERVED adopter pipeline as kit-emitted — precisely
+#     the false-FAIL class this design exists to remove. Mirror its write condition up front instead,
+#     the same way install_codeowners does ("only transform a file WE wrote").
+# The marker goes at the TOP of the file, not inside it: curate_db_backed -> strip_db_region runs AFTER
+# the §5 wiring block and deletes the bounded `# >>> kit:db-backed` … `# <<< kit:db-backed` region, so a
+# marker placed inside that region would vanish on a --no-db incept.
+# HONEST CEILING: an adopter can delete this line. Under §4 that is an accepted self-assertion of
+# ownership — it downgrades enforcement to a DISCLOSED N/A, never to a silent pass.
+PIPELINE_ORIGIN_MARKER='# kit-pipeline-origin: emitted'
+install_pipeline() {  # <src> <dst> <kit-own-marker-ERE> — brownfield-safe copy + origin stamp
+  _ip_write=0
+  { [ ! -f "$2" ] || grep -qE "$3" "$2" 2>/dev/null; } && _ip_write=1
+  cp_kit_replace "$1" "$2" "$3"
+  [ "$_ip_write" -eq 1 ] || return 0     # brownfield-preserved — their file, not ours to label
+  [ -f "$2" ] || return 0
+  if ! grep -qF "$PIPELINE_ORIGIN_MARKER" "$2" 2>/dev/null; then   # idempotent: never double-stamp
+    # Unpredictable temp name beside the target (same idiom as install_codeowners) — avoids following
+    # a pre-placed symlink at a predictable path. A failed mktemp STOPS the write: there is no
+    # fallback name, because a guessable name brings that symlink back (SWAS-754).
+    _ip_tmp=$(mktemp "$(dirname "$2")/.kitorigin.XXXXXX" 2>/dev/null) || { printf '%s\n' "incept: could not create a temporary file in $(dirname "$2") (mktemp failed), so incept stopped part-way and this directory is half-incepted; check the disk has free space and the directory is writable, then re-export the kit into a fresh directory and run 'sh scripts/incept.sh' there (in an existing repository, restore it from git instead and rerun)" >&2; exit 1; }
+    { printf '%s\n' "$PIPELINE_ORIGIN_MARKER"; cat "$2"; } > "$_ip_tmp" && mv "$_ip_tmp" "$2"
+  fi
+}
+# Internal/testing seam: run ONLY install_pipeline SRC DST (incept's own copy + origin stamp), then exit.
+# ci-gates.sh --selftest's YF-incept cell drives this; argument-borne, never an env var.
+if [ "${1:-}" = "__install-pipeline" ]; then
+  [ $# -eq 3 ] || { echo "incept: __install-pipeline takes SRC DST" >&2; exit 2; }
+  case "$2" in -*) echo "incept: __install-pipeline: SRC must not start with -" >&2; exit 2 ;; esac
+  case "$3" in -*) echo "incept: __install-pipeline: DST must not start with -" >&2; exit 2 ;; esac
+  install_pipeline "$2" "$3" 'Kit-own CI|Sparkwright'; exit 0
+fi
+
+NAME="${INCEPT_NAME:-}"; OWNER="${INCEPT_INTENT_OWNER:-}"
+STACK="${INCEPT_STACK:-typescript-node}"; BACKLOG="${INCEPT_BACKLOG:-md}"; INTERACTIVE=1
+# A stack chosen via INCEPT_STACK is deliberate too — only an un-set stack is a silent default.
+[ -n "${INCEPT_STACK:-}" ] && STACK_EXPLICIT=1 || STACK_EXPLICIT=0
+# CP-4 (security): the flag is the ONLY opt-in — never an ambient env var. Literal 0, not
+# ${...:-0}, so a hostile/leftover ALLOW_NESTED in the environment cannot skip the ownership gate.
+ALLOW_NESTED=0
+ALLOW_RUNTIME_MISMATCH=0   # K2: forwarded to the stack-aware preflight as its documented waiver
+# KW5: solo/team governance fork (mirrors STACK/STACK_EXPLICIT). Default solo (announced below).
+# A team chosen via INCEPT_TEAM is deliberate too — only an un-set team is a silent default.
+TEAM="${INCEPT_TEAM:-solo}"
+[ -n "${INCEPT_TEAM:-}" ] && TEAM_EXPLICIT=1 || TEAM_EXPLICIT=0
+TEAM_MODES="solo team"
+CI="${INCEPT_CI:-github}"
+HARNESS="${INCEPT_HARNESS:-claude-code}"        # default keeps today's experience identical
+FLUENCY="${INCEPT_OPERATOR_FLUENCY:-}"          # empty = undeclared (nudge); else stamped
+OPERATOR_FLUENCIES="novice adjacent practitioner"
+MODE="${INCEPT_PROCESS_MODE:-}"
+# A mode chosen via INCEPT_PROCESS_MODE is deliberate too — only an un-set mode is a silent default.
+[ -n "${INCEPT_PROCESS_MODE:-}" ] && MODE_EXPLICIT=1 || MODE_EXPLICIT=0
+PROCESS_MODES="lean enterprise"
+# KW3: the ts-node default archetype is DB-backed (=1). --no-db (or INCEPT_DB_BACKED=0) strips the
+# profile's kit:db-backed CI region + the scaffold/.db-backed marker for a non-DB archetype.
+DB_BACKED="${INCEPT_DB_BACKED:-1}"
+# P1.2: the stamped date. Empty = "stamp today" (the default every adopter has always had).
+# `kit-update` reconstructs the adopter's base tree by re-running incept over the vendored kit-base
+# — that reconstruction runs TODAY, but the adopter's real tree carries their ADOPTION date, so an
+# unpinned stamp would fabricate a conflict in CLAUDE.md / ADR-000-stack.md (files nobody touched).
+# A FLAG, never an env var: an ambient INCEPT_DATE would let a decoy redirect a control-plane stamp.
+DATE_PIN=''
+# TBG-TRACKER-CONF F1: backend-neutral brownfield modifier — default 0 (greenfield), --existing sets 1.
+EXISTING=0
+# KIT-BASE-MANIFEST-CONCORDANCE: what to do when a `kit-base` already exists that is NOT the base this export would
+# record. Neither flag = refuse, before any mutation. The choice is the OWNER's (the guard human-gates replace).
+KB_KEEP=0
+KB_REPLACE=0
+# Canonical named backlog backends (one source of truth — conformance/backlog-adapters.sh
+# asserts this set agrees with DEVELOPMENT-PROCESS.md §6 and docs/work-tracking/adapters.md).
+BACKLOG_BACKENDS="md github jira ado linear gitlab"
+# CI platforms with a shipped reference pipeline. The contract is the gate-ids (the platform
+# is open — see docs/operations/ci-platforms.md); these are the two with a worked reference.
+CI_PLATFORMS="github gitlab"
+# Valid harness adapters = the adapters/ registry (one source of truth; each has an adapter.json).
+HARNESS_ADAPTERS=$(for _d in adapters/*/; do [ -f "${_d}adapter.json" ] && printf '%s ' "$(basename "$_d")" || true; done)
+[ -n "$HARNESS_ADAPTERS" ] || { echo "incept: no adapters/ registry found (adapters/<harness>/adapter.json). Aborting." >&2; exit 1; }
+# Valid stacks = the profiles/ registry (one source of truth; each shipped stack has a profiles/<stack>/
+# directory). DERIVED, never a hardcoded list that would drift. This is the reject-by-default set for
+# --stack: the value is stamped into CLAUDE.md via a `#`-delimited sed program (and kit-update replays
+# incept with the stack read back out of an adopter-controlled CLAUDE.md), so an unvalidated stack is a
+# sed-injection / arbitrary-file-write sink — it MUST be validated exactly as --ci/--harness/--team are.
+STACK_PROFILES=$(for _d in profiles/*/; do [ -d "$_d" ] && printf '%s ' "$(basename "$_d")" || true; done)
+[ -n "$STACK_PROFILES" ] || { echo "incept: no profiles/ registry found (profiles/<stack>/). Aborting." >&2; exit 1; }
+
+# reqval: a value-taking flag must have a value (else dash's `shift 2` would fail
+# under set -e/-u and abort with a confusing error instead of a clean exit 2).
+reqval() { [ "$1" -ge 2 ] || { echo "incept: $2 requires a value" >&2; exit 2; }; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) reqval $# --name; NAME="$2"; shift 2 ;;
+    --intent-owner) reqval $# --intent-owner; OWNER="$2"; shift 2 ;;
+    --stack) reqval $# --stack; STACK="$2"; STACK_EXPLICIT=1; shift 2 ;;
+    --team) reqval $# --team; TEAM="$2"; TEAM_EXPLICIT=1; shift 2 ;;
+    # VALIDATED AT THE FRONT DOOR against the six canonical tokens (security S-L4). The value is
+    # stamped into CLAUDE.md AND, on a non-md choice, interpolated into a markdown table row in
+    # WAIVER-REGISTER.md, so an unconstrained string is a text-injection surface in two files at
+    # once. It is also the value every downstream gate resolves: an unrecognised token used to be
+    # discovered later, by resolve_backend, on the adopter's first CI run. Refuse it here, naming
+    # the set — a one-time bootstrap must not stamp a value the whole kit will then reject.
+    --backlog) reqval $# --backlog
+      case " $BACKLOG_BACKENDS " in
+        *" $2 "*) : ;;
+        *) echo "incept: --backlog '$2' is not a known backend (known: $BACKLOG_BACKENDS)" >&2; exit 2 ;;
+      esac
+      BACKLOG="$2"; shift 2 ;;
+    --ci) reqval $# --ci; CI="$2"; shift 2 ;;
+    --harness) reqval $# --harness; HARNESS="$2"; shift 2 ;;
+    --operator-fluency) reqval $# --operator-fluency; FLUENCY="$2"; shift 2 ;;
+    --mode) reqval $# --mode; MODE="$2"; [ -n "$2" ] && MODE_EXPLICIT=1 || MODE_EXPLICIT=0; shift 2 ;;
+    # `reqval` checks ARITY, not EMPTINESS: `--date ""` satisfies it, and an empty DATE_PIN skips the
+    # `[ -n "$DATE_PIN" ]` validation below and falls open to TODAY with rc=0. That is a fail-open in the
+    # exact seam that exists to PREVENT a false alarm: kit-update passes the adoption date it parsed out
+    # of CLAUDE.md, so an empty parse (missing field, reformatted doc, a grep that missed) would silently
+    # stamp today and fabricate a phantom conflict in CLAUDE.md + ADR-000-stack.md. Refuse, loudly.
+    --date) reqval $# --date; [ -n "$2" ] || { echo "incept: --date requires a non-empty YYYY-MM-DD value" >&2; exit 2; }; DATE_PIN="$2"; shift 2 ;;
+    --no-db) DB_BACKED=0; shift ;;
+    --allow-nested) ALLOW_NESTED=1; shift ;;
+    --allow-runtime-mismatch) ALLOW_RUNTIME_MISMATCH=1; shift ;;
+    --noninteractive) INTERACTIVE=0; shift ;;
+    # TBG-TRACKER-CONF F1: a BACKEND-NEUTRAL brownfield modifier — "the backlog backend already
+    # exists; don't stamp greenfield defaults." Only the jira conf-stamping BODY is jira-shaped
+    # (an empty state map + a --discover instruction, vs. the greenfield identity map); every other
+    # tracker backend accepts the flag with a brownfield note, and `md` refuses it (no external
+    # tracker to adopt into). Neutrality lives in the flag itself, not in a per-backend gate here.
+    --existing) EXISTING=1; shift ;;
+    --kit-base-keep) KB_KEEP=1; shift ;;
+    --kit-base-replace) KB_REPLACE=1; shift ;;
+    -h|--help) echo "usage: incept.sh [--name N] [--intent-owner O] [--stack S] [--team solo|team] [--backlog md|github|jira|ado|linear|gitlab] [--existing] [--ci github|gitlab] [--harness claude-code[,generic,...]] [--operator-fluency novice|adjacent|practitioner] [--mode lean|enterprise] [--date YYYY-MM-DD] [--no-db] [--allow-runtime-mismatch] [--kit-base-keep | --kit-base-replace] [--noninteractive]"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$KB_KEEP" -eq 1 ] && [ "$KB_REPLACE" -eq 1 ]; then
+  echo "incept: --kit-base-keep and --kit-base-replace are opposites; pass at most one (usage error, nothing was changed)" >&2
+  exit 2
+fi
+
+# security L-5: validate the --existing/--backlog PAIR at arg-parse time, before ANY mutation (git
+# init, scaffold copy, .gitignore edit) — refusing this AFTER the scaffold is already written left a
+# half-incepted tree on a bad flag combination. Pure validation; no side effect above this line yet.
+if [ "$EXISTING" -eq 1 ] && [ "$BACKLOG" = "md" ]; then
+  echo "incept: --existing is not applicable to --backlog md (md has no external tracker to adopt into — for existing-repo adoption see docs/adoption/brownfield.md)" >&2
+  exit 1
+fi
+
+# --- CP-4: repository ownership is a hard precondition -------------------------------------
+# `git rev-parse --is-inside-work-tree` answers "is there a repo ABOVE me?" — not "is THIS dir the
+# root of its own repo?". The two diverge only when nested, which is why every non-nested test
+# agrees and why the kit once wrote a pre-push hook into a stranger's repository.
+#
+# The root test asks git (`--is-inside-work-tree` plus `--show-prefix`, see owns_itself); it does NOT
+# compare path strings. A path compare drifts: `--show-toplevel` is symlink-resolved while `$PWD` is not
+# (macOS /tmp -> /private/tmp), and on a case-insensitive filesystem a case-variant `cd` keeps its
+# spelling in `pwd -P` while git reports the stored one (SWAS-463). The physical paths below only
+# decide "in no repo at all" and name the owner in the refusal text.
+#
+# CP-11 closes the git-dir-CONTAINMENT gap: GIT_DIR/GIT_WORK_TREE env redirects are hard-refused, and
+# submodule / `git worktree add` trees are refused unless gated behind --allow-nested. Residual (named,
+# not absorbed): core.hooksPath, GIT_OBJECT_DIRECTORY, insteadOf — the git dir stays inside the cwd, so
+# containment passes; out of CP-11 scope. See CP-11 design §6.
+owning_repo_root() {  # <dir> -> stdout: physical toplevel, or empty when <dir> is in no repo
+  ( CDPATH='' cd "$1" 2>/dev/null || exit 0
+    _t=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+    CDPATH='' cd "$_t" 2>/dev/null && pwd -P )
+}
+owns_itself() {  # <dir> -> 0 iff <dir> is its own repo root, or is in no repo at all
+  # "Cannot determine" must REFUSE, never proceed (the kit's default). Compute the physical cwd FIRST:
+  # a dir we cannot even cd into is not "in no repo -> fine", it is unknown -> refuse. Unreachable from
+  # today's call sites (all pass "$PWD"/"$ROOT"), but the wrong default is worth closing.
+  _phys=$( CDPATH='' cd "$1" 2>/dev/null && pwd -P ) || return 1
+  [ -n "$_phys" ] || return 1
+  _own=$(owning_repo_root "$1")
+  [ -n "$_own" ] || return 0
+  # Ask git whether <dir> is the root, never compare path strings: on a case-insensitive filesystem `cd` into a
+  # case-variant spelling keeps that spelling in `pwd -P` while git reports the toplevel as stored, so a string
+  # compare refused the repository's own root. `--show-prefix` prints an empty line exactly at the root.
+  # git also prints an empty prefix when the cwd is OUTSIDE the work tree (a `core.worktree` pointing elsewhere), so the same subshell requires
+  # `--is-inside-work-tree` to print exactly `true`; anything else refuses.
+  _pfx=$( CDPATH='' cd "$1" 2>/dev/null && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ] && git rev-parse --show-prefix 2>/dev/null ) || return 1   # MUT-OWNSINSIDE
+  [ -z "$_pfx" ]   # MUT-OWNSROOT
+}
+
+# --- CP-11: git-dir redirection is a hard precondition (closes CP-4 §6) --------------------
+# CP-4 proves the cwd is the work-tree root (an empty `--show-prefix` inside the work tree), but `--show-toplevel` reports the cwd even when GIT_DIR/GIT_WORK_TREE, a
+# submodule, or a `git worktree add` tree redirect the git dir ELSEWHERE (measured). The hook then lands
+# in a repo the operator does not own (env) or a shared/other .git (structural). Invariant: the git dir
+# that will receive the write lives INSIDE the tree I own. BOTH sides physical (the /tmp symlink landmine).
+git_env_redirected() { [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ]; }
+git_dir_outside() {  # <dir> -> 0 (true) iff the physical git-common-dir is NOT inside <dir>
+  _cwd=$( CDPATH='' cd "$1" 2>/dev/null && pwd -P ) || return 0
+  _gcd=$( CDPATH='' cd "$1" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null ) || return 1
+  [ -n "$_gcd" ] || return 1
+  _gcd_phys=$( CDPATH='' cd "$1" 2>/dev/null && CDPATH='' cd "$_gcd" 2>/dev/null && pwd -P ) || return 0
+  case "$_gcd_phys/" in "$_cwd"/*) return 1 ;; *) return 0 ;; esac
+}
+
+if git_env_redirected; then
+  echo "" >&2
+  echo "ERROR: your git environment redirects git away from this directory." >&2
+  [ -n "${GIT_DIR:-}" ]       && echo "  GIT_DIR=$GIT_DIR" >&2
+  [ -n "${GIT_WORK_TREE:-}" ] && echo "  GIT_WORK_TREE=$GIT_WORK_TREE" >&2
+  echo "  incept would git-init and install the pre-push hook there, outside your product." >&2
+  echo "  Nothing has been written. Clear the redirect and re-run:" >&2
+  echo "    env -u GIT_DIR -u GIT_WORK_TREE sh scripts/incept.sh ..." >&2
+  exit 1
+elif git_dir_outside "$PWD" && [ "${ALLOW_NESTED:-0}" -eq 0 ]; then
+  _gcd_raw=$( git rev-parse --git-common-dir 2>/dev/null )
+  _gcd_show=$( CDPATH='' cd "${_gcd_raw:-.}" 2>/dev/null && pwd -P )
+  [ -n "$_gcd_show" ] || _gcd_show=$_gcd_raw
+  echo "" >&2
+  echo "ERROR: this directory's git dir lives outside it (nested dir, submodule, or linked worktree)." >&2
+  echo "  git dir: $_gcd_show  — the pre-push hook would land in that shared/other repo." >&2
+  echo "  If this is intentional, re-run with:  sh scripts/incept.sh --allow-nested ..." >&2
+  exit 1
+fi
+
+# CP-4: assert ownership BEFORE ANY MUTATION — before the scaffold copy, before `git init`, before
+# the pre-push hook. Nested in a foreign worktree, incept skipped `git init` (the PARENT satisfied
+# --is-inside-work-tree) and installed the guard into the PARENT's .git/hooks/. "Fails, but only
+# after it wrote the hook" is not a fix; placement here is the fix.
+if ! owns_itself "$PWD" && [ "${ALLOW_NESTED:-0}" -eq 0 ]; then
+  _parent=$(owning_repo_root "$PWD")
+  echo "" >&2
+  echo "ERROR: this directory is not the root of its own git repository." >&2
+  echo "  cwd:      $(pwd -P)" >&2
+  echo "  owned by: $_parent  (git toplevel)" >&2
+  echo "" >&2
+  echo "Incept would skip 'git init' and install the pre-push hook into" >&2
+  echo "$_parent/.git/hooks/ — outside your product. Nothing has been written." >&2
+  echo "" >&2
+  echo "If this nesting is intentional (e.g. a monorepo package), re-run with:" >&2
+  echo "  sh scripts/incept.sh --allow-nested ..." >&2
+  exit 1
+fi
+
+# escape a string for safe use as a sed REPLACEMENT. Escapes & / \ AND the `#` delimiter every `sedi`
+# stamp below uses: without `#`, a `#`-bearing value terminates the `s#..#..#` program and the trailing
+# text is read as sed COMMANDS (e.g. `w <path>` = arbitrary file write). Escaping `#` closes EVERY
+# `#`-delimited stamp sink at once, not just one call site (T9 — defense in depth with --stack validation).
+esc() { printf '%s' "$1" | sed 's/[&/#\\]/\\&/g'; }
+# portable in-place sed: last positional arg is the FILE (POSIX; no bash ${@: -1})
+sedi() {
+  last=
+  for last in "$@"; do :; done
+  sed -i.bak "$@" && rm -f "${last}.bak"
+}
+warn_codeowners_active_placeholder() {  # <dst> — G11: warn ONLY on an ACTIVE (uncommented) @your-org rule
+  if [ -f "$1" ] && grep -Eq '^[[:space:]]*[^#].*@your-org' "$1" 2>/dev/null; then
+    echo "warning: $1 has an ACTIVE @your-org/* placeholder — replace it with REAL teams/users" >&2
+    echo "         BEFORE enabling branch protection (require_code_owner_reviews), or that merge gate" >&2
+    echo "         will block (the placeholder owners don't exist). See docs/operations/review-lane.md." >&2
+  fi
+}
+
+# K3 (CP-7 recert Slice 2): incept must ship an INERT CODEOWNERS so require_code_owner_reviews cannot
+# silently block every merge. OWNER is free text ("who owns the why"); a blind substitution is INVALID
+# CODEOWNERS syntax, so seed the `*` rule ONLY when OWNER is an explicit @handle (@user or @org/team).
+# A bare name / free text stays fully inert — seeding a wrong/non-existent owner would re-introduce the
+# very block K3 fixes. Honest ceiling: incept cannot confirm the handle exists (no guaranteed network).
+codeowners_seed_handle() {  # <owner> — echoes the normalized @handle iff handle-shaped, else nothing
+  case "$1" in '@'*) : ;; *) return 0 ;; esac
+  _csh_h=${1#@}
+  printf '%s' "$_csh_h" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]{0,38}(/[A-Za-z0-9._-]+)?$' || return 0
+  printf '@%s' "$_csh_h"
+}
+install_codeowners() {  # <src> <dst> — brownfield-safe copy + inert transform + opportunistic @handle seed
+  # Mirror cp_kit_replace's write condition up front so we only transform a file WE wrote (kit-own/absent);
+  # a brownfield-preserved adopter file is left untouched (only the active-placeholder warning fires).
+  _ic_write=0
+  { [ ! -f "$2" ] || grep -qE 'COPY & ADAPT|@your-org' "$2" 2>/dev/null; } && _ic_write=1
+  cp_kit_replace "$1" "$2" 'COPY & ADAPT|@your-org'
+  [ "$_ic_write" -eq 1 ] || { warn_codeowners_active_placeholder "$2"; return 0; }
+  _ic_seed=$(codeowners_seed_handle "$OWNER")
+  # Comment every active ownership rule: ANY line whose first non-blank char is not '#' (a CODEOWNERS rule,
+  # whatever its leading glyph — `*`, `/`, or a bare-word path a future profile might use). Header comments
+  # and blank lines are untouched. (dual-review Minor: don't couple to the current `*`/`/` rule shapes.)
+  sedi 's/^\([[:space:]]*[^#[:space:]]\)/# \1/' "$2"
+  # Unpredictable temp name (mktemp, O_EXCL) beside the target — avoids following a pre-placed symlink
+  # at a predictable path (dual-review Low). A failed mktemp STOPS the write: there is no pid-name
+  # fallback, because a guessable name brings that symlink back (SWAS-754).
+  _ic_tmp=$(mktemp "$(dirname "$2")/.codeowners.XXXXXX" 2>/dev/null) || { printf '%s\n' "incept: could not create a temporary file in $(dirname "$2") (mktemp failed), so incept stopped part-way and this directory is half-incepted; check the disk has free space and the directory is writable, then re-export the kit into a fresh directory and run 'sh scripts/incept.sh' there (in an existing repository, restore it from git instead and rerun)" >&2; exit 1; }
+  {
+    echo "# EDIT before enabling require_code_owner_reviews: replace the commented @your-org/*"
+    echo "# placeholder teams below with REAL teams/users, then uncomment. An active @your-org"
+    echo "# owner does not exist and would block EVERY merge (K3 / DEVELOPMENT-PROCESS.md §12)."
+    if [ -n "$_ic_seed" ]; then
+      echo "# Seeded from --intent-owner; confirm it is a real VCS user/team and add co-reviewers."
+      echo "*            ${_ic_seed}"
+    fi
+    echo ""
+    cat "$2"
+  } > "$_ic_tmp" && mv "$_ic_tmp" "$2"
+  warn_codeowners_active_placeholder "$2"
+}
+
+# --- safety guards ---
+# SWAS-784: these tree checks run AHEAD of the preflight call below (they were after it), so a directory that is no un-incepted export gets
+# the plain sentence naming the cwd, not preflight's generic "missing prerequisites" line (preflight now refuses a wrong directory too).
+# Only their order and the principles check's message changed; they stay after the CP-11 and CP-4 refusals and before every write to the tree.
+# They use only [ -f ], [ -e ] and grep, never jq, so they hold on a machine whose prerequisites are missing.
+[ -f ENGINEERING-PRINCIPLES.md ] && { echo "error: ENGINEERING-PRINCIPLES.md exists — already incepted. Aborting." >&2; exit 1; }
+incept_not_export_die() {
+  # incept has no guard_path_hostile: a control character in the cwd (a newline forges a whole line) replaces the whole path
+  case "$PWD" in *[[:cntrl:]]*) _ic_cwd='<unprintable path>' ;; *) _ic_cwd=$PWD ;; esac
+  printf '%s\n' "error: $_ic_cwd is not an un-incepted Sparkwright export (principles CLAUDE.md not found). cd to your exported project's root. Aborting." >&2
+  exit 1
+}
+{ [ -f CLAUDE.md ] && grep -q "Engineering Principles & Definition of Done" CLAUDE.md; } || incept_not_export_die   # MUT-ICOTHER
+
+# --- INCEPT-CONTAIN: refuse a tree that carries kit-internal artifacts --------------------------
+# incept transforms a CLEAN adopter distribution: adopter-export.sh (git archive --worktree-attributes)
+# strips every export-ignored path, so an adopter tree carries NO kit internals. The kit's OWN dev repo
+# and a raw `git clone` of it DO. Refuse BEFORE any mutation and redirect to the export path. This is a
+# PROPERTY check (tree has kit internals), not an identity check (dev-repo vs clone are byte-identical).
+# Soundness: every marker below is export-ignored in .gitattributes, so a clean export can never trip
+# this — locked by conformance/incept-containment.sh (refusal-set ⊆ export-ignored). Sibling: CP-11
+# (GIT_DIR/GIT_WORK_TREE redirect). KEEP KIT_INTERNAL_MARKERS ON ONE LINE — the lock greps this line
+# (and scripts/preflight.sh reads it, as its third reader, to tell the kit checkout from an export).
+# Markers MUST be glob-free and match [A-Za-z0-9._/-] only: the unquoted `for` word-split below relies
+# on no pathname expansion, and the soundness lock's ERE escaper covers exactly this character class.
+KIT_INTERNAL_MARKERS='SPARKWRIGHT-CONSOLIDATED-BACKLOG.md docs/ROADMAP-KIT.md docs/superpowers .superpowers .publish-identifiers docs/governance/meta-control-log.md'
+incept_kit_die() {  # <marker>: the kit-internal refusal, before any write
+  echo "" >&2
+  echo "ERROR: this tree contains Sparkwright kit-internal files ($1)." >&2
+  echo "incept transforms a clean adopter distribution — not the kit source or a raw clone." >&2
+  echo "Produce one, then incept inside it:" >&2
+  echo "  sh scripts/adopter-export.sh <dest-dir>   &&   cd <dest-dir> && sh scripts/incept.sh ..." >&2
+  echo "Nothing has been written." >&2
+  exit 1
+}
+# SWAS-784 errata: the loop below tests each marker at the cwd only, so a --allow-nested subdirectory of the kit checkout that holds a principles CLAUDE.md passed it.
+# The toplevel leg also refuses when the git toplevel is the kit root: a marker AND the principles CLAUDE.md there, and no ENGINEERING-PRINCIPLES.md. A monorepo root that only
+# a plugin marked (.superpowers, no principles CLAUDE.md) is not the kit root. Default git environment only (CP-11 has refused a redirect by now).
+_ic_top=$(git rev-parse --show-toplevel 2>/dev/null) || _ic_top=""
+if [ -n "$_ic_top" ] && [ "$_ic_top" != "$PWD" ] && [ "$_ic_top" != "$(pwd -P)" ] && [ ! -f "$_ic_top/ENGINEERING-PRINCIPLES.md" ] && [ -f "$_ic_top/CLAUDE.md" ] && grep -q "Engineering Principles & Definition of Done" "$_ic_top/CLAUDE.md" 2>/dev/null; then   # MUT-ICTOP
+  for _m in $KIT_INTERNAL_MARKERS; do   # values are glob-free literals
+    if [ -e "$_ic_top/$_m" ]; then incept_kit_die "$_ic_top/$_m"; fi
+  done
+fi
+for _m in $KIT_INTERNAL_MARKERS; do   # values are glob-free literals; `set -eu` word-split is safe
+  [ -e "$_m" ] || continue
+  incept_kit_die "$_m"
+done
+
+# 9f: fail fast if universal prerequisites are missing — jq is hard-required by the
+# guard and conformance, so proceeding would only defer a cryptic failure.
+_pf_nested=""
+[ "${ALLOW_NESTED:-0}" -eq 1 ] && _pf_nested="--allow-nested"
+# SWAS-355: --boundary-advisory, so a boundary FAIL (an UNDECLARED opt-out) never aborts incept as "missing prerequisites": only the rc of the tools check is read here.
+# shellcheck disable=SC2086  # $_pf_nested is a deliberate single optional flag, not a word list
+if [ -f scripts/preflight.sh ] && ! sh scripts/preflight.sh --boundary-advisory $_pf_nested >/dev/null 2>&1; then
+  echo "incept: missing prerequisites. Run 'sh scripts/preflight.sh' for the list + install hints. Aborting." >&2
+  exit 1
+fi
+
+# brownfield safety: warn (never modify) if a .claude/ exists without the kit guard wired.
+if [ -f .claude/settings.json ] && ! grep -q 'guard\.sh' .claude/settings.json; then
+  echo "warning: .claude/settings.json present but the kit guard is not registered." >&2
+  echo "         If this is an existing repo, MERGE .claude/ per docs/adoption/brownfield.md" >&2
+  echo "         (add, do not overwrite) before running agents. Continuing without touching .claude/." >&2
+fi
+
+# --- P1.2-pre: CAPTURE the pristine export, before any mutation --------------------------------------
+# Split in time, deliberately: CAPTURE here (the tree is still pristine, but there may be NO git repo yet
+# — the documented adopter path starts from a plain directory and §5b0 below is where `git init` runs),
+# then COMMIT the orphan branch after §5b0. The obvious implementation — "snapshot to an orphan branch
+# before mutating" — CANNOT work: the repo you would snapshot into does not exist yet, and by the time it
+# does, the pristine tree is gone. Reordering §5b0 earlier was rejected: it would move a `git init` that
+# five guard clauses and the CP-4 ownership gate are sequenced around.
+#
+# SCOPED TO .kit-manifest, NOT THE WORKTREE — this is the data-loss guard. A brownfield worktree contains
+# adopter-authored files; capturing them would make a later diff(kit-base, new-export) read them as "the
+# kit deleted these", and kit-update would propose DELETING THE ADOPTER'S OWN WORK. Only paths the
+# exporter said it shipped can enter the base.
+KIT_BASE_STAGE=""
+# S1: is the relative path <arg>, or ANY of its ancestor components, a symlink? Walks each prefix
+# (a/b/c -> a, a/b, a/b/c) and tests it. POSIX; no realpath/readlink dependency. Returns 0 iff a symlink
+# is found anywhere on the path — the caller then refuses the whole base.
+_kb_path_has_symlink() {
+  # Walk prefixes via parameter expansion — NOT IFS splitting (semgrep p/default flags ifs-tampering,
+  # and it runs on the emitted artifact; CP-8b's lesson). a/b/c -> a, a/b, a/b/c.
+  _kb_rest=$1; _kb_acc=""
+  while [ -n "$_kb_rest" ]; do
+    _kb_seg=${_kb_rest%%/*}
+    case "$_kb_rest" in */*) _kb_rest=${_kb_rest#*/} ;; *) _kb_rest="" ;; esac
+    [ -n "$_kb_seg" ] || continue
+    if [ -z "$_kb_acc" ]; then _kb_acc=$_kb_seg; else _kb_acc="$_kb_acc/$_kb_seg"; fi
+    [ -L "$_kb_acc" ] && return 0
+  done
+  return 1
+}
+capture_kit_base() {
+  if [ ! -f .kit-manifest ]; then
+    echo "notice: no .kit-manifest — this export predates the kit-base mechanism." >&2
+    echo "        NOT recording a base. 'kit-update' will be UNAVAILABLE for this project." >&2
+    echo "        Re-export with a current kit to get one. See docs/operations/kit-base.md." >&2
+    return 0
+  fi
+  # SECURITY: the manifest tells a privileged tool what to stage. Treat it as UNTRUSTED INPUT even though
+  # we wrote it — an absolute path, a '..' segment, or a leading '-' (option injection) must never be
+  # followed. Refuse the whole base rather than partially trust it; fail SAFE (no base), never fail open.
+  if LC_ALL=C grep -qE '^/|(^|/)\.\.(/|$)|^-' .kit-manifest; then
+    echo "warning: .kit-manifest contains an absolute path, a '..' segment, or a leading '-'." >&2
+    echo "         REFUSING to record a kit-base from it. 'kit-update' will be unavailable." >&2
+    return 0
+  fi
+  KIT_BASE_STAGE=$(mktemp -d) || { KIT_BASE_STAGE=""; return 0; }
+  # C3: clean the staging dir on ANY exit between here and commit_kit_base (input validation, preflight,
+  # an interactive Ctrl-C). commit_kit_base removes it on the success path; this catches every other one.
+  # shellcheck disable=SC2064
+  trap 'rm -rf "$KIT_BASE_STAGE" 2>/dev/null || true' EXIT INT TERM
+  while IFS= read -r _kbp; do
+    [ -n "$_kbp" ] || continue
+    # S1 (security BLOCKER, review #318): a symlink — or a path whose ANY ancestor is a symlink — makes
+    # the copy below read a file OUTSIDE the export and bake its content into a committed, pushed git ref.
+    # The literal-text guard above cannot see it (the path text is clean; the filesystem resolves it out).
+    # The kit ships ZERO symlinks, so refuse the ENTIRE base on the first one — fail CLOSED, no base — and
+    # never copy through it. This is belt to the export side's braces (it no longer emits symlinks).
+    if _kb_path_has_symlink "$_kbp"; then
+      echo "warning: .kit-manifest entry '$_kbp' is, or traverses, a symlink." >&2
+      echo "         REFUSING to record a kit-base (it could copy a file from outside the export into your" >&2
+      echo "         git history). 'kit-update' will be unavailable. See docs/operations/kit-base.md." >&2
+      rm -rf "$KIT_BASE_STAGE" 2>/dev/null || true; KIT_BASE_STAGE=""
+      return 0
+    fi
+    [ -f "$_kbp" ] || continue
+    mkdir -p "$KIT_BASE_STAGE/$(dirname "$_kbp")" 2>/dev/null || continue
+    # cp -P: NEVER dereference. Defense in depth — even if a symlink slipped past the check above, its
+    # content can never be materialized into the base (the link itself would be copied, not its target).
+    cp -P "$_kbp" "$KIT_BASE_STAGE/$_kbp" 2>/dev/null || true
+  done < .kit-manifest
+}
+capture_kit_base
+
+# --- collect inputs ---
+if [ "$INTERACTIVE" -eq 1 ]; then
+  [ -n "$NAME" ]  || { printf 'Project name: '; read -r NAME; }
+  [ -n "$OWNER" ] || { printf 'Intent owner: '; read -r OWNER; }
+  printf 'Stack [%s] (compare: docs/STACK-SELECTION.md): ' "$STACK"; read -r _s || true; [ -n "${_s:-}" ] && { STACK="$_s"; STACK_EXPLICIT=1; }
+  printf 'Backlog backend (md/github/jira/ado/linear/gitlab) [%s]: ' "$BACKLOG"; read -r _b || true; [ -n "${_b:-}" ] && BACKLOG="$_b"
+  printf 'CI platform (github/gitlab) [%s]: ' "$CI"; read -r _c || true; [ -n "${_c:-}" ] && CI="$_c"
+  printf 'Harness(es), comma-separated, of: %s [%s]: ' "$HARNESS_ADAPTERS" "$HARNESS"; read -r _h || true; [ -n "${_h:-}" ] && HARNESS="$_h"
+  # SWAS-843 (SWAS-774 PR 1): the question is the forge-account count the merge verbs ask (docs/adoption/vc-hosts.md §Solo or team): 1 = solo, 2 or more = team.
+  # Enter takes team, the safe side, unless --team/INCEPT_TEAM already chose. A typed answer that maps to nothing is refused just below; only a preset default (--team or INCEPT_TEAM) reaches the registry check. No dial is written.
+  _tm_def="$TEAM"; [ "$TEAM_EXPLICIT" -eq 1 ] || _tm_def="team"   # MUT-I1D
+  printf 'How many forge accounts will this work run under? 1 = solo, 2 or more = team [%s]: ' "$_tm_def"; read -r _tm || true
+  _tm_typed="${_tm:-}"
+  _tm="${_tm:-$_tm_def}"
+  case "$_tm" in
+    solo|team) : ;;                            # the words are accepted as typed
+    *[!0-9]*) : ;;                              # not all digits: refused just below when typed, else the default goes to the registry check
+    1) _tm="solo" ;;                           # MUT-I1
+    [2-9]|[1-9][0-9]*) _tm="team" ;;
+  esac
+  # An answer that maps to nothing (0, 3x, Solo) is refused here in the person's own words, not as a flag they never typed.
+  case "$_tm" in
+    solo|team) : ;;
+    *) [ -z "$_tm_typed" ] || { printf '%s\n' "incept: answer 1, 2 or more, solo or team (got '$_tm_typed')." >&2; exit 2; } ;;
+  esac
+  TEAM="$_tm"; TEAM_EXPLICIT=1
+fi
+[ -n "$NAME" ]  || { echo "error: --name required" >&2; exit 2; }
+[ -n "$OWNER" ] || { echo "error: --intent-owner required" >&2; exit 2; }
+# SECURITY (dual-review K3): --name / --intent-owner are FREE TEXT that flow into `#`-delimited `sedi`
+# stamps (esc() escapes sed-special chars but NOT newlines/control bytes) and into the emitted CODEOWNERS
+# seed. A newline breaks a stamp cryptically ("unescaped newline inside substitute pattern"); a per-line
+# handle validator would pass a multi-line value's first line and inject the rest as ACTIVE CODEOWNERS
+# rules (re-opening the K3 block). Reject control chars at the boundary — reject-by-default, mirroring
+# --stack (T9) and the CP-6 terminal-control-in-input class. Normal names (spaces, hyphens, apostrophes,
+# accented UTF-8) are unaffected — only C0/C1 control bytes are refused.
+case "$NAME"  in *[[:cntrl:]]*) echo "error: --name contains control characters (newline / control bytes) — refused" >&2; exit 2 ;; esac
+case "$OWNER" in *[[:cntrl:]]*) echo "error: --intent-owner contains control characters (newline / control bytes) — refused" >&2; exit 2 ;; esac
+case " $BACKLOG_BACKENDS " in *" $BACKLOG "*) : ;; *) echo "error: unknown --backlog '$BACKLOG' (one of: $BACKLOG_BACKENDS)" >&2; exit 2 ;; esac
+case " $CI_PLATFORMS " in *" $CI "*) : ;; *) echo "error: unknown --ci '$CI' (one of: $CI_PLATFORMS)" >&2; exit 2 ;; esac
+case " $TEAM_MODES " in *" $TEAM "*) : ;; *) echo "error: unknown --team '$TEAM' (one of: $TEAM_MODES)" >&2; exit 2 ;; esac
+# --stack is reject-by-default against the profiles/ registry, refused EARLY (before any file mutation).
+# SECURITY: unvalidated, the value flows into a `#`-delimited `sedi` stamp (arbitrary-file-write via sed
+# `w`) and kit-update replays it from an adopter-controlled CLAUDE.md. esc() also escapes `#` now — belt
+# and braces — but the registry check is the real boundary. A value starting with `-` lands here too (it
+# is consumed as the --stack VALUE, not a flag) and is refused unless it names a shipped profile.
+case " $STACK_PROFILES " in *" $STACK "*) : ;; *) echo "error: unknown --stack '$STACK' (one of: $STACK_PROFILES)" >&2; exit 2 ;; esac
+HARNESS_LIST=$(printf '%s' "$HARNESS" | tr ',' ' ')
+for _h in $HARNESS_LIST; do
+  case " $HARNESS_ADAPTERS " in *" $_h "*) : ;; *) echo "error: unknown --harness '$_h' (one of: $HARNESS_ADAPTERS)" >&2; exit 2 ;; esac
+done
+# GitLab CI ships only for stacks with a reference pipeline (typescript-node today). Refuse EARLY
+# (before any file changes) rather than silently writing no CI file and dead-ending at the
+# Inception-Done gate. GitHub ships a pipeline for every service stack.
+if [ "$CI" = "gitlab" ] && [ ! -f "profiles/${STACK}/ci.gitlab-ci.yml" ]; then
+  _gl=$(ls profiles/*/ci.gitlab-ci.yml 2>/dev/null | sed 's#profiles/##; s#/ci.gitlab-ci.yml##' | tr '\n' ' ')
+  echo "error: --ci gitlab is not yet available for stack '${STACK}' (no profiles/${STACK}/ci.gitlab-ci.yml)." >&2
+  echo "       Use --ci github (ships for every service stack), or add profiles/${STACK}/ci.gitlab-ci.yml." >&2
+  echo "       GitLab references today: ${_gl:-none}." >&2
+  exit 2
+fi
+
+# --- K2: the STACK-AWARE preflight — run it HERE, where $STACK is finally trusted ------------------
+# The universal preflight above (§9f) runs BEFORE --stack is validated, so it is deliberately BARE:
+# passing an unvalidated $STACK into another script is exactly the sed-injection / arbitrary-file-write
+# sink the registry check on the `--stack` line guards against. That is why this is a SECOND call, not
+# a flag added to the first one.
+#
+# WHAT IT CLOSES (CP-7 run-5, K2). preflight has enforced a per-stack runtime floor since v3.169.0 —
+# and `incept` never invoked it, so the refusal was UNREACHABLE on the documented path: START-HERE has
+# the operator run BARE preflight first, then `incept --stack <chosen>`. In run 5 that let
+# `incept --stack typescript-node` complete on Node 20.10 and hand the operator a project whose very
+# first `npm ci` failed against the emitted Node 24 floor — a fault detectable one step earlier, by a
+# check that already existed. Same shape as K9: a guard that had never executed on the path people use.
+#
+# Placement is load-bearing: AFTER validation (so $STACK is trusted) and BEFORE any working-tree
+# mutation (so a refusal leaves nothing half-written), alongside the other early refusals above.
+#
+# THE WAIVER MUST BE FORWARDABLE, OR THE ESCAPE IS A DEAD END. preflight's own failure text names
+# `--allow-runtime-mismatch`, but that flag makes PREFLIGHT pass — it does nothing for a subsequent
+# `incept`, which would call preflight again without it and refuse identically. An escape that does not
+# unblock the command that offered it is worse than none: it costs the operator a cycle to discover.
+# So incept accepts the same flag and FORWARDS it (see the arg parser above).
+if [ -f scripts/preflight.sh ]; then
+  _pf_waiver=""
+  [ "$ALLOW_RUNTIME_MISMATCH" -eq 1 ] && _pf_waiver="--allow-runtime-mismatch"
+  # shellcheck disable=SC2086  # both are deliberate single optional flags, not word lists
+  if ! _pf_out=$(sh scripts/preflight.sh --boundary-advisory --stack "$STACK" $_pf_nested $_pf_waiver 2>&1); then   # advisory: the floor message is never caused by the boundary
+    echo "incept: toolchain check failed: a required tool is missing or below its declared floor (run sh scripts/preflight.sh --stack $STACK for the list)" >&2
+    echo "" >&2
+    printf '%s\n' "$_pf_out" | sed 's/^/  /' >&2
+    echo "" >&2
+    # REFUSE FOR A HUMAN, WARN FOR AUTOMATION — the harm model discriminates, not the environment.
+    #
+    # K2's actual harm is a PERSON incepting and then hitting an incomprehensible `npm ci` failure. That
+    # is worth stopping for. But SCAFFOLD-AND-INSPECT automation is a different case entirely: the kit's
+    # own CI incepts fixture projects on a below-floor runtime constantly and never builds them — it only
+    # inspects the emitted structure. A blanket refusal cannot tell those apart, and the first version
+    # here proved it by reddening seven CI jobs that incept fixtures (bootstrap, containment-audit,
+    # artifact-gate ×2, cf-claims, cf-verify-enforced, conformance-core).
+    #
+    # `--noninteractive` is the caller's own declaration that nobody is present to read a prompt, so it
+    # is the right discriminator — NOT an `$CI` env sniff, which would guess at the situation instead of
+    # being told, and would leave an adopter's own automation refusing for a reason it cannot act on.
+    if [ "$INTERACTIVE" -eq 1 ]; then
+      echo "  Refusing before any file is written — fix the toolchain above, then re-run." >&2
+      echo "  install each tool preflight lists as MISS, and upgrade each one below its floor." >&2
+      printf '%s\n' "  Check again with: sh scripts/preflight.sh --stack $STACK" >&2
+      echo "  (--allow-runtime-mismatch waives only a version floor; it installs nothing.)" >&2
+      exit 1
+    fi
+    echo "  WARNING (--noninteractive): proceeding anyway. Scaffolding is safe, but BUILDING the emitted project" >&2
+    echo "  will fail until the toolchain above is fixed: install each tool preflight lists as MISS, and upgrade each one below its floor." >&2
+    printf '%s\n' "  Check again with: sh scripts/preflight.sh --stack $STACK" >&2
+    echo "  (--allow-runtime-mismatch waives only a version floor; it installs nothing.)" >&2
+  fi
+  [ "$ALLOW_RUNTIME_MISMATCH" -eq 1 ] && echo "notice: --allow-runtime-mismatch — the '$STACK' runtime floor was WAIVED, not met. The emitted project may not build." || true
+fi
+
+# SWAS-807: refuse EARLY, before the first write, a starter scaffold that would be written THROUGH a symlink.
+# `[ -e ]` and `[ -d ]` follow links, so a linked `tests/` (or `tests/integration/`) reads as "already there" and the
+# copy below would mkdir and cp into the link's target, outside this project; a dangling leaf link is the same hole.
+# The copy runs in a pipe, where an `exit` would end only the subshell after some files were written, so the refusal
+# is decided here, in the main shell. _scaf_skip is the ONE list of paths the copy skips, shared by both.
+# _scaf_tests_pre is recorded once, before any write; the copy loop and its SWAS-786 note read the same value.
+_scaf_tests_pre=0; [ -d tests ] && _scaf_tests_pre=1
+_scaf_skip() {  # <rel> -> 0 iff the scaffold copy skips this path
+  # .gitignore is MERGED after the copy (the project already has a root .gitignore), not copied.
+  if [ "$1" = ".gitignore" ]; then return 0; fi
+  # An existing tests/ keeps its own import layout: skip the scaffold's package markers there (SWAS-786).
+  if [ "$_scaf_tests_pre" -eq 1 ]; then
+    case "$1" in tests/__init__.py|tests/*/__init__.py) return 0 ;; esac
+  fi
+  # Never copy stray build artifacts (a dirty dev tree may have them; they are gitignored but
+  # `find` still sees them). Keeps an incepted project clean — no node_modules/coverage/pyc/etc.
+  case "$1" in
+    node_modules/*|*/node_modules/*|dist/*|*/dist/*|build/*|*/build/*|coverage/*|*/coverage/*|\
+    target/*|*/target/*|bin/*|*/bin/*|obj/*|*/obj/*|__pycache__/*|*/__pycache__/*|\
+    .pytest_cache/*|*/.pytest_cache/*|.gradle/*|*/.gradle/*|.coverage|*.pyc) return 0 ;;
+  esac
+  return 1
+}
+if [ -d "profiles/${STACK}/scaffold" ]; then
+  # The first offending path (the kit's own scaffold path, never the link's target) is printed by the walk and
+  # collected here; the decision is taken in the main shell.
+  _scaf_bad=$( ( cd "profiles/${STACK}/scaffold" && find . -type f ) | while IFS= read -r rel; do
+    rel=${rel#./}
+    if _scaf_skip "$rel"; then continue; fi
+    if [ "$(dirname "$rel")" != "." ] && _kb_path_has_symlink "$(dirname "$rel")"; then
+      printf '%s\n' "$_kb_acc"; break
+    fi
+    if [ -L "$rel" ] && [ ! -e "$rel" ]; then
+      printf '%s\n' "$rel"; break
+    fi
+  done )
+  if [ -n "$_scaf_bad" ]; then
+    printf '%s\n' "error: \`$_scaf_bad\` is a symlink. incept would write the $STACK starter scaffold through it, outside this project. Nothing has been written. Replace the link with a real folder (or remove it), then re-run." >&2
+    exit 1
+  fi
+fi
+
+# RATIFY-PARITY: the §13 control-plane-ratification gate installs (github CI) from the single
+# stack-neutral source profiles/ratification.yml. Refuse EARLY — before any working-tree mutation —
+# if it is missing, so a broken distribution fails clean instead of leaving a half-initialized tree.
+# A kit that lost its governance source must never silently produce an ungoverned project. Scoped to
+# --ci github (the gate is GitHub-specific); a valid kit/export always ships the source, so a real
+# adopter never hits this. The install site (github case) re-checks and fails closed too (defence-in-depth).
+if [ "$CI" = "github" ] && [ ! -f profiles/ratification.yml ]; then
+  echo "error: profiles/ratification.yml is MISSING — cannot install the §13 control-plane-ratification gate." >&2
+  echo "       This is a broken kit distribution; refusing to produce an ungoverned project. Nothing has been written." >&2
+  exit 1
+fi
+# B6: the adopter board/loop gates (backlog-presence, ceremony-binding, loop-state) install from the
+# single stack-neutral source profiles/adopter-gates.yml, exactly like profiles/ratification.yml above
+# — refuse EARLY, before any working-tree mutation, if it is missing. Scoped to --ci github (the gate
+# is GitHub-specific); a valid kit/export always ships the source, so a real adopter never hits this.
+# The install site (github case) re-checks and fails closed too (defence-in-depth).
+if [ "$CI" = "github" ] && [ ! -f profiles/adopter-gates.yml ]; then
+  echo "error: profiles/adopter-gates.yml is MISSING — cannot install the board/loop merge-time gates." >&2
+  echo "       This is a broken kit distribution; refusing to produce an ungoverned project. Nothing has been written." >&2
+  exit 1
+fi
+# TBG-TRUSTED-JOB: the tracker-backed trusted job — same early refusal as adopter-gates.yml above.
+if [ "$CI" = "github" ] && [ ! -f profiles/adopter-tracker-gates.yml ]; then
+  echo "error: profiles/adopter-tracker-gates.yml is MISSING — cannot install the tracker-backed trusted job." >&2
+  echo "       This is a broken kit distribution; refusing to produce an ungoverned project. Nothing has been written." >&2
+  exit 1
+fi
+# SWAS-901: the solo GO check (profiles/solo-go.yml) installs for every GitHub adopter, same early refusal as above.
+if [ "$CI" = "github" ] && [ ! -f profiles/solo-go.yml ]; then
+  echo "error: profiles/solo-go.yml is MISSING — cannot install the solo GO check." >&2
+  echo "       This is a broken kit distribution; refusing to produce an ungoverned project. Nothing has been written." >&2
+  exit 1
+fi
+if [ -n "$FLUENCY" ]; then
+  case " $OPERATOR_FLUENCIES " in *" $FLUENCY "*) : ;; *) echo "error: unknown --operator-fluency '$FLUENCY' (one of: $OPERATOR_FLUENCIES)" >&2; exit 2 ;; esac
+fi
+[ -n "$MODE" ] || MODE="lean"
+# Deprecation: prototype/team are the former names of the lean ceremony tier (ceremony only;
+# solo-vs-team governance is the separate enforce_admins / review-lane.md axis).
+case "$MODE" in prototype|team) echo "notice: --mode '$MODE' is deprecated; using 'lean' (ceremony only -- solo-vs-team governance is the separate enforce_admins / review-lane.md axis)" >&2; MODE="lean" ;; esac
+case " $PROCESS_MODES " in *" $MODE "*) : ;; *) echo "error: unknown --mode '$MODE' (one of: $PROCESS_MODES)" >&2; exit 2 ;; esac
+# RUNBOOK mode-marker balance — VALIDATED HERE, before the first write (review R2). A sed RANGE whose
+# closing address never matches deletes TO END OF FILE: one dropped `<!-- /mode:enterprise -->` took a
+# stamped RUNBOOK from 91 lines to 41, silently. Checking it at strip time aborted a HALF-INCEPTED tree
+# that then reported "already incepted" on the re-run, so the check belongs with the other input
+# validation: refuse before anything is written, and the operator can simply fix and re-run.
+if [ -f templates/RUNBOOK-TEMPLATE.md ]; then
+  _b3open=$(grep -c '^<!-- mode:enterprise -->$' templates/RUNBOOK-TEMPLATE.md || true)
+  _b3close=$(grep -c '^<!-- /mode:enterprise -->$' templates/RUNBOOK-TEMPLATE.md || true)
+  if [ "$_b3open" != "$_b3close" ]; then
+    echo "error: templates/RUNBOOK-TEMPLATE.md mode markers are unbalanced ($_b3open open, $_b3close close)." >&2
+    echo "  A range delete over an unclosed marker runs to END OF FILE and would silently truncate the" >&2
+    echo "  stamped RUNBOOK. Give every '<!-- mode:enterprise -->' a matching '<!-- /mode:enterprise -->'." >&2
+    exit 2
+  fi
+fi
+# --date is strictly YYYY-MM-DD. Not cosmetic: the value is interpolated into the `sedi` replacement
+# below, so an unvalidated string is a sed-expression injection surface (and a garbage stamp).
+#
+# The SHAPE glob alone is not enough — `[0-1][0-9]-[0-3][0-9]` accepts 2026-00-00 and 2026-13-32, which
+# are not dates. The charset is sed-safe either way, so this is not a security hole; it is a promise the
+# flag makes and must keep, since the value it stamps is what kit-update later reads back. So: shape
+# first (which also bounds the charset to digits + '-'), then the month and day RANGES, expressed as
+# case globs a POSIX `case` can state exactly.
+# Honest ceiling: this is a calendar-SHAPE check, not a calendar. 2026-02-31 has a valid month and a
+# valid day and is accepted; catching that needs a real date library, and the stamp is a label, not an
+# instant. The classes that mattered — empty, unpadded, out-of-range, and anything sed-active — are shut.
+if [ -n "$DATE_PIN" ]; then
+  case "$DATE_PIN" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+    *) echo "error: --date must be YYYY-MM-DD (got '$DATE_PIN')" >&2; exit 2 ;;
+  esac
+  _dp_m=${DATE_PIN#*-}; _dp_m=${_dp_m%%-*}   # MM
+  _dp_d=${DATE_PIN##*-}                      # DD
+  case "$_dp_m" in
+    0[1-9]|1[0-2]) : ;;
+    *) echo "error: --date month must be 01-12 (got '$_dp_m' in '$DATE_PIN')" >&2; exit 2 ;;
+  esac
+  case "$_dp_d" in
+    0[1-9]|[12][0-9]|3[01]) : ;;
+    *) echo "error: --date day must be 01-31 (got '$_dp_d' in '$DATE_PIN')" >&2; exit 2 ;;
+  esac
+fi
+
+# 9g: never SILENTLY default the stack — make the default choice explicit + pointed.
+if [ "$STACK_EXPLICIT" -eq 0 ]; then
+  echo "notice: no --stack given — using '$STACK'. Choose deliberately (fit AND maturity): docs/STACK-SELECTION.md" >&2
+fi
+# KW5: never SILENTLY default the solo/team governance fork — announce it (SoD stays server-side).
+[ "$TEAM_EXPLICIT" -eq 1 ] || echo "notice: no --team given — using 'solo' (enforce_admins:false + admin-merge). Team scale? pass --team team, then run: sh scripts/branch-protection-apply.sh --replace --team (read its trap first: an admin can then no longer merge their own PR, so a second write collaborator must approve every PR). See docs/operations/review-lane.md + START-HERE 'Solo / lite track'." >&2
+# KW5: deploy-target is BYO (no default) — nudge a deliberate, fit-driven choice.
+echo "notice: choose your deploy target deliberately — docs/adoption/DEPLOYMENT-ENVIRONMENT.md (cards + fit rubric); record fit + maturity in RUNBOOK §4 (linted by conformance/deploy-decision-integrity.sh)." >&2
+# KW9-B: surface harness FIT + honest MATURITY — the harness is a concretization axis (instance #3).
+# Choose by fit, not by "it's the default"; and disclose that only claude-code is a VERIFIED harness
+# (the kit self-hosts on it), codex is FLOOR-VERIFIED (floor exercised cold, CP-7), and
+# gemini/cursor are EXPERIMENTAL (declared, not exercised — unproven). The tiers here MUST match the
+# cards in docs/operations/harness-adapters.md — conformance/governing-docs-current.sh's harness-status
+# face reds when they drift. Always emitted → non-interactive-safe. Mirrors the KW5 deploy nudge +
+# KW4-L1's stack fit-vs-maturity disclosure. Cards + fit rubric: docs/operations/harness-adapters.md.
+echo "notice: target harness(es) = '${HARNESS}'. Confirm this is the BEST-FIT harness (fit-derived, not the default). Only 'claude-code' is a VERIFIED harness (kit self-hosts on it); 'codex' is FLOOR-VERIFIED (the universal-layer floor exercised end-to-end cold — no native bonus); 'gemini'/'cursor' are EXPERIMENTAL (declared against the boundary contract, not exercised end-to-end — unproven, not 'supported'). Record WHY it fits (cite a fit dimension) in CLAUDE.md §harness-neutrality — linted by conformance/harness-decision-integrity.sh. Cards + fit rubric: docs/operations/harness-adapters.md." >&2
+# K4/AC1: disclose the enforcement CEILING for hookless harnesses — a maturity label
+# ("experimental") is not a capability statement. A harness whose adapter declares
+# command-guard != "native" has NO inline PreToolUse-equivalent interception, so
+# control-plane enforcement is post-hoc (pre-push + CI), not pre-exec. Data-driven
+# from adapter.json (single source; fleet-general); fail-safe toward MORE disclosure.
+_ceiling_harnesses=''
+for _h in $HARNESS_LIST; do
+  _lvl=$(jq -r '.dimensions["command-guard"].level // "floor"' "adapters/${_h}/adapter.json" 2>/dev/null || echo floor)
+  [ "$_lvl" = "native" ] || _ceiling_harnesses="${_ceiling_harnesses:+$_ceiling_harnesses, }${_h}"
+done
+[ -z "$_ceiling_harnesses" ] || echo "notice: enforcement ceiling — harness(es) '${_ceiling_harnesses}' have NO inline PreToolUse-equivalent interception (no pre-exec deny). Control-plane enforcement is limited to the local pre-push hook + the CI agent-boundary gate (post-hoc, not pre-exec). See docs/operations/harness-adapters.md (the ceiling, stated plainly)." >&2
+# A1/M-2: never SILENTLY default the process mode either — after the interactive prompt drop the
+# mode is flag-only, so an un-declared mode gets the same announcement as stack/team/harness/fluency.
+[ "$MODE_EXPLICIT" -eq 1 ] || echo "notice: process mode defaulted to lean — pass --mode enterprise for the enterprise scaffold, or see docs/enterprise/README.md." >&2
+[ -n "$FLUENCY" ] || echo "notice: operator fluency not declared. New to enterprise SDLC? read the section of that name in START-HERE.md. Already fluent? pass --operator-fluency practitioner. Leaving the field for you to fill in CLAUDE.md." >&2
+
+DATE=$(esc "${DATE_PIN:-$(date +%Y-%m-%d)}")
+VER=$(cat VERSION 2>/dev/null || echo "unknown")
+ENAME=$(esc "$NAME"); EOWNER=$(esc "$OWNER")
+
+# --- KIT-BASE-MANIFEST-CONCORDANCE: a `kit-base` that is not THIS export's base is refused, BEFORE any mutation ----
+# MEASURED (T1 ledger harvest K3): incepting a python export over a directory that held a typescript-node trial
+# kept the trial's base with rc 0 and the line "'kit-update' will use the existing base". It never compared them.
+# The comparison lives HERE and not in commit_kit_base, because commit_kit_base runs after every mutation, which is
+# too late to refuse. At this point $STACK and $VER are trusted and nothing in the worktree has been touched.
+#
+# THE PREDICATE IS TREE IDENTITY with the base THIS incept would record: the stage (the export, scoped by its own
+# .kit-manifest) pruned exactly as it will be recorded, hashed by the SAME helper commit_kit_base uses, so the check and
+# the record can never compute the tree two ways. A path-set difference cannot see a same-profile, older-release base
+# (identical file list, different bytes), which is just as foreign; it is only the DISPLAY in the refusal.
+# No .kit-manifest means an empty stage and nothing to compare: the legacy behaviour is unchanged.
+_prune_profiles_in() {  # <dir> — remove non-$STACK stack profiles + surgically reconcile <dir>/.kit-manifest
+  _pp_dir=$1
+  [ -d "$_pp_dir/profiles" ] || return 0
+  _pp_re=''
+  for _pp in $STACK_PROFILES; do
+    [ "$_pp" = "$STACK" ] && continue
+    [ -d "$_pp_dir/profiles/$_pp" ] && rm -rf "$_pp_dir/profiles/$_pp"
+    [ -f "$_pp_dir/profiles/$_pp.md" ] && rm -f "$_pp_dir/profiles/$_pp.md"
+    # Regex-ESCAPE the name before it enters the grep -Ev alternation below. Profile DIRS are not
+    # charset-validated at the registry (unlike --stack, which is), so a metachar-bearing dir name must
+    # not be able to broaden/narrow the manifest carve (security review, defense-in-depth; matches the
+    # fixed-string discipline of adopter-export.sh). The disk rm above is already fixed-string + [ -d ]-guarded.
+    _pp_esc=$(printf '%s' "$_pp" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    _pp_re="${_pp_re:+$_pp_re|}$_pp_esc"
+  done
+  # Surgical manifest reconcile: drop ONLY the pruned profiles' lines — never a find-regenerate (incept
+  # runs in a messier context than adopter-export's clean staging). No manifest (old export) => no-op.
+  if [ -n "$_pp_re" ] && [ -f "$_pp_dir/.kit-manifest" ]; then
+    _pp_tmp="$_pp_dir/.kit-manifest.prune.$$"
+    if grep -Ev "^profiles/($_pp_re)(/|\.md\$)" "$_pp_dir/.kit-manifest" > "$_pp_tmp"; then
+      mv "$_pp_tmp" "$_pp_dir/.kit-manifest"
+    else
+      rm -f "$_pp_tmp"
+    fi
+  fi
+}
+
+# _kb_tree_of <dir> — prints the git tree id of <dir> as the kit-base commit records it: a TEMPORARY index, `add -Af`
+# (force past any ignore config, the manifest is authoritative), `write-tree`. Never touches the adopter's index or
+# worktree; the only side effect is unreachable loose objects. Both the concordance check and commit_kit_base call it.
+_kb_tree_of() {
+  _kt_gd=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  # The temp index path must NOT EXIST: git reads an existing EMPTY file as a CORRUPT index.
+  _kt_idx=$(mktemp) && rm -f "$_kt_idx" || return 1
+  _kt_tree=''
+  _kt_dir=$1
+  # Hash the stage with NOTHING of the repo's own configuration able to run: no hook (post-index-change), no fsmonitor, no
+  # attributes file, and every configured clean/smudge/process filter command emptied (an in-tree .gitattributes may name any
+  # of them). Without this the comparison could execute a command an adopter's repo configured.
+  set -- -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.attributesFile=/dev/null
+  for _kt_k in $(git config --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null); do
+    _kt_b=${_kt_k%.*}
+    set -- "$@" -c "${_kt_b}.clean=" -c "${_kt_b}.smudge=" -c "${_kt_b}.process=" -c "${_kt_b}.required=false"
+  done
+  if ( cd "$_kt_dir" && GIT_DIR="$_kt_gd" GIT_INDEX_FILE="$_kt_idx" GIT_WORK_TREE="$_kt_dir" git "$@" add -Af . ) >/dev/null 2>&1; then
+    _kt_tree=$(GIT_DIR="$_kt_gd" GIT_INDEX_FILE="$_kt_idx" git "$@" write-tree 2>/dev/null) || _kt_tree=''
+  fi
+  rm -f "$_kt_idx" 2>/dev/null || true
+  [ -n "$_kt_tree" ] || return 1
+  printf '%s\n' "$_kt_tree"
+}
+
+KB_ALREADY=0          # 1 = the existing kit-base is identical to this export: nothing to record
+KB_DEFER_REPLACE=0    # 1 = --kit-base-replace on a mismatch: commit_kit_base renames the old base aside, then records
+_kb_refuse() {  # <existing tree> <new tree or empty> — the refusal; exits 1, nothing was mutated
+  _kr_subj=$(git log -1 --format=%s refs/heads/kit-base 2>/dev/null || echo '?')
+  _kr_src=$(git log -1 --format='%(trailers:key=Kit-Source,valueonly)' refs/heads/kit-base 2>/dev/null | sed -n '1p' | tr -d '[:space:]')
+  _kr_profs=$(git show refs/heads/kit-base:.kit-manifest 2>/dev/null | sed -n 's#^profiles/\([^/]*\)/.*#\1#p' | LC_ALL=C sort -u | tr '\n' ' ')
+  echo "incept: REFUSING (FOREIGN BASE). To move an existing project to a newer kit, run 'kit-update --from <new kit>'; a second incept is not an upgrade." >&2
+  echo "  The existing 'kit-base' branch is not the base this export would record." >&2
+  echo "  existing base : ${_kr_subj} (Kit-Source ${_kr_src:-none})" >&2
+  echo "  its profiles  : ${_kr_profs:-none}   this incept's --stack: ${STACK}" >&2
+  if [ -n "$2" ]; then
+    _kr_d=$(git diff-tree -r --name-status "$1" "$2" 2>/dev/null || true)
+    _kr_a=$(printf '%s\n' "$_kr_d" | grep -c '^A' || true)
+    _kr_m=$(printf '%s\n' "$_kr_d" | grep -c '^M' || true)
+    _kr_x=$(printf '%s\n' "$_kr_d" | grep -c '^D' || true)
+    echo "  recording this export would change the base by ${_kr_a} added, ${_kr_m} modified, ${_kr_x} deleted paths:" >&2
+    printf '%s\n' "$_kr_d" | sed -n '1,10p' | sed 's/^/    /' >&2
+  else
+    echo "  (the tree of this export could not be computed, so the base cannot be shown to match)" >&2
+  fi
+  echo "  Only if this directory really held another kit or stack, there are two exits:" >&2
+  echo "    --kit-base-keep     keep the existing base. 'kit-update' will then refuse it as a FOREIGN BASE." >&2
+  echo "    --kit-base-replace  rename it aside (branch kit-base-replaced-<sha12>, its tags kit-base-replaced/...) and record this export. Nothing is deleted." >&2
+  echo "  Choosing one is the OWNER's decision: an agent should report this refusal, not pick a flag." >&2
+  exit 1
+}
+_kb_concordance() {
+  _kc_tmp=$(mktemp -d) || { echo "incept: cannot create a temp dir to compare the kit-base" >&2; exit 1; }
+  _kc_new=''
+  if cp -R "$KIT_BASE_STAGE/." "$_kc_tmp/" 2>/dev/null; then
+    _prune_profiles_in "$_kc_tmp"
+    _kc_new=$(_kb_tree_of "$_kc_tmp") || _kc_new=''
+  fi
+  rm -rf "$_kc_tmp" 2>/dev/null || true
+  _kc_old=$(git rev-parse --verify --quiet 'refs/heads/kit-base^{tree}' 2>/dev/null) || _kc_old=''
+  if [ -n "$_kc_new" ] && [ "$_kc_new" = "$_kc_old" ]; then
+    KB_ALREADY=1
+    echo "kit-base already exists and is identical to this export — kept." >&2
+    return 0
+  fi
+  if [ "$KB_KEEP" -eq 1 ]; then
+    echo "warning: the existing 'kit-base' is NOT this export's base; kept on --kit-base-keep." >&2
+    echo "         'kit-update' will REFUSE this project (FOREIGN BASE) until the base is re-recorded or replaced." >&2
+    return 0
+  fi
+  if [ "$KB_REPLACE" -eq 1 ]; then
+    KB_DEFER_REPLACE=1
+    echo "note: --kit-base-replace — the existing 'kit-base' is renamed aside when the new base is recorded (nothing is deleted)." >&2
+    return 0
+  fi
+  _kb_refuse "$_kc_old" "$_kc_new"
+}
+if [ -n "${KIT_BASE_STAGE:-}" ] && [ -d "${KIT_BASE_STAGE:-}" ] \
+   && git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+   && git rev-parse --verify --quiet refs/heads/kit-base >/dev/null 2>&1; then
+  _kb_concordance
+fi
+
+# --- ADOPTER-TREE-IDENTITY: replace the KIT's own SECURITY.md / README.md, never the adopter's ------
+# MEASURED: `.gitattributes` cannot carve these two (the public mirror IS an export; security-channel-
+# live.sh probes its SECURITY.md and eight kept docs link its README.md), so every export ships the
+# KIT's copies. incept's old `[ -f SECURITY.md ] ||` guard was therefore DEAD — the file always exists —
+# and every adopter's disclosure policy routed vulnerability reports to the kit author's repo.
+#
+# THE PREDICATE IS THE EXPORTER'S RECORD, and it has to be. Comparing against the `kit-base` this script
+# vendors was refuted by measurement before it was written: capture_kit_base (above) stages kit-base
+# FROM THIS TREE, so a brownfield adopter's own SECURITY.md would become its own "pristine twin" and be
+# clobbered. `.kit-digests` is written by adopter-export.sh from the kit's own tree, before this tree
+# existed — the one fact here that the adopter's file cannot accidentally satisfy.
+#
+# FAIL SAFE, ALWAYS TOWARD THE ADOPTER: no digests file, no record for the path, a malformed record, or
+# a digest that does not match => LEAVE THE FILE and say so in the closing message. Only an exact match
+# authorizes a replacement. RKO_REPLACED / RKO_LEFT carry that truth to the epilogue so the summary can
+# never claim a replacement that did not happen (the GUARD_STEP discipline).
+RKO_REPLACED=''; RKO_LEFT=''; RKO_NOTEMPLATE=''
+_rko_sha256() {  # <file> -> its sha256, or empty when no hasher is available
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 -- "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}
+_rko_recorded() {  # <path> -> the digest the exporter recorded for it, or empty
+  # UNTRUSTED TEXT, read by fixed field with a fixed-length hex charset check. A line this cannot parse
+  # is "no record", which means "leave the file" — a malformed digests file can never authorize a write.
+  [ -f .kit-digests ] || return 0
+  _rkod=$(awk -v p="$1" '$2 == p { print $1; exit }' .kit-digests 2>/dev/null || true)
+  case "$_rkod" in
+    ''|*[!0-9a-f]*) return 0 ;;
+  esac
+  [ "${#_rkod}" -eq 64 ] || return 0
+  printf '%s\n' "$_rkod"
+}
+replace_kit_own() {  # <file> <template> -> 0 if the file is now the adopter's (stamped), 1 if left as-is
+  _rkof=$1; _rkot=$2
+  # A MISSING TEMPLATE is a different fact from "this file is not the kit's", and the closing message
+  # must not blame the adopter's file for a gap in the export.
+  [ -f "$_rkot" ] || { RKO_NOTEMPLATE="$RKO_NOTEMPLATE $_rkof"; return 1; }
+  if [ ! -f "$_rkof" ]; then                      # absent -> stamp (the greenfield path)
+    cp "$_rkot" "$_rkof"; RKO_REPLACED="$RKO_REPLACED $_rkof"; return 0
+  fi
+  _rkorec=$(_rko_recorded "$_rkof")
+  if [ -z "$_rkorec" ]; then RKO_LEFT="$RKO_LEFT $_rkof"; return 1; fi
+  _rkogot=$(_rko_sha256 "$_rkof")
+  if [ -n "$_rkogot" ] && [ "$_rkogot" = "$_rkorec" ]; then
+    cp "$_rkot" "$_rkof"; RKO_REPLACED="$RKO_REPLACED $_rkof"; return 0
+  fi
+  RKO_LEFT="$RKO_LEFT $_rkof"; return 1
+}
+
+# The adopter's own `<owner>/<repo>`, for the SECURITY.md disclosure channel. The template's contact is
+# GITHUB private vulnerability reporting, so the stamp is only meaningful for a GITHUB origin — an
+# earlier, host-blind "last two path segments" parse turned `gitlab.com/grp/sub/widget` into
+# `sub/widget` and `/Users/me/proj` into `me/proj`: a plausible-looking channel repo that receives
+# nothing. HOST-GATED first, on EXACTLY the URL shapes conformance/security-channel-live.sh's
+# `_github_repo` accepts and no more — two parsers for one fact must not diverge, since what this one
+# stamps is what that one later probes. Then CHARSET-BOUNDED before it reaches sed and esc()'d at the
+# stamp, because an origin URL is adopter-controlled input. Anything else keeps the explicit
+# `[owner/repo]` placeholder and is named in the closing message — a wrong channel is worse than a blank.
+CHANNEL_REPO=''; CHANNEL_WHY=''
+_rko_origin=$(git remote get-url origin 2>/dev/null || true)
+if [ -z "$_rko_origin" ]; then
+  CHANNEL_WHY='no-origin'
+else
+  CHANNEL_WHY='not-github'
+  case "$_rko_origin" in
+    https://github.com/*|http://github.com/*|git@github.com:*|ssh://git@github.com/*)
+      # `:` here is the scp-style separator (`git@github.com:owner/repo`). The ssh PORT form is NOT
+      # accepted, because the probe does not accept it either; it falls safe to the placeholder.
+      _rko_r=${_rko_origin#*github.com}
+      _rko_r=${_rko_r#:}; _rko_r=${_rko_r#/}; _rko_r=${_rko_r%/}; _rko_r=${_rko_r%.git}
+      _rko_r=$(printf '%s\n' "$_rko_r" | grep -E '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || true)
+      # `.` and `..` pass that charset and are not repo names.
+      case "$_rko_r" in
+        ''|.*/*|*/.|*/..) : ;;
+        *) CHANNEL_REPO="$_rko_r"; CHANNEL_WHY='' ;;
+      esac ;;
+  esac
+fi
+
+# --- 1. free the root memory slot ---
+# Use `git mv` only when CLAUDE.md is actually TRACKED. In the literal quickstart (copy the
+# kit into a fresh `git init` repo, run incept before committing), CLAUDE.md is untracked and
+# `git mv` aborts with exit 128 — fall back to a plain `mv` (nothing is committed, so no
+# history is lost). Covers tracked / untracked-in-worktree / non-git alike.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git ls-files --error-unmatch CLAUDE.md >/dev/null 2>&1; then
+  git mv CLAUDE.md ENGINEERING-PRINCIPLES.md
+else
+  mv CLAUDE.md ENGINEERING-PRINCIPLES.md
+fi
+sedi 's/| \*\*`CLAUDE.md`\*\* (this) |/| **`ENGINEERING-PRINCIPLES.md`** (this) |/' ENGINEERING-PRINCIPLES.md
+
+# --- 2. rewrite principles-sense references (project-sense CLAUDE.md refs stay) ---
+sedi -e 's/and `CLAUDE.md` (principles + Definition of Done)/and `ENGINEERING-PRINCIPLES.md` (principles + Definition of Done)/' \
+     -e 's/The authoritative checklist is in \*\*`CLAUDE.md`\*\*/The authoritative checklist is in **`ENGINEERING-PRINCIPLES.md`**/' \
+     -e 's#Definition-of-Done "CI/CD" check, `CLAUDE.md`)#Definition-of-Done "CI/CD" check, `ENGINEERING-PRINCIPLES.md`)#' \
+     DEVELOPMENT-STANDARDS.md
+sedi -e 's/and `CLAUDE.md` (authoritative principles + Definition of Done)/and `ENGINEERING-PRINCIPLES.md` (authoritative principles + Definition of Done)/' \
+     -e 's/When they overlap, `CLAUDE.md` is authoritative/When they overlap, `ENGINEERING-PRINCIPLES.md` is authoritative/' \
+     DEVELOPMENT-PROCESS.md
+# The adopter's front door is the ADOPTER'S. This runs BEFORE the row-swap below, on purpose: the swap
+# would change the file's bytes and so destroy the very digest the replacement decision is made on.
+if replace_kit_own README.md templates/PROJECT-README-TEMPLATE.md; then
+  sedi -e "s/^# \[Project Name\]\$/# ${ENAME}/" \
+       -e "s/\*\*Intent owner:\*\* \[who owns the why\]/**Intent owner:** ${EOWNER}/" \
+       -e "s/\*\*Created:\*\* \[date\]/**Created:** ${DATE}/" \
+       -e "s/\[vX\.Y\.Z\]/v${VER}/g" \
+       README.md
+fi
+# KEPT for the case above where the kit's README was NOT replaced (a brownfield tree, or an export with
+# no digests record): the doc-table row still has to name the file the principles actually moved to.
+sedi 's/| \*\*`CLAUDE.md`\*\* | Principles + Definition of Done. Authoritative. |/| **`ENGINEERING-PRINCIPLES.md`** | Principles + Definition of Done. Authoritative. |/' README.md
+# The second expression MOVED here from the retired ONBOARDING.md (FRONT-DOOR-ONE-ROUTER): the
+# Practitioner lane it rewrites folded into START-HERE.md, carrying the phrase verbatim on one line.
+sedi -e 's/`CLAUDE.md` (principles + Definition of Done)/`ENGINEERING-PRINCIPLES.md` (principles + Definition of Done)/' \
+     -e 's/the principles (`CLAUDE.md`)/the principles (`ENGINEERING-PRINCIPLES.md`)/' START-HERE.md
+sedi 's#`DEVELOPMENT-STANDARDS.md` / `DEVELOPMENT-PROCESS.md` / `CLAUDE.md`#`DEVELOPMENT-STANDARDS.md` / `DEVELOPMENT-PROCESS.md` / `ENGINEERING-PRINCIPLES.md`#' MAINTAINING.md
+sedi 's/\*\*Principles + Definition of Done:\*\* `CLAUDE.md`/**Principles + Definition of Done:** `ENGINEERING-PRINCIPLES.md`/' templates/PROJECT-CLAUDE-TEMPLATE.md
+
+# --- 3. stamp the project CLAUDE.md ---
+cp templates/PROJECT-CLAUDE-TEMPLATE.md CLAUDE.md
+sedi -e "s/\*\*Project:\*\* \[name\]/**Project:** ${ENAME}/" \
+     -e "s/\*\*Intent owner:\*\* \[who owns the why\]/**Intent owner:** ${EOWNER}/" \
+     -e "s#\*\*Status:\*\* \[Inception / Active / Maintenance / Paused\]#**Status:** Inception#" \
+     -e "s/\*\*Created:\*\* \[date\]/**Created:** ${DATE}/" \
+     -e "s#\*\*Kit version adopted:\*\* \[vX.Y.Z.*\]#**Kit version adopted:** v${VER}#" \
+     CLAUDE.md
+if [ -n "$FLUENCY" ]; then
+  # Capitalize first letter for the human-facing value (Novice/Adjacent/Practitioner)
+  FCAP=$(printf '%s' "$FLUENCY" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$FLUENCY" | cut -c2-)
+  sedi "s#\*\*Operator fluency\*\* (§onboarding): \[Novice / Adjacent / Practitioner\]#**Operator fluency** (§onboarding): ${FCAP}#" CLAUDE.md
+fi
+# stamp the target harness(es)
+sedi "s#\*\*Target harness(es)\*\* (§harness-neutrality): \[claude-code\]#**Target harness(es)** (§harness-neutrality): $(esc "$HARNESS")#" CLAUDE.md
+# KW9-B: personalize the Harness fit rationale placeholder with the chosen harness while KEEPING it an
+# explicit UNFILLED decision — the body stays bracketed AND retains the "why this harness fits" sentinel,
+# so conformance/harness-decision-integrity.sh reads it as N/A (not yet decided) until the human writes
+# the real fit reason. Mirrors the harness stamp above + KW4-L1's stack fit-vs-maturity disclosure. No-op
+# if the template lacks the §harness-neutrality fit-rationale slot.
+sedi "s#\[why this harness fits#[$(esc "$HARNESS") — why this harness fits#" CLAUDE.md
+# S1: stamp the process mode (lowercase — matches the flag values, PROCESS_MODES, and the template field)
+sedi "s#\*\*Process mode\*\* (§ ceremony): \[lean / enterprise\]#**Process mode** (§ ceremony): $(esc "$MODE")#" CLAUDE.md
+# KW5: stamp the governance (solo/team) choice — records the fork so it's a ratified decision, not a
+# silent default (mirrors the process-mode stamp). No-op if the template lacks the §3 governance slot.
+sedi "s#\*\*Governance\*\* (§ solo/team): \[solo / team\]#**Governance** (§ solo/team): $(esc "$TEAM")#" CLAUDE.md
+# KW6-A: stamp the backlog backend — the operator ALREADY chose it (prompt above / --backlog), but the
+# answer never reached CLAUDE.md §3, so conformance/backlog-current.sh read the raw choice-list
+# placeholder as *undeclared* → N/A → the board gate silently never ran. Record the chosen token
+# (md/github/jira/ado/linear/gitlab) so it's a ratified decision, mirroring the four stamps above.
+# Replaces ONLY the bracketed choice-list — the trailing `— [link] (mapping: …)` annotation is preserved
+# ([^]]* stops at the first ], so [link] is untouched) and the human still fills in the link. No-op if
+# the template lacks the §3 backlog slot; idempotent (the anchor requires `[` right after the field).
+sedi "s#\*\*Backlog backend\*\* (§6): \[[^]]*\]#**Backlog backend** (§6): $(esc "$BACKLOG")#" CLAUDE.md
+# P1.2-pre: stamp the STACK — the one inception input that nothing recorded. incept stamped seven answers
+# (project, owner, date, kit version, fluency, harness, process mode, governance, backlog) and never the
+# stack, so a project could not say which profile it was built from. That is a cold-resume hole on its own,
+# and it is load-bearing for kit-update: a new export must be pruned to the SAME profile before it can be
+# compared against kit-base (an un-pruned export would read as "the kit added eight profiles").
+# Replaces ONLY the bracketed choice-list; idempotent; no-op if the template lacks the §3 slot.
+sedi "s#\*\*Stack profile\*\* (§2): \[[^]]*\]#**Stack profile** (§2): $(esc "$STACK")#" CLAUDE.md
+# P1.2 (T3b): stamp the LAST TWO inception inputs nothing recorded — the CI PLATFORM and the DB ARCHETYPE.
+# Same reason as the stack stamp above, and the same mechanism. kit-update reconstructs the adopter's base
+# by REPLAYING incept over kit-base with the inputs this project recorded; anything not recorded has to be
+# INFERRED from the tree, and inference is where a wrong base comes from. It is not hypothetical: the
+# export ships .github/workflows/ EMPTY (ci.yml is export-ignored, P0-FU), so a GitHub-workflow FILE is no
+# signal at all — and .gitlab-ci.yml (which ONLY `--ci gitlab` creates) is the positive signal, tested
+# first. Any file-presence inference would misread adopters; a wrong base cries CONFLICT on kit files the
+# adopter never touched. Record the FACT so nothing downstream has to guess it.
+# Both replace ONLY the bracketed choice-list (the trailing prose annotation survives); both are idempotent
+# (the anchor requires the `[` right after the field); both no-op if the template lacks the §3 slot — an
+# adopter incepted BEFORE these slots existed reconstructs identically, because their kit-base carries the
+# same slot-less template AND the same slot-less incept. Locked by conformance/incept-first-run-green.sh.
+sedi "s#\*\*CI platform\*\* (§14): \[[^]]*\]#**CI platform** (§14): $(esc "$CI")#" CLAUDE.md
+# The stamped token is the FLAG the operator chose (db-backed / no-db), not a fact re-derived from the
+# tree: --no-db's effects (CI region, marker, .env.example lines, dr-drill.sh) are a strict SUBSET of what
+# an adopter may later edit by hand, so only the input itself is a reliable record of the input.
+if [ "$DB_BACKED" = 1 ]; then _dbarch=db-backed; else _dbarch=no-db; fi
+sedi "s#\*\*DB archetype\*\* (§ archetype): \[[^]]*\]#**DB archetype** (§ archetype): ${_dbarch}#" CLAUDE.md
+
+# --- 3a. S1: mode-driven curation — surfacing/scaffolding only; NEVER an enforcement input. ---
+curate_for_mode() {  # $1 = mode
+  case "$1" in
+    lean)
+      if [ ! -f docs/conditional-obligations.md ]; then
+        mkdir -p docs
+        cat > docs/conditional-obligations.md <<'EOF'
+# Conditional obligations (process mode: lean)
+
+These gates are **enforced automatically when their trigger appears** — you do not opt in or out.
+Your project starts on the floor; each below activates the moment you add its trigger.
+
+| Control | Applies IF | Enforced by |
+|---|---|---|
+| Threat model / privacy review | you declare Confidential/Restricted data (CLAUDE.md §3) | conformance/readiness.sh privacy-ready |
+| Eval gate + AI System Card | you add an `evals/` dir or declare `AI feature: yes` | conformance/readiness.sh eval-ready |
+| Agent-ops trace posture | you declare `Agentic: yes` | conformance/readiness.sh agentops-ready |
+| Accessibility sign-off | you ship a user-facing UI | a11y gate (DEVELOPMENT-STANDARDS §14) |
+| Deployable / resilience / DR | you add a Dockerfile or deploy workflow / durable data | deployable-ready, resilience-ready, dr-ready |
+| Container supply-chain (image SBOM + provenance) | you add a Dockerfile | conformance/container-supply-chain.sh |
+
+The floor (lint · type · test+coverage · build · secret-scan · deps · SBOM · branch-protection · builder≠reviewer) applies in EVERY mode and is never waived.
+
+Ask *why* any of these matters: `sparkwright explain <control>` (or see docs/why-gates.md).
+EOF
+      fi
+      ;;
+    enterprise)
+      mkdir -p docs/governance
+      for _t in THREAT-MODEL PRIVACY-REVIEW AI-SYSTEM-CARD AI-POLICY AI-TRANSPARENCY-SIGNOFF A11Y-SIGNOFF BIA UAT-SIGNOFF; do
+        _src="templates/${_t}-TEMPLATE.md"; [ -f "$_src" ] || _src="templates/${_t}.md"  # the waiver register is NOT stamped here: the root WAIVER-REGISTER.md (created below) is the one the gates read (SWAS-309)
+        _dst="docs/governance/${_t}.md"
+        [ -f "$_src" ] && [ ! -f "$_dst" ] && cp "$_src" "$_dst"
+      done
+      [ -f docs/governance/README.md ] || cat > docs/governance/README.md <<'EOF'
+# Governance apparatus (process mode: enterprise)
+
+These templates are stamped ready-to-fill. They are SURFACING, not enforcement — each gate still
+keys on its detected trigger (data classification, AI feature, UI, data service). Delete the ones
+your project genuinely does not need; fill the rest and move/reference them where each conformance
+check looks (see each `conformance/*-ready.sh` header).
+EOF
+      ;;
+  esac
+}
+curate_for_mode "$MODE"
+
+# --- 4. RUNBOOK / BACKLOG / ADR-000 ---
+[ -f RUNBOOK.md ] || { cp templates/RUNBOOK-TEMPLATE.md RUNBOOK.md; sedi "s/\[Project Name\]/${ENAME}/g" RUNBOOK.md; }
+# SECURITY.md — the kit's own copy ships in every export, so "does the file exist?" was never the
+# question; "whose file is it?" is. See replace_kit_own above.
+if replace_kit_own SECURITY.md templates/SECURITY-TEMPLATE.md; then
+  if [ -n "$CHANNEL_REPO" ]; then
+    sedi "s#\*\*Channel repo:\*\* \`\[owner/repo\]\`#**Channel repo:** \`$(esc "$CHANNEL_REPO")\`#" SECURITY.md
+  fi
+fi
+# TBG-TRACKER-CONF-BACKENDS (RT3-Q1): the SINGLE source of truth for "does THIS run stamp a
+# .kit/tracker.conf for $BACKLOG" — jira only, today. Set ONCE, here, and read at both the
+# REQUIRED-CHECKS sixth-line site below and the `case "$BACKLOG"` block further down that actually
+# calls stamp_tracker_conf, so the two can never drift apart again.
+case "$BACKLOG" in
+  jira) _TBG_CONF_STAMPED=1 ;;
+  *)    _TBG_CONF_STAMPED=0 ;;
+esac
+# REQUIRED-CHECKS.md (B4) — the declared required-check contexts conformance/branch-protection.sh
+# and scripts/branch-protection-apply.sh read; same BACKLOG-pattern stamp, always written regardless
+# of backlog backend (it is not a backlog concern).
+[ -f REQUIRED-CHECKS.md ] || { cp templates/REQUIRED-CHECKS-TEMPLATE.md REQUIRED-CHECKS.md; sedi "s/\[Project Name\]/${ENAME}/g" REQUIRED-CHECKS.md; }
+# WAIVER-REGISTER.md (SWAS-309) — the root register, created on EVERY backend (md included), never
+# overwritten. A person writes its rows (the guard refuses an agent's write), so it must exist from day
+# one for that person to fill. The board-governance row is still stamped only on a non-md backend
+# (stamp_board_governance_waiver below); this line only guarantees the file.
+[ -f WAIVER-REGISTER.md ] || cp templates/WAIVER-REGISTER.md WAIVER-REGISTER.md
+# DECLARE WHAT WAS JUST INSTALLED (V1 repair PR 2, ADOPTERS-INSTALL-ZERO-GOVERNANCE-CONTEXTS). Until
+# 2026-08-29 the stamp left the placeholder, so a fresh adopter declared ZERO governance contexts,
+# branch-protection-apply.sh had nothing to bind, and inception-done said "verified protected" with
+# none of the gates this script installs actually required — the fail-closed argument the four
+# workflows print inverted to fail-open on the control-plane class. Now the placeholder becomes the
+# five contexts incept knows the names of: `ci` (every profile's CI job key), control-plane-ratification
+# (ratification.yml), backlog-presence + ceremony-binding + loop-state (adopter-gates.yml).
+# ⚠️ loop-state WAS RESERVED AS A COMMENT until 2026-08-30, because binding a context whose job
+# always exits 0 is a silent pass-through (Δ1) and adopter-gates.yml shipped `observe`. It now ships
+# `enforce` (LOOP-STATE-ADOPTER-ENFORCE), so the ordering rule that reserved the comment — flip the
+# mode FIRST, then bind the context — is satisfied here at Inception instead of being deferred to an
+# adopter who was never going to come back and do it. The coupling is held by
+# conformance/incept-first-run-green.sh, which asserts the installed workflow really does default to
+# enforce whenever loop-state is declared: flip one back without the other and it reds.
+# Only the PRISTINE placeholder is replaced (a brownfield file with real entries is never touched);
+# GitHub CI only — the names are GitHub check contexts. Binding stays the adopter's keystroke.
+if [ "$CI" = github ] && grep -q '^<your-check-name>$' REQUIRED-CHECKS.md; then
+  # `ci` only when a CI workflow is actually installed (custom stacks may ship none — binding a context
+  # that never posts would make every PR permanently unmergeable, the kit's own doctrine turned footgun).
+  _ci_line='ci'; [ -f "profiles/${STACK}/ci.yml" ] || _ci_line='# ci                     <- uncomment once you add a CI workflow whose job key is ci'
+  # TBG-TRACKER-TRUSTED-JOB-REQUIRED-CONTEXT (T3, RT3-Q1 fix): a SIXTH context, tracker-board-gates,
+  # ONLY where THIS RUN ACTUALLY STAMPS a .kit/tracker.conf (design §2a "the conf is stamped") — never
+  # merely "backlog != md". The trusted job can only read a tracker it has a stamped conf for, and today
+  # that is jira alone; github/ado/linear/gitlab get the md behaviour here (five lines, no notes) because
+  # no trusted job can read them yet. `_TBG_CONF_STAMPED` is the ONE variable both this site and the
+  # `case "$BACKLOG"` block below (the site that actually calls stamp_tracker_conf) read, so the two
+  # cannot drift apart — a future backend joins BOTH by flipping ONE line, not two independently.
+  _tbg_line=''
+  [ "$_TBG_CONF_STAMPED" -eq 1 ] && _tbg_line='tracker-board-gates'
+  awk -v ci="$_ci_line" -v tbg="$_tbg_line" '$0=="<your-check-name>"{print ci; print "control-plane-ratification"; print "backlog-presence"; print "ceremony-binding"; print "loop-state"; if (tbg != "") print tbg; next}1' REQUIRED-CHECKS.md > REQUIRED-CHECKS.md.tmp && mv REQUIRED-CHECKS.md.tmp REQUIRED-CHECKS.md \
+    || { rm -f REQUIRED-CHECKS.md.tmp; echo "incept: could not fill REQUIRED-CHECKS.md — declare ci, control-plane-ratification, backlog-presence, ceremony-binding, loop-state${_tbg_line:+, $_tbg_line} by hand (inception-done will name them)" >&2; }
+  # FIRST-RUN TRUTH, PRINTED RATHER THAN ASSUMED. loop-state is now a live required context and it
+  # ENFORCES, so the adopter's very first PR must carry an Entry Declaration or it will not merge.
+  # There is no incept commit on their branch to carry one for them (this script writes a kit-base
+  # snapshot, not a branch commit), so the exact block they need is printed here — two lines:
+  # since SWAS-614 every class owes only the row and the class, and on a pristine board the row leg
+  # N/As, so this block is green on day one.
+  echo "note: loop-state is now a required context and it ENFORCES. Your first PR's FINAL commit must"
+  echo "      end with this block as its LAST contiguous paragraph (a blank line inside it truncates it):"
+  echo ""
+  echo "        Kit-Row: <the row on your board this work satisfies>"
+  echo "        Kit-Class: ordinary"
+  echo ""
+  echo "      Every class owes those two (set Kit-Class to the class your change derives to) — see"
+  echo "      CLAUDE.md section 1. To opt out entirely, set LOOP_STATE_MODE to observe in"
+  echo "      .github/workflows/adopter-gates.yml AND delete loop-state from REQUIRED-CHECKS.md."
+  # TRACKER FACE ONLY (T3, RT3-Q2 fix): a second first-run truth, for the trusted board job's own
+  # preconditions. `auth` is read from whatever .kit/tracker.conf is ALREADY ON DISK at this point in
+  # the script — THIS BRANCH IS REACHABLE, not unconditionally absent: a brownfield tree can carry a
+  # pre-existing .kit/tracker.conf (valid per scripts/tracker-conf.sh) from BEFORE incept ever ran, and
+  # that file is read here, before stamp_tracker_conf (which never overwrites an existing conf — see its
+  # brownfield-safe guard) runs later in the `case "$BACKLOG"` block below. On a true greenfield tree no
+  # conf exists yet at this point, so the design's own "or absent" fallback applies and both variable
+  # names are named. Either way: a non-basic `auth=` (e.g. `bearer`) drops KIT_TRACKER_USER from the note.
+  if [ -n "$_tbg_line" ]; then
+    echo "note: tracker-board-gates is a required context on this tracker-backed repo — bind branch protection BEFORE your first PR: sh scripts/branch-protection-apply.sh --replace on an unprotected main (first time), --apply once it is protected"
+    _tbg_auth=basic
+    if [ -f .kit/tracker.conf ]; then
+      _tbg_a=$(grep '^auth=' .kit/tracker.conf 2>/dev/null | head -1 | cut -d= -f2)
+      [ -z "$_tbg_a" ] || _tbg_auth="$_tbg_a"
+    fi
+    if [ "$_tbg_auth" = basic ]; then
+      echo "note: the trusted board job reads your tracker with repository secrets — add KIT_TRACKER_TOKEN and KIT_TRACKER_USER (Settings → Secrets and variables → Actions) before your first PR, or it will report the missing secret by name."
+    else
+      echo "note: the trusted board job reads your tracker with repository secrets — add KIT_TRACKER_TOKEN (Settings → Secrets and variables → Actions) before your first PR, or it will report the missing secret by name."
+    fi
+  fi
+elif [ "$CI" != github ]; then
+  echo "note: REQUIRED-CHECKS.md left as the placeholder — its contexts are GitHub check names; on ${CI} the protected-branch equivalent is adopter-owned (docs/operations/ci-platforms.md), and inception-done cannot name unbound contexts there."
+fi
+# The decision ledger — stamped EMPTY, same absent-only guard. The entry contract sends every agent
+# into docs/governance/DECISIONS.md before it changes a surface, so the file has to exist from day
+# one; what must NOT exist is the kit's own copy, which is export-ignored for that reason.
+mkdir -p docs/governance
+[ -f docs/governance/DECISIONS.md ] || { cp templates/DECISIONS-TEMPLATE.md docs/governance/DECISIONS.md; sedi "s/\[Project Name\]/${ENAME}/g" docs/governance/DECISIONS.md; }
+# The seat -> model map (SWAS-303a, D-241018-2) — stamped from the template, every value `unset` (the honest
+# single-model case), same absent-only guard. The kit's own map names its maintainers' models and is export-ignored,
+# so an adopter never inherits a vendor default; an existing map (kit-update, brownfield) is never overwritten.
+mkdir -p .kit
+[ -f .kit/model-map.conf ] || cp templates/MODEL-MAP-TEMPLATE.conf .kit/model-map.conf
+# .env.example — the committed env template the DoD + RUNBOOK require (never a real .env).
+if [ ! -f .env.example ]; then
+  cat > .env.example <<'ENVEOF'
+# Environment variables — TEMPLATE. Copy to `.env` (gitignored) and fill real values.
+# Document each in RUNBOOK.md §1 and the profile's "Environments this stack needs".
+# NEVER commit real secrets (DEVELOPMENT-STANDARDS.md §2).
+
+# App (set PORT to match your service/compose — e.g. 3000 node, 8000 python, 8080 go/rust)
+PORT=8080
+
+# Secrets — replace placeholders with strong values kept out of git
+APP_SECRET=replace-me
+
+# Backing services — uncomment what your stack/archetype needs (see compose.yaml)
+# DATABASE_URL=postgres://app:app@localhost:5432/app
+# REDIS_URL=redis://localhost:6379
+ENVEOF
+  # Stamp a stack-appropriate default PORT so .env.example matches the scaffold/docs (go/no-go #4:
+  # the ts-node scaffold + docs use 3000; a hardcoded 8080 made the documented `curl :3000` fail).
+  case "$STACK" in
+    python)  _port=8000 ;;
+    go|rust) _port=8080 ;;
+    *)       _port=3000 ;;
+  esac
+  sedi "s/^PORT=8080/PORT=${_port}/" .env.example
+  echo "wrote .env.example (PORT=${_port} for ${STACK}; copy to a gitignored .env and fill values — see RUNBOOK §1)"
+fi
+# Ensure real .env files are never committed — the template above tells the user to create one,
+# so guarantee the ignore rule exists (not all stack scaffolds carry it). Idempotent.
+if [ ! -f .gitignore ] || ! grep -qE '^\.env' .gitignore 2>/dev/null; then
+  printf '\n# Local env files — never commit real secrets (.env.example IS the committed template)\n.env\n.env.*\n!.env.example\n' >> .gitignore
+  echo "ensured .env is gitignored (real secrets stay out of git)"
+fi
+# GUARD-DENY-LOG L2: `.kit-run/` is the local run directory — the runaway killswitch's step/token
+# tally AND the guard's deny log both live there. Neither is ever committed: the deny log can carry
+# redacted-but-not-guaranteed-clean command segments, and the tally is per-run noise. The kit's own
+# .gitignore has carried this line since the killswitch shipped; an INCEPTED tree did not, so an
+# adopter's first `git add -A` would have committed both. Idempotent, same shape as the .env rule.
+if [ ! -f .gitignore ] || ! grep -qxF '.kit-run/' .gitignore 2>/dev/null; then
+  printf '\n# Local run directory — runaway tally + guard deny log; never committed (docs/operations/runtime-guards.md)\n.kit-run/\n' >> .gitignore
+  echo "ensured .kit-run/ is gitignored (guard deny log + runaway tally stay out of git)"
+fi
+# NON-MD BACKENDS MEET THE GAP ON DAY ZERO (NON-MD-BACKEND-NEVER-SILENT §3.5a). The kit's three
+# board-bound gates read BACKLOG.md only, so on a hosted tracker they report NOT ENFORCED and go
+# red. Learning that on your first PR — from a red nothing in the PR can clear — is friction with no
+# ladder, so incept says it HERE and stamps the waiver row that IS the ladder. The two bracketed
+# cells are placeholders on purpose: `waivers-valid.sh --active board-governance` refuses them, so
+# the first PR is still red, with a sentence naming the exact row a human must ratify. A stamp is
+# not a ratification, and this function is careful not to become one.
+stamp_board_governance_waiver() {   # $1 = the chosen backend token
+  [ -f WAIVER-REGISTER.md ] || cp templates/WAIVER-REGISTER.md WAIVER-REGISTER.md
+  grep -q '^| board-governance |' WAIVER-REGISTER.md && return 0    # idempotent
+  # +90 days: GNU then BSD. If NEITHER parses (a date(1) with neither dialect), stamp the opening
+  # date — a same-day expiry is still refused for its placeholders, so the fallback cannot
+  # accidentally widen anything; it only makes the row shorter-lived.
+  _sbw_exp=$(date -u -d "$DATE +90 days" +%Y-%m-%d 2>/dev/null \
+    || date -u -j -v+90d -f %Y-%m-%d "$DATE" +%Y-%m-%d 2>/dev/null) || _sbw_exp="$DATE"
+  [ -n "$_sbw_exp" ] || _sbw_exp="$DATE"
+  # NO `|` IN AN INTERPOLATED VALUE (security S-L4). The row IS a markdown table row, so a pipe in
+  # $1 would forge extra columns and shift Owner/Opened/Expires into cells the validator then reads
+  # as something else. $1 is already constrained to the six tokens by the --backlog parse check, so
+  # this is defence in depth against a future caller, and it REFUSES rather than sanitising: a
+  # backend token that needs escaping is not a backend token.
+  case "$1" in
+    *'|'*) echo "incept: refusing to stamp a board-governance waiver for a backend token containing '|' — add the row by hand (templates/WAIVER-REGISTER.md)." >&2; return 0 ;;
+  esac
+  # printf, NOT `awk -v` (security S-L4). `awk -v row=...` runs ESCAPE PROCESSING over the assigned
+  # value, so a `\t`, a `\n` or a lone `\` in the text becomes something else inside the program —
+  # a data-into-program path for a value the program then prints verbatim. Build the line with
+  # printf, and hand awk only the FILE it is reading.
+  # SWAS-203: the Remediation cell names a cure that exists today. Jira has a kit adapter (the bind);
+  # every other backend has none, so its way out is its own adapter or BACKLOG.md. No pipe, no
+  # "when released": the validator reads this cell as a plan, and a plan must not wait on a release.
+  case "$1" in
+    jira) _sbw_fix="Bind tracker-board-gates once branch protection is available, or move the board to BACKLOG.md" ;;
+    *) _sbw_fix="Adopt a kit adapter for '$1', or move the board to BACKLOG.md" ;;
+  esac
+  _sbw_row=$(printf '| board-governance | The kit reads BACKLOG.md only; board-bound gates cannot read '"'"'%s'"'"' | [owner] | %s | %s | %s | [security-owner] |' "$1" "$DATE" "$_sbw_exp" "$_sbw_fix")
+  # Insert directly after the Active table's separator row — awk to a temp file, then move, because
+  # `sedi` is a substitution helper and this is an insertion. The row reaches awk through the
+  # ENVIRONMENT (ENVIRON), which is not escape-processed.
+  SBW_ROW="$_sbw_row" awk '
+    { print }
+    /^##[[:space:]]+Active waivers/ { insec=1; next }
+    insec && !done && /^\|[-|: ]*\|[[:space:]]*$/ { print ENVIRON["SBW_ROW"]; done=1; insec=0 }
+  ' WAIVER-REGISTER.md > WAIVER-REGISTER.md.tmp && mv WAIVER-REGISTER.md.tmp WAIVER-REGISTER.md
+  # VERIFY THE STAMP LANDED, and say so honestly when it did not (reviewer R4). The insertion is
+  # anchored on a `## Active waivers` section AND a separator row; a register that carries neither —
+  # an adopter's own file, a future template edit — silently keeps every line and stamps nothing,
+  # and the success sentence below would then be a false claim in the one place an adopter is being
+  # told the gap is now visible. Fail LOUD and hand them the manual step.
+  if ! grep -q '^| board-governance |' WAIVER-REGISTER.md; then
+    echo "incept: could not stamp the board-governance row into WAIVER-REGISTER.md (no '## Active waivers' table found) — add it by hand from templates/WAIVER-REGISTER.md before your first PR." >&2
+    return 0
+  fi
+  # The cure sentence is the gates' own (conformance/backlog-lib.sh::tracker_delegated_cure), so
+  # incept and the first red say the same thing. A tree without the library (never an adopter export)
+  # falls back to the neutral short form rather than printing nothing.
+  _sbw_cure=$( . conformance/backlog-lib.sh >/dev/null 2>&1 && tracker_delegated_cure "$1" ) || _sbw_cure=""
+  [ -n "$_sbw_cure" ] || _sbw_cure="bind tracker-board-gates (jira), or ratify a board-governance waiver, or move the board to BACKLOG.md"
+  echo "NOT ENFORCED: backend '$1' — board-bound governance is not verified on this tree (the kit reads BACKLOG.md only; see docs/work-tracking/adapters.md §Which gates bind). Cure: $_sbw_cure."
+  echo "note: WAIVER-REGISTER.md now carries a pre-filled 'board-governance' row with [owner] and [security-owner] PLACEHOLDERS. Until a human fills both, your board-bound CI gates stay red — that is the point: the gap is real and it is now visible."
+}
+# TBG-TRACKER-CONF: stamp .kit/tracker.conf for the jira backend, per design §5. `--existing`
+# (F1's jira arm) writes an EMPTY state map plus a --discover instruction instead of the greenfield
+# identity map — the adopter's Jira statuses are unknown until they run the live discovery leg.
+# The stamped conf is validated against the SAME grammar tracker-contract.sh reads (F4 — never a
+# second parser), so a placeholder host/project that fails scripts/tracker-conf.sh here would also
+# fail it later; both arms are written to satisfy that grammar exactly.
+stamp_tracker_conf() {  # $1 = existing (0|1)
+  mkdir -p .kit
+  if [ -f .kit/tracker.conf ]; then
+    echo "note: .kit/tracker.conf already exists — not overwritten (brownfield-safe)."
+    return 0
+  fi
+  if [ "$1" -eq 1 ]; then
+    cat > .kit/tracker.conf <<'EOF_TC'
+# .kit/tracker.conf — stamped by `incept --backlog jira --existing`. Fail-closed key=value grammar;
+# see docs/architecture/2026-09-19-tracker-backed-governance-design.md §5, or `sh scripts/
+# tracker-conf.sh <this-file>` to validate. Credentials are ENV ONLY: KIT_TRACKER_USER /
+# KIT_TRACKER_TOKEN (JIRA_EMAIL/JIRA_TOKEN honoured as aliases) — never stamp a token here.
+version=1
+backend=jira
+base_url=https://your-site.example.invalid
+flavour=cloud
+auth=basic
+project=PROJ
+list_cap=200
+# --existing: the state map below is intentionally EMPTY. Set KIT_TRACKER_USER/KIT_TRACKER_TOKEN,
+# then run `sh conformance/tracker-contract.sh --discover` to print this instance's id<->name state
+# map, and add one `state.<kit-state>=<tracker-status>` line per §4.1 kit state (the FIRST line for
+# a given kit state is the `move` target). field.<name>=customfield_NNNNN|label:<prefix>|none lines
+# follow the same discovery step.
+# create.issuetype is the issue type `board create` makes. Field ids are PER ISSUE TYPE on
+# team-managed projects: map field.size/field.risk to THIS type's ids, printed by
+# `sh conformance/tracker-contract.sh --fields`.
+# A field your Jira REQUIRES on create (it will be listed under REQUIRED by --fields) needs a line here:
+# create.<fieldId>=<value> (a team default) or create.<fieldId>=prompt (the agent supplies it per card).
+create.issuetype=Task
+EOF_TC
+  else
+    cat > .kit/tracker.conf <<'EOF_TC'
+# .kit/tracker.conf — stamped by `incept --backlog jira`. Fail-closed key=value grammar; see
+# docs/architecture/2026-09-19-tracker-backed-governance-design.md §5, or `sh scripts/
+# tracker-conf.sh <this-file>` to validate. Credentials are ENV ONLY: KIT_TRACKER_USER /
+# KIT_TRACKER_TOKEN (JIRA_EMAIL/JIRA_TOKEN honoured as aliases) — never stamp a token here.
+# Edit base_url/project for your instance, then verify with `sh conformance/tracker-contract.sh`.
+version=1
+backend=jira
+base_url=https://your-site.example.invalid
+flavour=cloud
+auth=basic
+project=PROJ
+state.backlog=Backlog
+state.ready=Ready
+state.in-progress=In Progress
+state.in-review=In Review
+state.released=Released
+state.done=Done
+state.blocked=Blocked
+field.size=label:size
+field.risk=label:risk
+list_cap=200
+# create.issuetype is the issue type `board create` makes. Field ids are PER ISSUE TYPE on
+# team-managed projects: map field.size/field.risk to THIS type's ids, printed by
+# `sh conformance/tracker-contract.sh --fields`.
+# A field your Jira REQUIRES on create (it will be listed under REQUIRED by --fields) needs a line here:
+# create.<fieldId>=<value> (a team default) or create.<fieldId>=prompt (the agent supplies it per card).
+create.issuetype=Task
+EOF_TC
+  fi
+  echo "note: .kit/tracker.conf stamped — credentials go in env only: KIT_TRACKER_USER, KIT_TRACKER_TOKEN (JIRA_EMAIL/JIRA_TOKEN also honoured). Never stamp a token into the conf."
+}
+
+case "$BACKLOG" in
+  md)
+    [ -f BACKLOG.md ] || { cp templates/BACKLOG-TEMPLATE.md BACKLOG.md; sedi "s/\[Project Name\]/${ENAME}/g" BACKLOG.md; } ;;
+  jira)
+    [ -f JIRA-SETUP.md ] || { cp templates/JIRA-SETUP-TEMPLATE.md JIRA-SETUP.md; sedi "s/\[Project Name\]/${ENAME}/g" JIRA-SETUP.md; }
+    echo "note: backlog backend 'jira' selected — JIRA-SETUP.md written; configure it, then verify with 'sh conformance/tracker-contract.sh'. Declare the backend in CLAUDE.md §3."
+    [ "$_TBG_CONF_STAMPED" -eq 1 ] && stamp_tracker_conf "$EXISTING"
+    stamp_board_governance_waiver jira ;;
+  *)
+    [ -f TRACKER-SETUP.md ] || { cp templates/TRACKER-SETUP-TEMPLATE.md TRACKER-SETUP.md; sedi "s/\[Project Name\]/${ENAME}/g; s/\[BACKEND\]/${BACKLOG}/g" TRACKER-SETUP.md; }
+    echo "note: backlog backend '$BACKLOG' selected (convention-tier) — TRACKER-SETUP.md written; map it via docs/work-tracking/adapters.md. Declare it in CLAUDE.md §3."
+    if [ "$EXISTING" -eq 1 ]; then
+      echo "note: --existing acknowledged for backend '$BACKLOG' — no incept-time brownfield adapter ships for it yet; map it via docs/work-tracking/adapters.md and docs/adoption/brownfield.md."
+    fi
+    stamp_board_governance_waiver "$BACKLOG" ;;
+esac
+mkdir -p docs/architecture
+[ -f docs/architecture/ADR-000-stack.md ] || { cp docs/ADR-000-EXAMPLE.md docs/architecture/ADR-000-stack.md; sedi "s/\[YYYY-MM-DD\]/${DATE}/g" docs/architecture/ADR-000-stack.md; }
+
+# --- 4b. B3: finish the stamp — no TEMPLATE RESIDUE in a delivered artifact -------------------------
+# MEASURED (KIT-EVAL-2): the tree an adopter is handed still read as a blank form. CLAUDE.md opened
+# `# [Project Name] — Claude Project Guide` — the very FIRST line of the very FIRST file an agent
+# reads; the `> **Template.** Copy to a new project's ...` instruction survived into five delivered
+# files, each telling the reader to do the thing incept had ALREADY done; and RUNBOOK carried an
+# unstamped `**Last Updated:** [date]`. None of it is a cosmetic complaint: an artifact that still
+# describes itself as a template is one the reader discounts, and a stamped tree that looks unstamped
+# is indistinguishable from an incept that half-failed.
+#
+# `[date]` is NOT swept generally, and that is deliberate: it is a live sentinel that five conformance
+# checks (dr-ready, resilience-ready, containment-ready, cost-governance-ready, egress-policy) grep for
+# to tell an UNFILLED attestation from a filled one. Only the artifact-HEADER slots incept genuinely
+# knows the answer to are stamped (below); every ATTESTATION slot stays bracketed on purpose.
+# REVIEW R1 BLOCKER: the first cut deleted only the banner's FIRST line. Every banner but RUNBOOK's is
+# a multi-line blockquote RUN (REQUIRED-CHECKS 4 lines, DECISIONS 4, SECURITY 3), so stamped
+# REQUIRED-CHECKS.md and docs/governance/DECISIONS.md opened on a dangling `> in this repo's branch
+# protection...` fragment — a mid-sentence continuation with its subject deleted, which reads WORSE
+# than the banner it replaced. The unit is the blockquote run, not the line: skip while the line is
+# still part of the quote, then swallow one trailing blank so no double blank is left behind.
+strip_template_banner() {  # <file> — drop the whole `> **Template.**` blockquote run + one blank after
+  [ -f "$1" ] || return 0
+  grep -q '^> \*\*Template\.\*\*' "$1" || return 0
+  awk '
+    /^> \*\*Template\.\*\*/ { skip = 1; next }
+    skip == 1 && /^>/       { next }
+    skip == 1 && $0 == ""   { skip = 0; next }
+    { skip = 0; print }
+  ' "$1" > "$1.b3tmp" && mv "$1.b3tmp" "$1"
+}
+for _b3f in CLAUDE.md README.md RUNBOOK.md BACKLOG.md REQUIRED-CHECKS.md SECURITY.md .env.example docs/governance/DECISIONS.md; do
+  strip_template_banner "$_b3f"
+done
+# The project's own name belongs in its own title.
+sedi "s/^# \[Project Name\] — /# $(esc "$ENAME") — /" CLAUDE.md
+# The artifact-header date slots are the ones incept KNOWS the answer to — a file stamped today that
+# says it was last updated `[date]` is simply wrong. These three headers are not sentinels: no
+# conformance check greps them (the `[date]` sentinel checks all key on RUNBOOK ATTESTATION lines —
+# 'Restore verified:', 'enforced:' — which stay bracketed and unfilled on purpose).
+for _b3d in CLAUDE.md RUNBOOK.md BACKLOG.md; do
+  if [ -f "$_b3d" ]; then
+    sedi -e "s/^\*\*Last Updated:\*\* \[date\]\$/**Last Updated:** ${DATE}/" \
+         -e "s/^\*\*Created:\*\* \[date\] /**Created:** ${DATE} /" \
+         "$_b3d"
+  fi
+done
+
+# --- 4c. B3: `--mode lean` must actually STAMP a lighter RUNBOOK ------------------------------------
+# MEASURED (KIT-EVAL-2): lean and enterprise stamped RUNBOOKs differed in the PROJECT NAME and nothing
+# else. `--mode lean` is the kit's central promise that ceremony is proportionate; a mode that changes
+# no delivered artifact is a promise made only in prose.
+#
+# The mechanism is markers in templates/RUNBOOK-TEMPLATE.md, and the marker lines NEVER survive into a
+# stamped RUNBOOK in EITHER mode — enterprise keeps the content and drops the markers, lean drops both.
+# The three marked blocks are pure enterprise apparatus, chosen because every check that keys on them
+# ALREADY self-skips on a lean project's triggers (measured: resilience-ready and observability-ready
+# N/A with no deploy surface, agentops-ready N/A without `Agentic: yes`) — and because lean mode ships
+# docs/conditional-obligations.md, whose table names these same controls and says they activate the
+# moment the trigger appears. So the rows come BACK with the obligation; they are not lost.
+# This runs here, not in curate_for_mode, for the plain reason that curate_for_mode runs before
+# RUNBOOK.md exists.
+# REVIEW R1: a sed RANGE whose closing address never matches deletes TO END OF FILE. Reproduced — one
+# dropped `<!-- /mode:enterprise -->` took the stamped RUNBOOK from 91 lines to 41, silently, on the
+# one artifact an adopter is told to cold-resume from. A range delete is only safe over a balanced
+# marker set; balance is validated up in the input-validation block, BEFORE the first write, so a bad
+# template can never leave a half-incepted tree. Both matchers anchor the EXACT comment form
+# (`^<!-- /?mode:enterprise -->$`) so ordinary prose mentioning the token is never treated as a marker.
+if [ -f RUNBOOK.md ]; then
+  if [ "$MODE" = lean ]; then
+    sed '/^<!-- mode:enterprise -->$/,/^<!-- \/mode:enterprise -->$/d' RUNBOOK.md > RUNBOOK.b3tmp
+  else
+    sed '/^<!-- \/\{0,1\}mode:enterprise -->$/d' RUNBOOK.md > RUNBOOK.b3tmp
+  fi
+  mv RUNBOOK.b3tmp RUNBOOK.md
+fi
+
+# --- 5. wire CI from the chosen profile (platform-specific path/reference) ---
+# The contract is the gate-ids; the platform is open (docs/operations/ci-platforms.md).
+# github → .github/workflows/ci.yml ; gitlab → .gitlab-ci.yml at the repo root.
+case "$CI" in
+  github)
+    mkdir -p .github/workflows
+    # RATIFY-PARITY: the §13 control-plane-ratification gate is STACK-NEUTRAL (runs only conformance/*.sh),
+    # so it installs for EVERY stack from ONE shared source — UNCONDITIONALLY, not gated on the profile's
+    # ci.yml or on a per-stack copy (it used to live under profiles/typescript-node/, so 9 stacks silently
+    # got no gate). CP-9: it ships as its OWN workflow — it must re-run on `pull_request_review` (an
+    # approval IS the ratification signal) and a review must re-run THAT and nothing else; separate file =
+    # structural containment. FAIL-LOUD if the source is gone: a kit that lost its governance source must
+    # not silently produce an ungoverned adopter. (conformance/ratification-parity.sh locks this.)
+    if [ -f profiles/ratification.yml ]; then
+      cp_kit_replace profiles/ratification.yml .github/workflows/ratification.yml 'COPY & ADAPT|Sparkwright'
+    else
+      echo "incept: profiles/ratification.yml is MISSING — cannot install the §13 control-plane-ratification gate." >&2
+      echo "        This is a broken kit distribution; refusing to produce an ungoverned project. Aborting." >&2
+      exit 1
+    fi
+    # B6: the board/loop merge-time gates (backlog-presence, ceremony-binding, loop-state — the latter
+    # ACTIVE but in observe mode, see the source file's header) install from the same single
+    # stack-neutral source pattern as ratification.yml, UNCONDITIONALLY for every stack.
+    # conformance/adopter-gates-parity.sh locks that this stays the sole, wired, stack-neutral copy.
+    if [ -f profiles/adopter-gates.yml ]; then
+      cp_kit_replace profiles/adopter-gates.yml .github/workflows/adopter-gates.yml 'COPY & ADAPT|Sparkwright'
+    else
+      echo "incept: profiles/adopter-gates.yml is MISSING — cannot install the board/loop merge-time gates." >&2
+      echo "        This is a broken kit distribution; refusing to produce an ungoverned project. Aborting." >&2
+      exit 1
+    fi
+    # TBG-TRUSTED-JOB: the tracker-backed trusted job, installed unconditionally like adopter-gates.yml
+    # above — it skips entirely on a `md` backend (R1a), so it costs a pristine adopter nothing.
+    if [ -f profiles/adopter-tracker-gates.yml ]; then
+      cp_kit_replace profiles/adopter-tracker-gates.yml .github/workflows/adopter-tracker-gates.yml 'COPY & ADAPT|Sparkwright'
+    else
+      echo "incept: profiles/adopter-tracker-gates.yml is MISSING — cannot install the tracker-backed trusted job." >&2
+      echo "        This is a broken kit distribution; refusing to produce an ungoverned project. Aborting." >&2
+      exit 1
+    fi
+    # SWAS-258: the after-the-fact trunk trace (`trunk-trace`, push to the default branch, observe by default)
+    # is its OWN workflow file so a push run can never skip a required job in adopter-gates.yml. Installed
+    # unconditionally like adopter-gates.yml; never a required context (see the source file's header).
+    # conformance/adopter-gates-parity.sh locks that this stays the sole, wired, stack-neutral copy.
+    if [ -f profiles/adopter-trunk-trace.yml ]; then
+      cp_kit_replace profiles/adopter-trunk-trace.yml .github/workflows/adopter-trunk-trace.yml 'COPY & ADAPT|Sparkwright'
+    else
+      echo "incept: profiles/adopter-trunk-trace.yml is MISSING — cannot install the after-the-fact trunk trace." >&2
+      echo "        This is a broken kit distribution; refusing to produce an ungoverned project. Aborting." >&2
+      exit 1
+    fi
+    # SWAS-901: the solo GO check (`solo-go-bound`, pull_request_target), installed unconditionally like the files above. A repository
+    # that is not solo-declared reads a green `na`; it is REQUIRED only in a solo-declared repository after
+    # `branch-protection-apply.sh --replace`. conformance/adopter-gates-parity.sh (SG8-SG9) locks this install and the early refusal.
+    if [ -f profiles/solo-go.yml ]; then
+      cp_kit_replace profiles/solo-go.yml .github/workflows/solo-go.yml 'COPY & ADAPT|Sparkwright'
+    else
+      echo "incept: profiles/solo-go.yml is MISSING — cannot install the solo GO check." >&2
+      echo "        This is a broken kit distribution; refusing to produce an ungoverned project. Aborting." >&2
+      exit 1
+    fi
+    if [ -f "profiles/${STACK}/ci.yml" ]; then
+      install_pipeline "profiles/${STACK}/ci.yml" .github/workflows/ci.yml 'Kit-own CI|Sparkwright'
+      [ -f "profiles/${STACK}/CODEOWNERS" ] && install_codeowners "profiles/${STACK}/CODEOWNERS" .github/CODEOWNERS
+    else
+      echo "note: no profiles/${STACK}/ci.yml — add a CI workflow satisfying DEVELOPMENT-STANDARDS.md §14 (conformance/ci-gates.sh checks it)."
+    fi
+    ;;
+  gitlab)
+    if [ -f "profiles/${STACK}/ci.gitlab-ci.yml" ]; then
+      install_pipeline "profiles/${STACK}/ci.gitlab-ci.yml" .gitlab-ci.yml 'Sparkwright'
+      # GitLab resolves ONE CODEOWNERS file, first found wins: root -> docs/ -> .gitlab/ (NOT a
+      # mirror of GitHub's .github/ -> root -> docs/ order). The kit ships NO root CODEOWNERS in
+      # the adopter archive (A2: a root file would win GitLab precedence and shadow this inert one;
+      # conformance/codeowners-export-clean.sh locks the archive clean), so the .gitlab/ file
+      # written here is the one GitLab actually finds.
+      [ -f "profiles/${STACK}/CODEOWNERS" ] && { mkdir -p .gitlab; install_codeowners "profiles/${STACK}/CODEOWNERS" .gitlab/CODEOWNERS; }
+    else
+      echo "note: no profiles/${STACK}/ci.gitlab-ci.yml — add a .gitlab-ci.yml satisfying DEVELOPMENT-STANDARDS.md §14 (conformance/ci-gates.sh checks it; see docs/operations/ci-platforms.md)."
+    fi
+    ;;
+esac
+
+# --- 5a. copy a reference eval harness if the profile ships one (currently ml) ---
+# Platform-independent; brownfield-safe (never clobber an existing evals/). The shipped runner
+# is a deterministic offline scorer — swap in your model/judge per evals/rubric.md.
+if [ -d "profiles/${STACK}/evals" ] && [ ! -d evals ]; then
+  cp -R "profiles/${STACK}/evals" evals
+  echo "copied reference eval harness: evals/ (deterministic offline scorer; the drop-in CI runs it as gate-eval — see evals/rubric.md)"
+fi
+
+# --- 5a2. copy the profile's starter scaffold so the drop-in CI is green on the empty project ---
+# Brownfield-safe: each file is copied ONLY where absent (never clobbers existing app source).
+# See profiles/${STACK}/scaffold/README.md for any one-time lockfile/wrapper step.
+if [ -d "profiles/${STACK}/scaffold" ]; then
+  # SWAS-786: the scaffold's tests/__init__.py files make its test folders packages. In a repo that ALREADY has a
+  # tests/ folder they would change how pytest names that repo's tests (the repo root goes on sys.path in place of
+  # tests/, so `import helpers` can break), so they are copied only where tests/ is new.
+  # (_scaf_tests_pre was set once, before the first write, by the SWAS-807 check above; _scaf_skip is shared with it.)
+  ( cd "profiles/${STACK}/scaffold" && find . -type f ) | while IFS= read -r rel; do
+    rel=${rel#./}
+    if _scaf_skip "$rel"; then continue; fi
+    # SWAS-807 belt: the early check above refuses a linked path; a link made after it is still never written through.
+    _kb_path_has_symlink "$rel" && continue
+    if [ ! -e "$rel" ]; then
+      mkdir -p "$(dirname "$rel")"
+      cp "profiles/${STACK}/scaffold/$rel" "$rel"
+    fi
+  done
+  # Merge the scaffold's ignore rules into the project .gitignore so the first `git add -A`
+  # does not stage build artifacts (node_modules/target/bin/...). Idempotent.
+  sgi="profiles/${STACK}/scaffold/.gitignore"
+  if [ -f "$sgi" ]; then
+    [ -f .gitignore ] || : > .gitignore
+    # `|| [ -n "$pat" ]` processes a final line with no trailing newline (robust to any scaffold).
+    while IFS= read -r pat || [ -n "$pat" ]; do
+      case "$pat" in ''|\#*) continue ;; esac
+      grep -qxF "$pat" .gitignore 2>/dev/null || printf '%s\n' "$pat" >> .gitignore
+    done < "$sgi"
+  fi
+  echo "copied starter scaffold from profiles/${STACK}/scaffold/ (brownfield-safe) + merged its .gitignore rules"
+  if [ "$_scaf_tests_pre" -eq 1 ] && [ -f "profiles/${STACK}/scaffold/tests/__init__.py" ]; then
+    echo "note: tests/ already existed, so the scaffold's tests/__init__.py files were not copied (they would change how pytest names your existing tests). Add an empty __init__.py to each test folder yourself if two test files may share a name."
+  fi
+  # Stack-specific one-time step to make the first CI push green (exact command, not a generic hint).
+  case "$STACK" in
+    python)      echo "  first-green step: uv lock && git add uv.lock && git commit -m 'lock deps'" ;;
+    java-spring) echo "  first-green step: mvn wrapper:wrapper && git add mvnw .mvn && git commit -m 'add maven wrapper'" ;;
+    kotlin)      echo "  first-green step: gradle wrapper && git add gradlew gradle && git commit -m 'add gradle wrapper'" ;;
+    dotnet)      echo "  first-green step: dotnet restore (writes packages.lock.json) && git add '**/packages.lock.json' && git commit -m 'lock deps'" ;;
+    go|rust)     echo "  no lockfile step — this scaffold is dependency-free and clone-green." ;;
+  esac
+  echo "  run it: see profiles/${STACK}/scaffold/README.md → 'See it run' (start the app, curl /healthz)"
+else
+  echo "warning: no starter scaffold for '${STACK}' — incept copied its CI but no app source, so CI will be RED until you add code. Non-service stacks (ml / data-engineering / terraform) ship a CI contract you populate, not a /healthz starter (see profiles/${STACK}.md §2)."
+fi
+
+# --- 5a2b. KW3 DB-archetype curation: a non-DB archetype (--no-db) strips the kit:db-backed CI region
+#     (Postgres service + DATABASE_URL) from the emitted workflow AND removes the copied .db-backed
+#     marker, so the drop-in CI ships no idle database service. DB-backed (the ts-node default) keeps
+#     both. Runs after the CI + scaffold copy so both the workflow file and the marker are in place. ---
+curate_db_backed "$DB_BACKED"
+
+# --- 5a3. point at the profile's COPY-&-ADAPT container references (do NOT auto-copy) ---
+# The profile's Dockerfile + compose.yaml are explicitly "COPY & ADAPT" references written for a
+# real app (e.g. a cmd/server entrypoint, a DB-backed service) — NOT drop-in artifacts for the
+# minimal /healthz starter. Auto-copying them would make `docker build` / `docker compose up` fail
+# until adapted, so incept leaves them in the profile and the image-supply-chain CI gates are
+# conditional on a Dockerfile existing (they skip until you add one). See profiles/${STACK}/ +
+# the "Environments this stack needs" section in profiles/${STACK}.md / docs/STACK-SELECTION.md.
+if [ -f "profiles/${STACK}/Dockerfile" ] || [ -f "profiles/${STACK}/compose.yaml" ]; then
+  echo "note: containerize when ready — adapt profiles/${STACK}/Dockerfile + compose.yaml to your app, then the image-build CI gates activate (they skip until a Dockerfile is present)."
+fi
+
+# --- 5a4. prune unselected stack profiles (CP-7 recert, K5) ---------------------------------------
+# The emitted CI runs whole-tree SAST (`semgrep --config p/default --error .`). A fresh export ships
+# ALL stack profiles, so scanning a FOREIGN profile's scaffold (e.g. profiles/python/scaffold/tests/
+# urllib) reddens a TS adopter's very FIRST CI on code they never wrote. incept is the first point the
+# stack is known (the release is stack-neutral), so prune here — mirroring `adopter-export --profile`
+# (scripts/adopter-export.sh). Keep profiles/<STACK>/, profiles/ratification.yml, profiles/adopter-gates.yml,
+# profiles/adopter-tracker-gates.yml (TBG-TRUSTED-JOB — same top-level, non-stack asset shape as
+# ratification.yml/adopter-gates.yml, B6), profiles/adopter-trunk-trace.yml (SWAS-258 — same shape), profiles/solo-go.yml (SWAS-901 — same shape), profiles/_TEMPLATE.md,
+# profiles/.gitignore (the tree-level build-output ignore file — CP7R5-K4-IGNORE; it MUST outlive the prune)
+# (adopter-export iterates known-profile DIRS only). Prune BOTH the working tree AND KIT_BASE_STAGE:
+# capture_kit_base already staged the UNPRUNED set (before $STACK was known), so pruning both keeps
+# kit-base, the tree, and both .kit-manifest files in agreement — kit-update then reconstructs a
+# matching pruned THEIRS (it reads kit-base:.kit-manifest first).
+# NOTE: conformance/kit-update-merge.sh builds its LEGACY-adopter fixture by stripping this block via the
+# `# --- 5a4.` / `# --- 5b0.` markers — do not rename them without updating that check (it asserts the strip).
+# (`_prune_profiles_in` is DEFINED above, beside the kit-base concordance check that also prunes a copy; only its two
+# calls live here, between the markers.)
+_prune_profiles_in "."
+[ -n "${KIT_BASE_STAGE:-}" ] && [ -d "${KIT_BASE_STAGE:-}" ] && _prune_profiles_in "$KIT_BASE_STAGE"
+# Rewrite docs/STACK-SELECTION.md (working tree) to a single-profile stub so its links to the now-removed
+# profiles/<other>.md do not dangle (the adopter's check-links would RED on first push). Mirrors
+# adopter-export.sh's stub; kit-update's rebuilt THEIRS gets the same stub via adopter-export --profile.
+if [ -f docs/STACK-SELECTION.md ]; then
+  {
+    printf '# Stack selection\n\n'
+    printf 'This project was incepted for the **%s** profile — see [the profile guide](../profiles/%s.md).\n\n' "$STACK" "$STACK"
+    printf 'The full multi-stack comparison matrix lives in the upstream Sparkwright kit; it is omitted\n'
+    printf 'here because the other stack profiles are not included in a single-profile project.\n'
+  } > docs/STACK-SELECTION.md
+fi
+
+# --- 5b0. ensure a git repo exists so the runtime guard can be installed (F6) ---
+# The documented adopter path (adopter-export.sh → incept) starts from a plain directory, not a
+# repo, so the pre-push hook below has nowhere to install and the summary would claim a guard that
+# never landed. Initialize a repo here — announced — but ONLY when there is none: a brownfield
+# adopter who ran incept inside an existing repo is left completely untouched (the is-inside-work-tree
+# check is false only when there is no repo, so this never re-inits or clobbers an existing one).
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git init >/dev/null 2>&1 && echo "initialized a git repo (git init) so the runtime guard can be installed"
+fi
+
+# --- P1.2-pre: COMMIT the captured base onto the `kit-base` orphan branch ------------------------------
+# The second half of the capture/commit split above: a repo is now guaranteed. This is the MERGE BASE
+# every kit->adopter update pipe needs — the answer to "what tree did this adopter receive?". It is
+# immutable by construction (a commit in a repo they own), works offline, and is automatically
+# profile-correct (it IS what they got). Locked by conformance/kit-base.sh.
+#
+# NEVER TOUCHES THE WORKTREE OR THE ADOPTER'S INDEX: built through a TEMPORARY index with GIT_WORK_TREE
+# pointed at the staging dir. No checkout, no stash, no `git add` against the real index. `git status` is
+# byte-identical before and after.
+# KIT-UPDATE-BASE-ADVANCES: read the export's `.kit-source` (adopter-export.sh) from the staged base.
+# Sets KB_SRC_SHA / KB_SRC_VER and returns 0 only for a STRICTLY well-formed record: exactly two lines,
+# `commit <40 lowercase hex>` then `version <non-empty, no whitespace>`. Absent -> 1 silently (an older
+# kit's export: legacy behaviour); present but malformed -> 1 with a one-line warning (never guess).
+KB_SRC_SHA=''; KB_SRC_VER=''
+read_kit_source() {
+  KB_SRC_SHA=''; KB_SRC_VER=''
+  [ -f "$KIT_BASE_STAGE/.kit-source" ] || return 1
+  _ks_n=$(wc -l < "$KIT_BASE_STAGE/.kit-source" | tr -d ' ')
+  _ks_l1=$(sed -n 1p "$KIT_BASE_STAGE/.kit-source"); _ks_l2=$(sed -n 2p "$KIT_BASE_STAGE/.kit-source")
+  _ks_sha=${_ks_l1#commit }; _ks_ver=${_ks_l2#version }
+  if [ "$_ks_n" = 2 ] && [ "$_ks_l1" != "$_ks_sha" ] && [ "$_ks_l2" != "$_ks_ver" ] \
+     && [ "${#_ks_sha}" = 40 ] && [ -n "$_ks_ver" ] \
+     && ! printf '%s' "$_ks_sha" | grep -q '[^0-9a-f]' && ! printf '%s' "$_ks_ver" | grep -q '[[:space:]]'; then
+    KB_SRC_SHA=$_ks_sha; KB_SRC_VER=$_ks_ver; return 0
+  fi
+  echo "warning: .kit-source is malformed — recording kit-base without the Kit-Source trailer." >&2
+  return 1
+}
+
+# --kit-base-replace: rename the existing base AWAY, never delete it. The branch goes to kit-base-replaced-<sha12>; every
+# kit-base/* tag that resolves into its chain goes to kit-base-replaced/<name> (the new base's tag can then bind, and a
+# colliding name no longer points at the old chain). Runs only after the new commit object exists, so a failure before
+# this point leaves the old base untouched; a failure after it is undone by _kb_replace_undo.
+_kb_replace_aside() {
+  [ "$KB_DEFER_REPLACE" = 1 ] || return 0
+  _ra_tip=$(GIT_DIR="$_kb_gd" git rev-parse --verify --quiet refs/heads/kit-base 2>/dev/null) || return 1
+  _ra_br="kit-base-replaced-$(printf '%s' "$_ra_tip" | cut -c1-12)"
+  GIT_DIR="$_kb_gd" git branch -m kit-base "$_ra_br" >/dev/null 2>&1 || return 1
+  _kb_aside_br=$_ra_br
+  _ra_list=$(GIT_DIR="$_kb_gd" git for-each-ref --format='%(refname:strip=2)' refs/tags/kit-base/ 2>/dev/null) || _ra_list=''
+  for _ra_t in $_ra_list; do
+    _ra_obj=$(GIT_DIR="$_kb_gd" git rev-parse --verify --quiet "refs/tags/${_ra_t}" 2>/dev/null) || continue
+    _ra_c=$(GIT_DIR="$_kb_gd" git rev-parse --verify --quiet "refs/tags/${_ra_t}^{commit}" 2>/dev/null) || continue
+    GIT_DIR="$_kb_gd" git merge-base --is-ancestor "$_ra_c" "$_ra_tip" >/dev/null 2>&1 || continue
+    # create-only: a kit-base-replaced/<name> that already exists blocks the move. Never half-move: stop, and the caller undoes.
+    if GIT_DIR="$_kb_gd" git update-ref "refs/tags/kit-base-replaced/${_ra_t#kit-base/}" "$_ra_obj" '' >/dev/null 2>&1; then
+      GIT_DIR="$_kb_gd" git update-ref -d "refs/tags/${_ra_t}" "$_ra_obj" >/dev/null 2>&1 || true
+      _kb_moved_tags="${_kb_moved_tags} ${_ra_t}"
+    else
+      _kb_blocked_tag="kit-base-replaced/${_ra_t#kit-base/}"
+      return 1
+    fi
+  done
+  return 0
+}
+_kb_replace_undo() {
+  [ -n "${_kb_aside_br:-}" ] || return 0
+  for _ru_t in $_kb_moved_tags; do
+    _ru_obj=$(GIT_DIR="$_kb_gd" git rev-parse --verify --quiet "refs/tags/kit-base-replaced/${_ru_t#kit-base/}" 2>/dev/null) || continue
+    GIT_DIR="$_kb_gd" git update-ref "refs/tags/${_ru_t}" "$_ru_obj" '' >/dev/null 2>&1 || continue
+    GIT_DIR="$_kb_gd" git update-ref -d "refs/tags/kit-base-replaced/${_ru_t#kit-base/}" >/dev/null 2>&1 || true
+  done
+  GIT_DIR="$_kb_gd" git rev-parse --verify --quiet refs/heads/kit-base >/dev/null 2>&1 \
+    || GIT_DIR="$_kb_gd" git branch -m "$_kb_aside_br" kit-base >/dev/null 2>&1 || true
+  _kb_aside_br=''
+}
+
+commit_kit_base() {
+  [ -n "$KIT_BASE_STAGE" ] && [ -d "$KIT_BASE_STAGE" ] || return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  _kb_gd=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 0
+
+  # S2 (review #318): NEVER clobber an adopter's existing ref. On re-adoption or a prior kit-base install
+  # the adopter may already have a `kit-base` branch or a `kit-base/v<VER>` tag; overwriting it is silent,
+  # after-GC-unrecoverable data loss on a namespace we do not own. Refuse and say so.
+  # KIT-BASE-MANIFEST-CONCORDANCE: by here the pre-mutation check (above) has already compared the two. An identical
+  # base needs no record; a kept foreign one is announced there; only --kit-base-replace reaches the record below,
+  # after the old base is renamed aside (kit-update's own `kit-base-unverified` rename-aside is the precedent).
+  if [ "$KB_DEFER_REPLACE" != 1 ] && GIT_DIR="$_kb_gd" git rev-parse --verify --quiet refs/heads/kit-base >/dev/null 2>&1; then
+    [ "$KB_ALREADY" = 1 ] || echo "warning: a 'kit-base' branch already exists — NOT overwriting it (brownfield-safe)." >&2
+    rm -rf "$KIT_BASE_STAGE" 2>/dev/null || true; return 0
+  fi
+
+  # (The temp index and `add -Af` live in _kb_tree_of, shared with the concordance check.)
+
+  # The kit-base commit carries a KIT identity, supplied explicitly — NOT the adopter's. Two reasons:
+  #   (1) a fresh `git init` adopter (the documented path) may have NO user.name/user.email configured,
+  #       so a bare `git commit-tree` would FAIL — which is exactly what CI (no ambient identity) caught,
+  #       and what a real adopter would hit. (2) This is the kit's snapshot, not the adopter's work, so
+  #       it should not be attributed to them. Deterministic identity also keeps the commit reproducible.
+  # C1 (review #318): `git add -Af` — force past core.excludesFile / info/exclude / .gitignore. The
+  #   manifest is AUTHORITATIVE: every path we staged must be committed. A bare `git add -A` honours the
+  #   adopter's ignore config and would SILENTLY DROP kit files (a global `*.md` ignore dropped 190),
+  #   producing a base that reports success while being wrong — with no 3-way anchor for those files later.
+  # A well-formed .kit-source adds the Kit-Source/Kit-Version trailer paragraph (LAST paragraph, contiguous)
+  # and a sha-qualified tag, so two pre-release exports of one VERSION are distinguishable. Absent or
+  # malformed: today's message and `kit-base/v<VER>` tag, unchanged.
+  _kb_msg="kit-base: pristine Sparkwright export v${VER} (the tree this project was adopted from)"
+  _kb_tag="kit-base/v${VER}"
+  if read_kit_source; then
+    _kb_msg=$(printf '%s\n\nKit-Source: %s\nKit-Version: %s' "$_kb_msg" "$KB_SRC_SHA" "$KB_SRC_VER")
+    _kb_tag="kit-base/v${VER}+$(printf '%s' "$KB_SRC_SHA" | cut -c1-12)"
+  fi
+  _kb_aside_br=''; _kb_moved_tags=''; _kb_blocked_tag=''
+  if _kb_tree=$(_kb_tree_of "$KIT_BASE_STAGE") &&
+     _kb_cmt=$(GIT_DIR="$_kb_gd" GIT_AUTHOR_NAME='Sparkwright kit-base' GIT_AUTHOR_EMAIL='kit-base@sparkwright.local' \
+         GIT_COMMITTER_NAME='Sparkwright kit-base' GIT_COMMITTER_EMAIL='kit-base@sparkwright.local' \
+         git commit-tree "$_kb_tree" \
+         -m "$_kb_msg" 2>/dev/null) &&
+     _kb_replace_aside &&
+     GIT_DIR="$_kb_gd" git update-ref refs/heads/kit-base "$_kb_cmt" '' 2>/dev/null; then
+    # Create-only tag (no -f): S2 already refused if the branch existed; guard the tag independently.
+    if GIT_DIR="$_kb_gd" git rev-parse --verify --quiet "refs/tags/${_kb_tag}" >/dev/null 2>&1; then :; else
+      GIT_DIR="$_kb_gd" git tag "$_kb_tag" "$_kb_cmt" >/dev/null 2>&1 || true
+    fi
+    echo "recorded kit-base: the pristine v${VER} export you adopted from (branch 'kit-base', tag '${_kb_tag}')"
+    echo "  It is the merge base 'kit-update' will diff against. Do not delete it. See docs/operations/kit-base.md."
+    [ -z "$_kb_aside_br" ] || echo "  The previous base is kept at branch '${_kb_aside_br}' (its tags are kit-base-replaced/...). Nothing was deleted."
+  else
+    _kb_replace_undo
+    if [ "$KB_DEFER_REPLACE" = 1 ]; then
+      # --kit-base-replace was asked for and could not finish: the old base is back where it was (undone above), never half-moved.
+      echo "incept: --kit-base-replace FAILED and was undone: the previous 'kit-base' and its tags are as they were." >&2
+      if [ -n "$_kb_blocked_tag" ]; then
+        echo "  The tag '$_kb_blocked_tag' already exists and blocks the move. Move it aside yourself, then run again." >&2
+      fi
+      rm -rf "$KIT_BASE_STAGE" 2>/dev/null || true
+      exit 1
+    fi
+    echo "warning: could not record the kit-base branch — 'kit-update' will be unavailable for this project." >&2
+  fi
+  rm -rf "$KIT_BASE_STAGE" 2>/dev/null || true
+}
+commit_kit_base
+
+# --- 5b. install the runtime-guard git pre-push hook (default-on, brownfield-safe) ---
+# Git hooks are not version-controlled, so incept installs the reference per-clone.
+# Never clobber an existing hook (same discipline as the .claude/ brownfield path).
+# GUARD_STEP carries the TRUTHFUL summary line for whichever path we take (mirrors the
+# ${PROTECT_HINT} heredoc-variable pattern) so the next-steps summary can never claim an install
+# that did not happen. Default = the honest "not installed" recovery; each branch overrides it.
+GUARD_STEP="Runtime guard NOT installed — no git repo could be initialized. Run 'git init', then re-run 'sh scripts/incept.sh' to install it."
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [ -f hooks/pre-push ]; then
+    HOOK_DST=$(git rev-parse --git-path hooks/pre-push)
+    # CP-4/D3: --git-path yields a path relative to the cwd (".git/hooks/pre-push", or
+    # "../.git/hooks/pre-push" under --allow-nested). Absolutize it so every message below — and the
+    # GUARD_STEP summary in particular — names the file ACTUALLY written, wherever it landed.
+    _hook_dir=$(dirname "$HOOK_DST")
+    if [ -d "$_hook_dir" ]; then
+      HOOK_DST="$( CDPATH='' cd "$_hook_dir" && pwd -P )/$(basename "$HOOK_DST")"
+    fi
+    if [ -e "$HOOK_DST" ]; then
+      echo "note: $HOOK_DST already exists — NOT overwriting (brownfield-safe). To chain the kit"
+      echo "      guard, call 'sh \"$PWD/hooks/pre-push\"' from your existing hook, or replace it."
+      GUARD_STEP="Local runtime guard NOT overwritten — $HOOK_DST already existed (brownfield-safe). Chain the kit guard from your existing hook, or replace it (see the note above)."
+    else
+      mkdir -p "$(dirname "$HOOK_DST")"
+      if cp hooks/pre-push "$HOOK_DST" && chmod +x "$HOOK_DST"; then
+        echo "installed runtime guard: $HOOK_DST (blocks force-push/push-to-main; bypass: git push --no-verify)"
+        # CP-4/D3: DERIVED, never hardcoded. This line is the one the adopter actually reads (the
+        # honest echo above scrolls past), and it used to claim ".git/hooks/pre-push" no matter where
+        # the hook really landed. Under --allow-nested it now self-documents the parent path.
+        GUARD_STEP="Local runtime guard installed at $HOOK_DST (force-push/push-to-main; bypass: --no-verify)."
+      else
+        echo "WARNING: could NOT install the runtime guard at $HOOK_DST (cp/chmod failed — check permissions/disk)." >&2
+        GUARD_STEP="Runtime guard NOT installed — could not write $HOOK_DST (cp/chmod failed; check permissions). Re-run 'sh scripts/incept.sh' after fixing."
+      fi
+    fi
+  else
+    GUARD_STEP="Runtime guard NOT installed — hooks/pre-push not found in the kit tree. Re-export the kit (adopter-export.sh) to restore it, then re-run 'sh scripts/incept.sh'."
+  fi
+fi
+
+# --- 5c. verify each selected harness adapter against the boundary contract (real project; non-fatal) ---
+for _h in $HARNESS_LIST; do
+  if sh conformance/harness-adapter.sh "adapters/${_h}" >/dev/null 2>&1; then
+    echo "harness adapter '${_h}': conforms to the boundary contract."
+  else
+    echo "WARNING: harness adapter '${_h}' does NOT yet conform — close the gaps before you build:" >&2
+    echo "         run 'sh conformance/harness-adapter.sh adapters/${_h}' for the specifics." >&2
+    echo "         (The Inception-Done gate will block until it conforms.)" >&2
+  fi
+done
+
+# --- 6. next steps (the judgment incept does NOT automate) ---
+# Branch-protection guidance is platform-specific: branch-protection.sh / BRANCH-PROTECTION.md
+# use the GitHub API; on GitLab the protected-branches equivalent is adopter-owned (honest
+# coupling note — see docs/operations/ci-platforms.md).
+# --- ADOPTER-TREE-IDENTITY: say what was replaced, what was LEFT, and what is still owed ------------
+# Never a silent no-op: "incept did nothing to your SECURITY.md" is indistinguishable from a bug unless
+# incept says which of the three reasons applied.
+if [ -n "$RKO_REPLACED" ]; then
+  echo "replaced the kit's own${RKO_REPLACED} with your project's (they matched the digest the export recorded for the kit's copies)"
+  case "$RKO_REPLACED" in
+    *SECURITY.md*)
+      case "$CHANNEL_WHY" in
+        '')  echo "  SECURITY.md declares Channel repo: ${CHANNEL_REPO} (from your 'origin'). It is only LIVE once you"
+             echo "  enable private vulnerability reporting on that repo (Settings -> Code security)." ;;
+        no-origin)
+             echo "  ⚠ SECURITY.md still carries the [owner/repo] placeholder — this repo has no 'origin' remote yet."
+             echo "    Fill it in, and enable private vulnerability reporting on that repo." ;;
+        *)   echo "  ⚠ SECURITY.md still carries the [owner/repo] placeholder — your 'origin' is not GitHub, so the"
+             echo "    template's GitHub private-reporting channel needs a real contact instead: a security mailbox,"
+             echo "    or your forge's own private vulnerability reporting. Edit the 'Security contact:' line too." ;;
+      esac
+      [ -n "$CHANNEL_WHY" ] && echo "    Until you do, conformance/security-policy.sh FAILS on the unresolved placeholder — deliberately: a"
+      [ -n "$CHANNEL_WHY" ] && echo "    policy advertising private reporting with no reachable repo points a reporter nowhere." ;;
+  esac
+fi
+if [ -n "$RKO_LEFT" ]; then
+  echo "note: LEFT ALONE (treated as yours, never overwritten):${RKO_LEFT}"
+  if [ -f .kit-digests ]; then
+    echo "      Their contents do not match what this export recorded, so incept cannot prove they are the kit's."
+  else
+    echo "      This export carries no .kit-digests record, so incept cannot tell the kit's copies from yours."
+    echo "      Re-export with a current kit to get one. Until then, check them by hand: a SECURITY.md that"
+    echo "      still names the KIT's repo would route YOUR vulnerability reports to the kit author."
+  fi
+fi
+if [ -n "$RKO_NOTEMPLATE" ]; then
+  echo "warning: LEFT ALONE for a different reason —${RKO_NOTEMPLATE}: this export is MISSING the template incept" >&2
+  echo "         stamps them from. That is a gap in the export, not a judgement about your files. Re-export." >&2
+fi
+
+# SWAS-355: the agent-boundary lines, once, as advice (the person sees them before the first plain preflight). Advisory: a boundary FAIL never aborts incept.
+if [ -f scripts/preflight.sh ]; then
+  echo "agent boundary (advice; run 'sh scripts/preflight.sh' any time — an undeclared opt-out fails it):"
+  sh scripts/preflight.sh --boundary-only --boundary-advisory 2>&1 || true
+fi
+
+case "$CI" in
+  github) PROTECT_HINT="Protect main NOW — declare required checks in REQUIRED-CHECKS.md, then run scripts/branch-protection-apply.sh --replace on an unprotected main (first time), --apply once it is protected (see profiles/${STACK}/BRANCH-PROTECTION.md); verify with: sh conformance/branch-protection.sh" ;;
+  gitlab) PROTECT_HINT="Protect main NOW — in GitLab: Settings → Repository → Protected branches (require merge request + pipeline success + an approval rule). branch-protection.sh uses the GitHub API; the GitLab equivalent is adopter-owned — see docs/operations/ci-platforms.md." ;;
+esac
+print_epilogue

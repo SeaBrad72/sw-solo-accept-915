@@ -1,0 +1,117 @@
+# doc-markers.tsv — the MARKER TABLE read by conformance/doc-markers.sh.
+#
+# Each data line is ONE load-bearing marker: a tracked document must carry a phrase, and the check
+# names that marker when it goes missing. The table is the check's whole subject — the script has no
+# per-case knowledge at all — so adding a marker is a table row, never a new conformance/*.sh.
+#
+# FORMAT — one row per marker, exactly FIVE tab-separated fields. `#` comments and blank lines skipped.
+#
+#     <case>\t<file>\t<regex>\t<label>\t<scope>
+#
+#   case   the check name a verify.sh row and CI step invoke: `sh conformance/doc-markers.sh <case>`.
+#   file   repo-root-relative path of the document that must carry the marker.
+#   regex  POSIX ERE, CASE-SENSITIVE (grep -Eq). Escape ERE metacharacters you mean literally.
+#   label  the human name of the marker. It is the FAIL text (`FAIL: <label> (missing in <file>)`)
+#          AND the string --selftest requires the mutant to die by, so a label is load-bearing
+#          identity, not decoration: two rows must never share one.
+#   scope  `kit` — the document is the kit's OWN, so the case renders N/A on an adopter tree (no
+#                  docs/ROADMAP-KIT.md and none of the case's files present).
+#          `any` — the document is expected wherever the check runs; absence is a FAIL.
+#
+# --selftest generates, for EVERY row, a mutant that strips the matching lines from a fixture copy
+# and requires RED WITH THAT ROW'S LABEL. So a row that cannot be killed is a row that is not really
+# checked, and the sweep says which one.
+#
+# ── artifact-lineage (E11) — templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md still carries its six
+#    load-bearing fields: the chain tying a produced AI artifact back to the model + prompt + inputs
+#    + eval that made it. HONEST CEILING: the phrases are matched, so this proves the FIELDS are
+#    present, never that they are FILLED, nor that a real artifact's stated lineage is accurate
+#    (that is the signer's responsibility).
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Artifact version	artifact-lineage: 'Artifact version' field	kit
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Model ID \+ version	artifact-lineage: 'Model ID + version' field	kit
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Prompt/template version	artifact-lineage: 'Prompt/template version' field	kit
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Input dataset version	artifact-lineage: 'Input dataset version' field	kit
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Eval score	artifact-lineage: 'Eval score' field	kit
+artifact-lineage	templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md	Human sign-off	artifact-lineage: 'Human sign-off' field	kit
+#
+# ── gate-eval-secrets (E6-d / C5) — docs/operations/secrets-for-ai.md documents how the eval CI job
+#    obtains its live credential SAFELY (a short-lived OIDC-minted token, never an embedded key) and
+#    points at the non-waivable secret-scan gate. HONEST CEILING: the REFERENCE is proven present +
+#    load-bearing; no adopter's live OIDC/secrets-manager setup is verified, and nothing here scans
+#    for secrets (the required `secret-scan` gate does that).
+gate-eval-secrets	docs/operations/secrets-for-ai.md	gate-eval secret handling	gate-eval-secrets: 'gate-eval secret handling' section	kit
+gate-eval-secrets	docs/operations/secrets-for-ai.md	OIDC	gate-eval-secrets: OIDC-minted credential	kit
+gate-eval-secrets	docs/operations/secrets-for-ai.md	short-lived	gate-eval-secrets: short-lived credential	kit
+gate-eval-secrets	docs/operations/secrets-for-ai.md	never embedded	gate-eval-secrets: never-embedded rule	kit
+gate-eval-secrets	docs/operations/secrets-for-ai.md	secret-scan	gate-eval-secrets: secret-scan enforcement pointer	kit
+#
+# ── feedback-link-lifecycle (CP-7 Slice 8 / K13) — the KIT-FEEDBACK live-log link lifecycle is
+#    documented UPSTREAM so operators never author a link check-links.sh must reject: the log stays
+#    live-but-untracked until the synthesis commit, so cite findings by plain K-id until then.
+#    HONEST CEILING: proves the doctrine is documented, not that an operator obeys it live
+#    (un-gateable) — check-links.sh remains the runtime backstop.
+feedback-link-lifecycle	templates/KIT-FEEDBACK-TEMPLATE.md	untracked until the end-of-run synthesis commit	feedback: log untracked-until-synthesis-commit marker	any
+feedback-link-lifecycle	templates/KIT-FEEDBACK-TEMPLATE.md	cite it by its K-id as plain text, never a Markdown link	feedback: cite-by-K-id-not-a-link marker	any
+feedback-link-lifecycle	templates/BACKLOG-TEMPLATE.md	cite the finding by its plain K-id until the synthesis commit tracks	backlog: cite-plain-K-id-until-synthesis marker	any
+#
+# ── validation-terminal-state (CP-7 Slice 6 / K6) — the review loop documents the FAITHFUL-FAILURE
+#    third terminal state, and the two load-bearing surfaces stay CROSS-SURFACE COHERENT: the
+#    reviewing craft (skills/review/SKILL.md) and the declared-class structural input
+#    (templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md). Rows 5 and 7 share a phrase on purpose — the
+#    coherence claim IS that both surfaces carry it, so each has its own row and its own mutant.
+#    HONEST CEILING: proves the doctrine is documented + coherent, not that a live reviewer applies
+#    FAITHFUL-FAILURE correctly (un-gateable).
+validation-terminal-state	skills/review/SKILL.md	terminal state — FAITHFUL-FAILURE	review: FAITHFUL-FAILURE terminal state	any
+validation-terminal-state	skills/review/SKILL.md	subject-under-test	review: anti-contamination clause	any
+validation-terminal-state	skills/review/SKILL.md	originating backlog	review: route-to-originating-backlog	any
+validation-terminal-state	skills/review/SKILL.md	faithful methodology is the precondition	review: faithful-methodology precondition	any
+validation-terminal-state	skills/review/SKILL.md	validation / field-test	review: gated on declared TCC class	any
+validation-terminal-state	skills/review/SKILL.md	Task Context Contract	review: names the TCC as the class source	any
+validation-terminal-state	templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md	validation / field-test	tcc: validation class declared	any
+validation-terminal-state	templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md	subject-under-test	tcc: subject-under-test prohibition	any
+#
+# ── dod-precedence (DOD-SINGLE-SOURCE, PR 9 / D-240828-4) — DEVELOPMENT-STANDARDS.md §12 is the ONE
+#    drift-capable restatement of the Definition of Done in the shipped tree (it lists category
+#    names, not items) and it opens by DEFERRING to CLAUDE.md. This row pins that deferral in its
+#    exact bold-backticked form, so deleting or REWORDING it — turning the restatement back into an
+#    apparently-authoritative second source — reds CI with this row's label. The regex escapes `**`
+#    and the `.` deliberately: the unescaped form matches a bold-stripped or reworded line too, and
+#    the generated mutant battery cannot tell the weak regex from the strong one (both kill the
+#    deletion mutant), so the build carries a bold-stripped negative fixture beyond the battery.
+#    Scope `any`: `git archive HEAD` measured both documents SHIPPING to adopter trees (2026-08-31),
+#    where the precedence rule is exactly as load-bearing.
+#    HONEST CEILING: this pins PRECEDENCE, not content agreement. If CLAUDE.md adds or renames a DoD
+#    category, §12's category prose can drift silently — the deferral is what makes that drift
+#    harmless, because the restatement permanently declares itself subordinate.
+#    The name alternation: incept renames the principles doc and rewrites this very sentence to name
+#    ENGINEERING-PRINCIPLES.md (scripts/incept.sh), so both names are the deferral (SWAS-213).
+dod-precedence	DEVELOPMENT-STANDARDS.md	The authoritative checklist is in \*\*`(CLAUDE|ENGINEERING-PRINCIPLES)\.md`\*\*	dod-precedence: standards §12 defers to the authoritative checklist	any
+#
+# ── collected-not-gated (PREFLIGHT-DOCTOR-MERGE disposition, PR 9 / D-240828-4) — the one
+#    measurement instrument left (dora.sh) carries a header disclosure stating plainly that it is
+#    exercised by selftests, that NO CI gate consumes its output, and that it is run deliberately.
+#    (tier-value.sh and agent-scorecard.sh carried the same line until SWAS-619 removed them.)
+#    Removing the disclosure reds CI with that instrument's label, so the honesty is ENFORCED
+#    rather than merely declared. Scope `any`: `git archive HEAD` measured all three scripts
+#    SHIPPING to adopter trees (2026-08-31).
+#    The pattern is ANCHORED to `^# collected-not-gated:` — the bare token was satisfiable by ANY
+#    occurrence in the file (a mention in prose, a variable name), so the anchor is what makes the
+#    row assert the DISCLOSURE LINE rather than the word.
+#    HONEST CEILING: proves the disclosure LINE is present, never that it is TRUE — whether the
+#    instruments stay ungated is a property of ci.yml/verify.sh that no marker can see.
+#    SCOPE CONSEQUENCE (`any`, owner-ratified trade): an adopter who LEGITIMATELY deletes one of these
+#    instruments (dora.sh on a non-GitHub host, say) gets a hard RED from a disclosure check that has
+#    no waiver arm. Deliberate: the alternative — latching to N/A on absence — is a check that fails
+#    open exactly when a file goes missing.
+collected-not-gated	scripts/dora.sh	^# collected-not-gated:	collected-not-gated: dora.sh disclosure line	any
+#
+# ── adopter-claims-honest (ADOPTER-CLAIMS-HONEST) — three of the five false adopter-facing claims
+#    corrected 2026-09-07 are pinned by exact-sentence presence here (the other two — #2 GitLab
+#    coverage, #3 the ci-platforms.md coupling count — are DERIVED pins in
+#    conformance/gitlab-adoption-complete.sh and conformance/adopter-export-wired.sh, since a
+#    presence marker cannot catch those two claims silently drifting true-to-false again).
+#    HONEST CEILING: these rows prove the CORRECTED WORDS are present, not that the surrounding
+#    prose stays true — a NEW falsehood elsewhere in the same doc would not be caught here.
+adopter-claims-honest	docs/enterprise/compliance-crosswalk.md	Least-privilege OIDC in CI \(push-only provenance job\).*Kit-assisted \|	adopter-claims-honest: OIDC row relabeled Kit-assisted	any
+adopter-claims-honest	docs/operations/harness-adapters.md	already inside the guard-core set	adopter-claims-honest: AGENTS.md is inside guard-core, not outside it	any
+adopter-claims-honest	DEVELOPMENT-PROCESS.md	re-sync procedure for genuinely overlapping parallel work was proposed and	adopter-claims-honest: re-sync procedure named as rejected by its design sitting, not promised	any

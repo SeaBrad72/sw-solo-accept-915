@@ -1,0 +1,24 @@
+# aggregate-exclusions.txt — conformance/*.sh files that are NOT conformance checks.
+#
+# CP7R5-GATE-AUTHORITY. conformance/aggregate-coverage.sh partitions every conformance/*.sh into
+# exactly one of three categories, and FAILs on any file in none of them:
+#
+#   1. REGISTERED — named in conformance/verify.sh. The PORTABLE battery: adopters run it too, and
+#      every emitted pipeline now runs it (`verify.sh --require`).
+#   2. WORKFLOW   — named as a step in .github/workflows/*.yml. Enforced by the kit's workflows.
+#      Not always kit-only (SWAS-608): a workflow-only check some adopter uses still ships (for example
+#      kit-current.sh, promotion-readiness.sh, green-on-clone.sh) and sits on the export-orphan baseline in
+#      aggregate-coverage.sh; only a path that passed the seven tests of SWAS-608 is export-ignored by name.
+#   3. LIBRARY    — listed below. Sourced, never executed; not a check and has no verdict.
+#
+# Only category 3 needs a hand-maintained list — 1 and 2 are derived from the files themselves, so
+# they cannot drift out of date. An entry here is a claim that the file is NOT a check; if that ever
+# stops being true, the file must move to category 1 or 2 and its line here must be deleted.
+#
+# Format: <basename><TAB><reason>. A reasonless entry FAILs — an unreasoned exclusion is a silent
+# widening, which is the defect this file exists to prevent rather than commit.
+
+backlog-lib.sh	Sourced board-parser primitives shared by backlog-current.sh and backlog-presence.sh (KW6-A2 T1.1). Pure functions: no dispatch, no exit, no set -eu, no top-level side effects. Its own header states it is sourced, never run.
+wf-helpers.sh	Sourced helper functions for the conformance checks (single source of truth), the same pattern hooks use for guard-core.sh. Defines functions only, owns no shell options, has no --selftest and no verdict. Linted by shellcheck.sh like any other shell source.
+surface-lib.sh	Sourced SURFACE-TRIGGER predicates (has_data_surface, has_deploy_surface/has_service_surface, has_ai_surface, is_agentic, declares_sensitive) shared by the conditional readiness cases in conformance/readiness.sh — the single implementation of the five questions nine retired *-ready.sh files each answered with their own copy (CONFORMANCE-DOC-FAMILIES-MERGE, D-240828-4). Defines functions only: no dispatch, no exit, no set -eu, no top-level side effects, no verdict. It has no --selftest of its own by design (a conf file must never dispatch) — the original five predicates are graded through readiness.sh's --selftest, whose per-case no-surface fixture (must render N/A) and filled fixture (must render OK) fail immediately if a predicate over- or under-triggers, and whose _surface() fixture-maker returns 1 on an unknown predicate so a new one cannot land untested. has_deploy_surface's two K13 arms (GATE-SUBJECT-IS-THE-ADOPTERS-SYSTEM: a repo-root PaaS descriptor; a RUNBOOK/CLAUDE live-URL declaration) are ADDITIONALLY locked by conformance/surface-lib-wired.sh --selftest — readiness.sh's fixture-maker plants exactly one fixture per predicate name and so cannot exercise a second/third arm of the same predicate independently. Linted by shellcheck.sh like any other shell source.
+union-lib.sh	Sourced adapter-union primitives (kit_union_derive + kit_path_in_union) shared by agent-boundary.sh — the required control-plane-ratification gate — and promotion-readiness.sh, the --class seam every merge gate derives through (GUARD-PATH-ENUMERATION-INCOMPLETE S2 extracted BOTH the derivation and the matching authority so the two gates cannot re-fork the semantics one layer down). Defines functions only: no dispatch, no exit, no set -eu, no top-level side effects, no verdict. It has no --selftest of its own by design — its behaviour is graded through both consumers' selftests and by the census lock in promotion-readiness-wired.sh, whose drop-the-union-consult mutant kills it; the K15 `.kit/control-plane.conf` second source (GATE-SUBJECT-IS-THE-ADOPTERS-SYSTEM) is locked by the K15 legs in that same file's selftest (declared-path derivation, escalate-only/downgrade-impossible, OK-EMPTY). Linted by shellcheck.sh like any other shell source.

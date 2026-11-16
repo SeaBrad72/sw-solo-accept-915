@@ -1,0 +1,95 @@
+# [Project Name] — RUNBOOK
+
+> **Template.** Created at Inception; grow it at each release. Must enable a **cold resume** by another engineer or agent (DEVELOPMENT-STANDARDS.md §11). Fill every `[...]`.
+
+**Project:** [Project Name]
+**Last Updated:** [date]
+
+---
+
+## 1. Local setup
+- Prerequisites: [runtime + version, package manager, Docker/devcontainer]
+- Install: `[install command]`
+- Configure env: copy `.env.example` → `.env.local`, fill values (see §3)
+- Run locally: `[dev command]`
+
+## 2. Test / build
+- Test: `[test command]` · Coverage: `[coverage command]` (≥80%, 100% critical)
+- Lint / type-check: `[commands]`
+- Build: `[build command]`
+- **CI troubleshooting:** `kit selftests not re-run: …` in the job summary is expected on a PR that touches no control-plane path. To force the full battery, run `sh conformance/verify.sh --require` (no `--changed`); the weekly schedule also runs it in full, and the GitLab pipeline builds no changed-file list, so nothing in it asks for a skip.
+- **Test data:** [approach] *(data-handling projects — synthetic/masked/never-raw-prod; see `docs/operations/test-data-management.md`)*
+- **Data handling:** [classification · retention · deletion path] *(personal-data projects — `docs/enterprise/data-governance.md`)*
+
+## 3. Environment variables
+Documented in `.env.example` (committed, placeholders only). Required:
+- `[VAR]` — [purpose] — [where to obtain]
+
+## 4. Deploy
+- **Deploy-target contract:** map your platform to the six-point deploy contract — see `docs/adoption/DEPLOYMENT-ENVIRONMENT.md`; record your platform's answers in this section.
+- Target: [Vercel / Railway / container / …]
+- Promotion: Dev → QA → UAT → Prod (prod is human-gated — see `DEVELOPMENT-PROCESS.md` "Environments & promotion")
+- **Preview environments:** [approach] *(deployable services — per-PR isolated, safe test data, scoped creds, auto-teardown; see `docs/operations/preview-environments.md`)*
+- Trigger: [per-tier deploy trigger; e.g. CI green on PR → Dev; human approval → Prod]
+- Steps: `[deploy command(s)]`
+- Smoke test: after each deploy run the post-deploy smoke test (`[smoke test command]`) and record the result before declaring the release live — gates the **Definition of Deployable** (`conformance/definition-of-deployable.md`).
+- Network egress: default-deny via [k8s NetworkPolicy | cloud egress firewall | forward proxy] — enforced: [date]  <!-- The only reliable exfiltration defense (`docs/operations/egress-control.md`); run `sh conformance/egress-policy.sh` to check this declaration+attestation — nothing you receive runs it for you. If no outbound network, replace this entire line with: N/A — [reason] -->
+- Sandbox FS: read-only work-tree mounts ([mechanism]) — enforced: [date]  <!-- Agent FS scoped to the work tree (host secrets unreachable); see docs/operations/containment.md; run `sh conformance/containment-ready.sh` to check this declaration+attestation — nothing you receive runs it for you. If not applicable: replace with N/A — [reason] -->
+- Scoped tokens: OIDC->role, short TTL ([mechanism]) — enforced: [date]  <!-- Least-privilege, time-boxed credentials -->
+- Prod credentials: separate + break-glass ([mechanism]) — enforced: [date]  <!-- Agents never hold prod write creds; SoD -->
+- Cost governance: per-run budget + platform spend-cap ([Anthropic usage limit | harness budget]) — enforced: [date]  <!-- LLM/metered-API spend bounded by a declared budget + the platform cap; docs/operations/cost-governance.md; run `sh conformance/cost-governance-ready.sh` to check this declaration+attestation — nothing you receive runs it for you. If no metered external/LLM spend: N/A — [reason] -->
+- **Runaway kill-switch:** ceilings in `.kit/budget.conf`; the orchestration loop calls `scripts/runaway-guard.sh step --row <ROW>` (one budget per slice/row; a new row starts at zero; see `docs/operations/runaway-killswitch.md`).
+
+<!-- mode:enterprise -->
+**Container / Kubernetes deploy (if applicable):**
+- Image: built multi-stage & non-root in CI; pushed to GHCR on merge to `main` with a **digest-bound provenance attestation**.
+- Promote the **attested digest** (never a mutable tag) Dev → QA → UAT → Prod; production promotion is human-gated.
+- Apply `deploy/k8s/` (or `helm upgrade --install` with `deploy/helm/`); verify liveness/readiness probes pass.
+- Rollback: redeploy the previous digest (`kubectl rollout undo deployment/<name>` or re-apply the prior digest).
+<!-- /mode:enterprise -->
+
+#### Deploy-target fit rationale
+[why this platform fits THIS workload — cite the fit dimensions that drove the choice:
+statefulness, traffic pattern (spiky / scale-to-zero), latency/edge, ops burden, compliance/region,
+cost model, team familiarity. "It's what we ran before / the proven default" is NOT a fit reason —
+enforced by conformance/deploy-decision-integrity.sh against your RUNBOOK.]
+
+#### Maturity acknowledged
+[the chosen platform/topology's kit-maturity (worked / exercised / documented) — recorded so the
+fit-vs-maturity trade-off is explicit; see docs/adoption/DEPLOYMENT-ENVIRONMENT.md.]
+
+## 5. Rollback
+- Fastest path: [feature-flag off / redeploy previous / revert+redeploy]
+- Command: `[rollback command]`
+- Every release declares its rollback path before shipping (DEVELOPMENT-PROCESS.md §10).
+
+## 6. Disaster recovery
+- **RPO:** [< 24h default] · **RTO:** [< 4h default] — always fill these headline targets (replace the placeholders); for multi-criticality systems also fill the per-tier table below.
+- **Per-tier targets (multi-criticality systems, from the BIA — the file you create at `docs/continuity/BIA.md` from `templates/BIA-TEMPLATE.md`; it does not ship, and `sh conformance/readiness.sh dr-ready` looks for it once your project is data-backed):**
+
+  | Tier | RTO | RPO |
+  |------|-----|-----|
+  | [Critical] | [1h] | [15m] |
+  | [Standard] | [4h] | [24h] |
+
+- Backups: [cadence, location] · Restore verified: [date] (recurring-maintenance item — see `docs/continuity/backup-restore-drill.md`)
+
+## 7. Test accounts & credentials
+- [account/role] — [location of credentials, e.g. secrets manager path] (never commit secrets)
+
+## 8. Monitoring & alerting
+- Error tracking: [tool/link] · Health check: [endpoint] · Alerts: [what fires, to whom]
+<!-- mode:enterprise -->
+- **Resilience verification** *(deployable services — see `docs/operations/resilience-verification.md`)*: Load/soak tested: [date] · Fault-injection drill: [date]
+<!-- /mode:enterprise -->
+- **Observability** *(deployable services — Factor 14 / §3; verified by `conformance/readiness.sh observability-ready`)*: SLOs: [target] · Telemetry wired: [signals]
+<!-- mode:enterprise -->
+- **Agent observability** *(agentic projects — see `docs/operations/agentic-ops.md`; verified by `conformance/readiness.sh agentops-ready`)*: Agent-ops: [trace]
+<!-- /mode:enterprise -->
+
+## 9. Known issues / technical debt
+- [issue] — [impact] — [tracking link]
+
+---
+
+**Resume check:** could another engineer or agent take this project cold using only this file + README + the kit docs? If not, fill the gaps.

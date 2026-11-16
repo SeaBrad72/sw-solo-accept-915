@@ -1,0 +1,30 @@
+# Reference: GitHub binding for auto-tag-on-merge (OPT-IN). COPY this into your repo's
+# .github/workflows/ to auto-tag v<VERSION> on every push to main. The kit itself does NOT run
+# this — it tags manually with `sh scripts/release-tag.sh` after merge (see release-tag.md);
+# this is provided for adopters who choose full automation. Pin actions to a full SHA in your repo.
+name: release-tag
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+  # `actions: read` lets the provenance gate read this commit's own workflow-run conclusions.
+  # A `permissions:` block sets every UNLISTED scope to none, so without this line the token is
+  # present but forbidden — the query 403s and the gate reports a FAILED query (loud; and a refusal
+  # for anyone who has opted the RELEASE_TAG_PROVENANCE dial into enforce).
+  actions: read
+jobs:
+  release-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Auto-tag v<VERSION> on the merge commit (coherent, idempotent)
+        # `gh` is INSTALLED on GitHub-hosted runners but UNAUTHENTICATED by default, so the
+        # provenance gate's query fails and warns loudly on every run unless a token is exported.
+        # Supplying the job's own token makes the gate answer honestly instead of crying wolf.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/release-tag.sh

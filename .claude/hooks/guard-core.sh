@@ -1,0 +1,13090 @@
+#!/bin/sh
+# guard-core.sh — runtime-agnostic deny-matrix (the SINGLE SOURCE OF TRUTH).
+# Pure: no stdin parsing, no runtime-specific emit. Each check prints the "13: …"
+# reason to STDOUT and returns 1 (deny); returns 0 (allow) with no output.
+# Consumed by: .claude/hooks/guard.sh (Claude PreToolUse), hooks/pre-push (git),
+# scripts/kit-guard (CLI). See docs/operations/runtime-guards.md.
+# A SPEED BUMP, not a boundary — the real control is platform-owned
+# (docs/enterprise/platform-safety-boundary.md). POSIX sh; no `local` (dash-clean).
+
+selfedit_allowed() { [ "${KIT_GUARD_SELFEDIT:-0}" = "1" ]; }
+
+# SWAS-309 - S6R's admin-deny reason, printed from ONE place so the late S6R arm and the early G309-S6FIRST arm speak
+# the same bytes. Prints the dot-segment/percent reason when _S6_API_DQ=1, else the admin-merge reason; unsets _S6_API_DQ.
+_s6_admin_reason() {
+  if [ "${_S6_API_DQ:-0}" = 1 ]; then
+    unset _S6_API_DQ; printf '%s' "13: this gh api endpoint carries a dot-segment, or a percent-encoding that does not decode, under a MUTATING method - the guard cannot certify which route it reaches, and GitHub resolves both, so it is not certified and denies (trigger=api-endpoint). Spell the endpoint plainly: no %XX, no . or .. segment. A query string is fine (it is truncated), and capitals in an owner, repo or label name are normalised, not refused. (escape card R18b api-endpoint)"; return 0
+  fi
+  unset _S6_API_DQ; printf '%s' '13: gh pr merge --admin bypasses branch protection (incl. control-plane-ratification) - human-gated. The agent actuates via a NORMAL merge on a recorded authenticated GO (scripts/promotion-verify.sh actuate); the --admin bypass is a keystroke only the owner types. (escape card R35 admin-merge) The REST forms (gh api PUT/POST .../pulls/N/merge, protection or ruleset edits, repo DELETE) are the same bypass.'
+}
+
+# SWAS-301a - a refusal names ITS escape-card retry (`escape card R<n> <slug>`, or `escape card F-<x>`) or says "stop and
+# escalate", and never names the override (the human-only switch lives in docs/operations/runtime-guards.md, for a human
+# at their own terminal). The two kinds of pointer are emitted at the refusal's OWN site: a family with a sanctioned
+# retry spells its row inline; a family on the DECLARED no-retry list below calls `_guard_stop_pointer <family>`.
+# Nothing is ever appended by default, so a remedy can never be followed by "stop" unless its site was deliberately put
+# on this list. A family that is not on the list prints NOTHING, which leaves the refusal with no pointer at all, and the
+# build lock (NOH-P1 in conformance/agent-autonomy.sh) reds on it. Adding a family is a reviewed edit of this table.
+# The text of every pointer is locked there too: a row pointer plus the stop pointer on one refusal reds (NOH-P1), and a
+# stop pointer beside a remedy token (TIP:, Remedy:, NOTE:) reds (NOH-P3). `secret-read` / `secret-write` carry their
+# alternative (the template file) so the pointer does not contradict the reason's own advice; `truncation` (the Write tool
+# creates or replaces a file) and `push-main` (push a feature branch and open a PR) do the same for the two matrix reasons
+# whose old text already named a sanctioned alternative that no escape-card row carries.
+_GUARD_STOP_FAMILIES=' human-gated hooks-path mcp adapter unresolvable-path kit-base-replace clone-object-links secret-read secret-write truncation push-main '
+# The 278a dev-clone note (R29) starts empty at load, so an inherited environment value can never suppress the R30 pointer.
+_CP8B_G_NOTE=''
+_guard_stop_pointer() {
+  case "$_GUARD_STOP_FAMILIES" in
+    *" ${1:-} "*) : ;;
+    *) return 0 ;;
+  esac
+  case "$1" in
+    secret-read)
+      printf '%s' ' Next: read .env.example (or ask for a redacted value) instead; for the real secret, stop and escalate to the owner (escape card §Stop and escalate).' ;;
+    secret-write)
+      printf '%s' ' Next: write the template (.env.example) instead; for the real secret, stop and escalate to the owner (escape card §Stop and escalate).' ;;
+    truncation)
+      printf '%s' ' Next: use the Write tool to create a new file, or edit one you have read; for anything else, stop and escalate (escape card §Stop and escalate).' ;;
+    push-main)
+      printf '%s' ' Next: push a feature branch and open a PR instead; for anything else, stop and escalate (escape card §Stop and escalate).' ;;
+    *)
+      printf '%s' ' Next: stop and escalate. No escape-card row gives an agent a retry for this shape; tell the owner the command and this reason, and do not re-spell it (escape card §Stop and escalate).' ;;
+  esac
+}
+
+# control-plane paths an agent must never silently modify (guard integrity + gates).
+# scanner-config allowlists/ignores — an edit here can silently narrow a required gate (KW10):
+# .gitleaks.toml / .gitleaksignore / .publish-identifiers / .semgrepignore / .trivyignore / .checkov.yaml|.yml are
+# enumerated in the case below (both bare + */-prefixed forms). Honest ceiling: this covers
+# DEDICATED scanner-config files (path-matchable). Coverage thresholds embedded in SHARED
+# multi-purpose files (pyproject.toml, .golangci.yml) are NOT path-matchable without blocking the
+# whole file — that is a content-level problem, out of scope here.
+# is_control_plane_path <path> — CASE-INSENSITIVE since A2. On a case-INSENSITIVE filesystem (the
+# macOS default, and the kit's own development platform) `.Claude/hooks/guard-core.sh` resolves to the
+# REAL guard while a byte-literal match classified it `ordinary` — so the guard could be edited out of
+# the way by typing one capital letter, and the required §13 gate derived `ordinary` for it. Measured.
+#
+# STRICTLY FAIL-SAFE: folding can only ever ADD paths to the control-plane set, and no consumer treats
+# a `true` verdict as a grant (guard_check_path denies, is_control_plane_target denies,
+# promotion-readiness escalates). The cost is that a genuinely-distinct `Skills/` file on a
+# case-SENSITIVE filesystem is now treated as control-plane — a guard prompt, never a bypass.
+#
+# HOT PATH: this runs on every PreToolUse, twice per path. The literal `case` below is tried FIRST and
+# decides every all-lowercase path with zero subprocesses; only a path that actually contains an
+# uppercase byte AND missed the literal match pays one `tr`. `LC_ALL=C` + the explicit `A-Z`/`a-z`
+# ranges keep it byte-safe against a `tr` that maps I->dotless-i under a Turkish locale (a GNU or busybox
+# single-byte build; not measured here). Measured: macOS `tr` does NOT mis-map `I` there, and its UTF-8
+# fold maps Kelvin (U+212A) and dotted I (U+0130). `_kitbase_ref_denied` runs BOTH folds, so neither
+# behaviour opens a hole.
+#
+# CEILING: closes CASE variance only. It does NOT close Unicode normalization (NFC/NFD) or homoglyphs —
+# a related class, deliberately not claimed. Do not read this green as closing those.
+# _fs_case_insensitive: is THIS filesystem case-insensitive? Probed ONCE and cached — the fold's cost
+# and its false-positive risk both depend on the answer, and it cannot change mid-process. Uses `/tmp`
+# (POSIX-required to exist) with `$HOME` as a fallback; no files are written. A Linux box that happens
+# to have a real `/TMP` directory answers "insensitive" and simply folds more — the safe direction.
+_kit_fs_ci=""
+_fs_case_insensitive() {
+  if [ -z "$_kit_fs_ci" ]; then
+    _kit_fs_ci=0
+    # PROBE THE TREE WE ARE JUDGING, not `/` or `$HOME`. An earlier draft tested `/tmp` vs `/TMP` with a
+    # `$HOME` fallback, which answers for the WRONG VOLUME and is wrong in real setups: a repo on a
+    # case-insensitive disk image or a `+F` casefold ext4 directory under a case-sensitive `/`, a Linux
+    # container with a macOS bind mount, or a case-sensitive APFS volume mounted under a
+    # case-insensitive `/`. In each the probe said "sensitive" while the variant genuinely resolved.
+    # `.github` is present in this repo and in every incepted adopter, so it is a reliable in-tree
+    # anchor; `$PWD` is the fallback for a caller running outside a kit tree. No files are written and
+    # no env value steers the answer.
+    for _kfd in "." ".."; do
+      if [ -d "$_kfd/.github" ] && [ -d "$_kfd/.GITHUB" ]; then _kit_fs_ci=1; break; fi
+    done
+    if [ "$_kit_fs_ci" = 0 ] && [ -d "${PWD:-.}" ]; then
+      _kfu=$(printf '%s' "${PWD:-.}" | LC_ALL=C tr 'a-z' 'A-Z')
+      [ "$_kfu" != "${PWD:-.}" ] && [ -d "$_kfu" ] && _kit_fs_ci=1
+    fi
+  fi
+  [ "$_kit_fs_ci" = 1 ]
+}
+
+# is_control_plane_path <path> — case-insensitive since A2, in TWO tiers.
+#
+# WHY TWO TIERS. Folding everything unconditionally was measured to break three SHIPPED profiles:
+# `src/Adapters/Repo.cs`, `Adapters/Http/StripeAdapter.cs` and `Skills/Onboarding.cs` all derived
+# control-plane, and PascalCase directories are the language convention in profiles/dotnet,
+# profiles/java-spring and profiles/kotlin — `Adapters/` being the idiomatic ports-and-adapters folder.
+# On a case-SENSITIVE filesystem (every CI runner) that is not a guard prompt but a MERGE BLOCK on an
+# ordinary PR, clearable only with `--admin` — defeating §13 rather than enforcing it. The design's
+# stated cost ("rare, and only a guard prompt") was wrong on both halves.
+#
+#   TIER 1 — kit-owned names, folded ALWAYS. `.claude/`, `.github/`, `.git/`, the ENUMERATED `.kit/`
+#   confs (budget · roster · model-tiers · model-map · dials — a FILENAME enumeration, NOT a `.kit/`
+#   directory prefix; the earlier wording claimed a prefix the patterns never implemented, which is
+#   how `.kit/dials.conf` measured ORDINARY the day before it shipped), `codeowners`,
+#   `claude.md`, `development-*.md`, the named scripts, the scanner-ignore files. Nobody names
+#   application code `CLAUDE.md`, so there is no false-positive surface and these stay closed on EVERY
+#   platform. This is the tier the real attacks used (`.Claude/hooks/guard-core.sh`, `Claude.md`).
+#
+#   TIER 2 — generic directory prefixes (`conformance/`, `skills/`, `adapters/`, `agents/`, `scripts/`),
+#   folded ONLY on a case-insensitive filesystem. There the variant genuinely RESOLVES to the real
+#   directory, which is what makes it dangerous; on a case-sensitive filesystem `Adapters/` is simply a
+#   different directory and folding it would be a false positive with no corresponding risk.
+#
+# ⚠️ RESIDUAL, stated rather than hidden: a path committed on a case-SENSITIVE machine that would
+# collide on a case-INSENSITIVE checkout is classified on the CI runner's filesystem, not the
+# developer's. Tier 1 is unconditional precisely because that is where a cross-platform collision would
+# actually matter; Tier 2's residual is a generic directory an adopter has deliberately named.
+is_control_plane_path() {
+  _cpp_match "$1" && return 0
+  case "$1" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) : ;;
+    *) return 1 ;;
+    esac
+  _cppf=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z')
+  _cpp_kitowned "$_cppf" && return 0
+  _fs_case_insensitive && _cpp_match "$_cppf" && return 0
+  return 1
+}
+
+# TIER 1 set — kit-owned, unambiguous, folded on every platform.
+#
+# ⚠️ THE LINE IS DRAWN AT FILENAME GRANULARITY, NOT DIRECTORY GRANULARITY. The first cut of this split
+# put whole directories in Tier 2 (`skills/`, `conformance/`, `agents/`, `scripts/`) because
+# `Skills/Onboarding.cs` and `src/Adapters/Repo.cs` are plausible adopter code. But the ambiguity is in
+# the FILE, not the folder: no dotnet/java/kotlin adopter ships `Skills/review/SKILL.md`,
+# `Agents/reviewer.agent.md`, `Conformance/verify.sh` or `Scripts/promotion-verify.sh`. Drawing the line
+# at the directory left those classified ORDINARY on every Linux runner — a live §13 bypass (below) —
+# while buying no false-positive protection they needed.
+#
+# THE BYPASS THIS CLOSES, measured: an attacker opens a PR adding `Skills/incident-response/SKILL.md`.
+# On ubuntu-latest the class derived `ordinary`, `control-plane-ratification` posted GREEN "nothing to
+# ratify", and it merged under an ordinary review. Git then checks a NEW file at a case-variant path
+# out SILENTLY into the real directory on any case-insensitive clone — no collision warning, unlike an
+# existing file (which warns, and whose real content wins because the lowercase path sorts later). So
+# the attacker's file becomes a live agent-instruction surface carrying kit authority.
+#
+# `.claude/` IS A SEGMENT-ANCHORED FAMILY (GUARD-PATH-ENUMERATION-INCOMPLETE S1). It began as
+# `guard.sh`/`guard-core.sh` by name, so every other file in the hook directory derived `ordinary` —
+# measured: `.claude/hooks/entry-core.sh` -> ordinary, with Write, Edit and `sed -i` on it all ALLOWED.
+# That was cured for `hooks/` with a directory prefix; the SAME hole then measured live one level up:
+# `.claude/commands/*` and `.claude/plugins/*` both derived ordinary at 9d29406e (neither directory
+# exists yet, which is exactly why no census over tracked files could see them). The whole directory is
+# wired into settings.json as agent instrumentation, so ANY file in it is a live control-plane surface
+# an agent could author unratified. The family is the fix the per-directory prefix was a down payment
+# on: `.claude/*|*/.claude/*` — one rule, no list, and a sub-directory invented tomorrow is covered
+# before it exists.
+# THE ANCHOR IS THE POINT. `.claude/*|*/.claude/*` matches a full `.claude` PATH SEGMENT (at the start
+# or after a `/`), NEVER `*.claude/...`: the loose form also matched any component merely ENDING in
+# `.claude` — measured, `my.claude/hooks/x` and `src/mycompany.claude/hooks/z` both derived
+# control-plane. Those are ordinary adopter files, and an unnecessary control-plane classification is
+# an unnecessary ratification demand on an ordinary PR. The anchored family still captures a vendored
+# `vendor/pkg/.claude/hooks/h.sh` and, via this tier's unconditional fold, `.Claude/Hooks/Entry.sh`.
+# THE FOUR SIBLING `*.claude/...` PATTERNS ARE NOW GONE — deliberately, WITH the evidence the comment
+# they replace demanded. `*.claude/settings.json` · `*.claude/settings.local.json` ·
+# `*.claude/mcp-policy.json` · `*.claude/agents/*` each carried the identical `<x>.claude/...` false
+# positive (measured: `my.claude/settings.json`, `my.claude/mcp-policy.json`, `my.claude/agents/x.md`
+# all derived control-plane). The old note left them alone because narrowing four patterns on the file
+# that decides what may be edited at all is its own change — "its own fixtures, its own monotonicity
+# run, its own review". This slice IS that change: the sibling-relief ALLOW fixtures on BOTH routes and
+# the corner-spelling DENY fixtures live in conformance/agent-autonomy.sh, the fold-monotonicity sweep
+# runs over synthetic never-tracked family paths in promotion-readiness-wired.sh, and the pathhit
+# `.claude` leg is re-anchored in the same commit so the relief is not route-split.
+# ⚠️ COVERAGE WIDENS ONE STEP with the family: files sitting DIRECTLY in `.claude/` (`.claude/README.md`,
+# `.claude/settings.local.json`) are control-plane now where the enumeration reached only four names.
+# That is the intended direction — everything in the agent's own instrumentation directory is governing
+# — and it is fail-SAFE (a ratification demand, never a missed one). Fixtures record it explicitly so
+# it reads as a decision, not as drift.
+# ⚠️ THE RELIEF ARM BELOW IS FIRST ON PURPOSE, AND IT IS THE ONLY HOLE IN THE `.claude/` FAMILY.
+# GUARD-CLAUDE-HOME-INSTRUMENTATION-FP (design docs/architecture/2026-08-17-guard-claude-home-fp-design.md).
+# The family above is segment-anchored, so `*/.claude/*` matches ANY absolute path carrying a
+# `/.claude/` segment — including the agent harness's OWN home directory. Measured 2026-08-17, minutes
+# after S1 shipped: `~/.claude/projects/<p>/memory/*.md` (persistent agent memory) and
+# `~/.claude/plans/*.md` (plan mode) were guard-DENY on both the Edit and Write tool routes, which
+# broke the standing memory directive and plan mode in EVERY session wherever this hook is wired.
+# Those two subtrees are the agent's WORKSPACE, not its instrumentation. Everything else under
+# `.claude/` — settings.json, settings.local.json, mcp-policy.json, hooks/, agents/, commands/,
+# plugins/, skills/, workflows/, CLAUDE.md, statusline-command.sh (which the harness EXECUTES), and
+# every name invented tomorrow — stays family-denied: those are the user-level halves of the exact
+# permission surfaces PERMISSION-LOCAL-ACCRETION-SIGNAL monitors, and the categorical owner-keystroke
+# bright line. `tasks/`/`todos/` are deliberately NOT relieved: each addition is its own ratified
+# control-plane change, which is the correct friction direction.
+# POSIX `case` is FIRST-MATCH-WINS, so this arm must precede the family arm or it is inert.
+# ⚠️ IT MUST BE ADDED TO **BOTH** TIERS ATOMICALLY. Tier 1 ⊆ Tier 2 is the fold's soundness
+# invariant: relieving only here would leave Tier 1 NARROWER (harmless) while relieving only in
+# `_cpp_match` would leave Tier 1 BROADER — manufacturing control-plane-ness on the folded spelling.
+# A one-sided WIDENING confined to `_cpp_kitowned` is caught on every filesystem only by the
+# BRIGHTLINE-T1 predicate in conformance/promotion-readiness-wired.sh; a one-sided RELIEF in either
+# direction is caught by the relief ALLOW legs, the case-variant one FS-independently.
+# WHY THE RELIEF HALF NEEDS NO STRUCTURAL LEG (measured, and an earlier draft of this comment claimed
+# otherwise): once `_cpp_kitowned` returns 0 the wrapper returns control-plane IMMEDIATELY — the
+# conditional Tier-2 re-check below it never runs — so a relief missing from Tier 1 turns the
+# case-variant subject `…/.CLAUDE/PLANS/x.md` control-plane on a case-INSENSITIVE host too, not just
+# on CI. The WIDENING half is the genuinely FS-dependent one (vet C2): a widened Tier 1 hands the
+# subject back to that same re-check, which still denies on macOS, so it dies only on CI at the
+# verdict level — which is what BRIGHTLINE-T1 exists to cover.
+# ⚠️ THE RELIEF IS CLASSIFIER-ONLY, BY OWNER RULING (design §3, C1 = option (b)). The `_CP8B_PATHHIT_*`
+# regex legs deny DIRECTLY without ever consulting this function, so a non-read-verb shell spelling
+# (`sed -i`, `tee`, an interpreter's `open(...)`) aimed at a relieved name STILL denies. That is a
+# DISCLOSED RETAINED FALSE POSITIVE, fixtured in conformance/agent-autonomy.sh — the broken workflows
+# use the tool route exclusively, and this keeps the guard's hottest deny leg byte-untouched.
+# ⚠️ TWO FACES DISCLOSED RATHER THAN DISCOVERED: (i) the arm returns EARLY, so a family name nested
+# UNDER a relieved one (`.claude/projects/x/hooks/pre-push`) classifies ordinary — pinned as a
+# recorded decision, not drift; (ii) the relief is by subtree NAME, not location, so a repo that
+# TRACKED these subtrees would derive `ordinary` at `promotion-readiness --class` and merge without
+# control-plane ratification (pinned in promotion-readiness-wired.sh). $HOME-anchored patterns were
+# rejected as the alternative: env-dependent matching is the worse failure mode.
+_cpp_kitowned() {
+  case "$1" in
+    .claude/projects/*|*/.claude/projects/*|.claude/plans/*|*/.claude/plans/*) return 1 ;;
+    .claude/*|*/.claude/*|\
+    */.github/workflows/*|.github/workflows/*|*/.git/*|.git/*|.git|*/.git|\
+    .kit/budget.conf|*/.kit/budget.conf|.kit/roster.conf|*/.kit/roster.conf|\
+    .kit/model-tiers.conf|*/.kit/model-tiers.conf|.kit/model-map.conf|*/.kit/model-map.conf|\
+    .kit/dials.conf|*/.kit/dials.conf|\
+    .kit/ratification-seats.conf|*/.kit/ratification-seats.conf|\
+    .kit/control-plane.conf|*/.kit/control-plane.conf|\
+    .kit/tracker.conf|*/.kit/tracker.conf|\
+    .kit/boundary-optout.conf|*/.kit/boundary-optout.conf|\
+    .kit/ci-pre-approval.conf|*/.kit/ci-pre-approval.conf|\
+    codeowners|*/codeowners|claude.md|*/claude.md|\
+    development-standards.md|*/development-standards.md|\
+    development-process.md|*/development-process.md|\
+    agents.md|*/agents.md|\
+    required-checks.md|*/required-checks.md|\
+    waiver-register.md|*/waiver-register.md|\
+    .gitattributes|*/.gitattributes|\
+    */hooks/pre-push|hooks/pre-push|*/scripts/kit-guard|scripts/kit-guard|\
+    .gitleaks.toml|*/.gitleaks.toml|.gitleaksignore|*/.gitleaksignore|.publish-identifiers|*/.publish-identifiers|\
+    .semgrepignore|*/.semgrepignore|.trivyignore|*/.trivyignore|\
+    .checkov.yaml|*/.checkov.yaml|.checkov.yml|*/.checkov.yml|\
+    docs/governance/.meta-control-last|*/docs/governance/.meta-control-last|\
+    docs/governance/meta-control-log.md|*/docs/governance/meta-control-log.md|\
+    docs/governance/decisions.md|*/docs/governance/decisions.md|\
+    docs/governance/promotion-contract.md|*/docs/governance/promotion-contract.md|\
+    docs/governance/promotion-log.md|*/docs/governance/promotion-log.md|\
+    templates/project-readme-template.md|*/templates/project-readme-template.md|\
+    templates/project-claude-template.md|*/templates/project-claude-template.md|\
+    templates/runbook-template.md|*/templates/runbook-template.md|\
+    templates/required-checks-template.md|*/templates/required-checks-template.md|\
+    templates/security-template.md|*/templates/security-template.md|\
+    templates/decisions-template.md|*/templates/decisions-template.md|\
+    templates/waiver-register.md|*/templates/waiver-register.md|\
+    templates/model-map-template.conf|*/templates/model-map-template.conf|\
+    templates/backlog-template.md|*/templates/backlog-template.md|\
+    templates/jira-setup-template.md|*/templates/jira-setup-template.md|\
+    templates/tracker-setup-template.md|*/templates/tracker-setup-template.md|\
+    templates/threat-model-template.md|*/templates/threat-model-template.md|\
+    templates/privacy-review-template.md|*/templates/privacy-review-template.md|\
+    templates/ai-system-card-template.md|*/templates/ai-system-card-template.md|\
+    templates/ai-policy-template.md|*/templates/ai-policy-template.md|\
+    templates/ai-transparency-signoff-template.md|*/templates/ai-transparency-signoff-template.md|\
+    templates/a11y-signoff-template.md|*/templates/a11y-signoff-template.md|\
+    templates/bia-template.md|*/templates/bia-template.md|\
+    templates/uat-signoff-template.md|*/templates/uat-signoff-template.md|\
+    templates/postmortem-template.md|*/templates/postmortem-template.md|\
+    templates/review-record-template.md|*/templates/review-record-template.md|\
+    templates/plan-record-template.md|*/templates/plan-record-template.md|\
+    templates/feature-request-template.md|*/templates/feature-request-template.md|\
+    templates/task-context-contract-template.md|*/templates/task-context-contract-template.md|\
+    templates/opportunity-brief-template.md|*/templates/opportunity-brief-template.md|\
+    templates/shaping-doc-template.md|*/templates/shaping-doc-template.md|\
+    templates/kit-feedback-template.md|*/templates/kit-feedback-template.md|\
+    templates/ai-artifact-lineage-template.md|*/templates/ai-artifact-lineage-template.md|\
+    templates/eval-plan-template.md|*/templates/eval-plan-template.md|\
+    templates/test-plan-template.md|*/templates/test-plan-template.md|\
+    templates/field-report-template.md|*/templates/field-report-template.md|\
+    templates/restore-drill-template.md|*/templates/restore-drill-template.md|\
+    conformance/*.sh|*/conformance/*.sh|\
+    skills/*/skill.md|*/skills/*/skill.md|\
+    agents/*.agent.md|*/agents/*.agent.md|\
+    scripts/incept.sh|*/scripts/incept.sh|scripts/dora.sh|*/scripts/dora.sh|\
+    scripts/tracker-conf.sh|*/scripts/tracker-conf.sh|\
+    scripts/tracker-jira.sh|*/scripts/tracker-jira.sh|\
+    scripts/tracker-read.sh|*/scripts/tracker-read.sh|\
+    scripts/board.sh|*/scripts/board.sh|\
+    scripts/agent-scorecard.sh|*/scripts/agent-scorecard.sh|\
+    scripts/agent-trace.sh|*/scripts/agent-trace.sh|\
+    scripts/escalate.sh|*/scripts/escalate.sh|\
+    scripts/coverage-ratchet.sh|*/scripts/coverage-ratchet.sh|\
+    scripts/license-check.sh|*/scripts/license-check.sh|\
+    scripts/preflight.sh|*/scripts/preflight.sh|\
+    scripts/new-adapter.sh|*/scripts/new-adapter.sh|\
+    scripts/new-profile.sh|*/scripts/new-profile.sh|\
+    scripts/doctor.sh|*/scripts/doctor.sh|\
+    scripts/doctor-boundary.sh|*/scripts/doctor-boundary.sh|\
+    scripts/postmortem.sh|*/scripts/postmortem.sh|\
+    scripts/tier-advice.sh|*/scripts/tier-advice.sh|\
+    scripts/sparkwright|*/scripts/sparkwright|\
+    scripts/containment-audit.sh|*/scripts/containment-audit.sh|\
+    scripts/sod-check.sh|*/scripts/sod-check.sh|\
+    scripts/model-tier.sh|*/scripts/model-tier.sh|\
+    scripts/runaway-guard.sh|*/scripts/runaway-guard.sh|\
+    scripts/orchestrator-run.sh|*/scripts/orchestrator-run.sh|\
+    scripts/release-tag.sh|*/scripts/release-tag.sh|\
+    scripts/promotion-verify.sh|*/scripts/promotion-verify.sh|\
+    adapters/*/adapter.json|*/adapters/*/adapter.json|\
+    conformance/claims.tsv|*/conformance/claims.tsv|\
+    conformance/aggregate-exclusions.txt|*/conformance/aggregate-exclusions.txt|\
+    conformance/incept-manifests/*|*/conformance/incept-manifests/*|\
+    conformance/fixtures/*|*/conformance/fixtures/*|\
+    scripts/fixtures/*|*/scripts/fixtures/*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# ⚠️ TIER 1 MUST BE A STRICT SUBSET OF _cpp_match. The fold's only sound invariant is
+#   is_control_plane_path(p)  =>  is_control_plane_path(tolower(p))
+# i.e. folding may only ever PRESERVE control-plane-ness, never CREATE it. An earlier draft listed
+# `*.claude/*` and `*/.github/*` here while `_cpp_match` carried only `.github/workflows/*` and five
+# specific `.claude/` files — so Tier 1 was BROADER than the set it folds and manufactured new
+# classifications. Measured over all tracked files: `.github/ISSUE_TEMPLATE/*`,
+# `.github/PULL_REQUEST_TEMPLATE.md` and `.claude/README.md` flipped ordinary -> control-plane on EVERY
+# platform. Those are GitHub's own uppercase conventions, present in near-every adopter, so a PR editing
+# a bug-report template demanded non-author ratification — the merge block this whole split exists to
+# avoid, arriving through the tier that was supposed to be the safe one.
+# `conformance/invariant-fold-monotone` (promotion-readiness-wired.sh) now asserts the invariant over
+# every tracked path, because it is a PROPERTY, not an example — an anchor list cannot catch this.
+# ⚠️ THE TRACKED-FILE CENSUS IS BLIND WHERE THIS SLICE WORKS. `scripts/zz-*`, `.claude/commands/*`,
+# `profiles/zz-*` are not tracked (two of those directories do not exist at all), so a sweep over
+# `git ls-files` says nothing about them. The invariant is therefore ALSO asserted over synthetic,
+# never-tracked family paths — same check, explicit list — or the subset relation would be proven
+# only where it was never in doubt.
+
+# The pattern set, LOWERCASED. Both sides of the comparison are folded — the subject by the wrapper
+# above, the patterns here at authoring time. ⚠️ Every pattern in this list MUST stay lowercase: a
+# pattern carrying an uppercase byte can never match a folded subject, which would SILENTLY DECLASSIFY
+# it. That is not hypothetical — the first draft of this change kept `CODEOWNERS`, `CLAUDE.md`,
+# `DEVELOPMENT-STANDARDS.md` and `DEVELOPMENT-PROCESS.md` byte-identical and turned all four `ordinary`.
+# The `.claude/*` family is the IDENTICAL segment-anchored form Tier 1 carries (see the note above
+# `_cpp_kitowned`, which records the measurements behind it): Tier 1 must stay a strict subset of this
+# set, so the two patterns are kept byte-identical rather than merely equivalent.
+#
+# GUARD-PATH-ENUMERATION-INCOMPLETE S1 — THE DIRECTORY FAMILIES LIVE HERE, AND ONLY HERE.
+# `scripts/*|*/scripts/*` and `profiles/*|*/profiles/*` join `conformance/`, `skills/` and `adapters/`
+# in TIER 2 — deliberately NOT in `_cpp_kitowned`. Tier 1 folds on EVERY platform, so a generic
+# `scripts/` prefix there would fold `src/Scripts/Deploy.cs` into control-plane on case-SENSITIVE
+# Linux and reinstate the exact false-positive class the tier split was built to close (the same
+# measurement that produced `src/Adapters/Repo.cs` and `Skills/Onboarding.cs`). Tier 1 keeps its
+# per-NAME script entries as the unambiguous-filename floor; because the family lives only here, the
+# "Tier 1 ⊆ Tier 2" invariant above stops being self-satisfied and becomes a real proof.
+# WHY A FAMILY AT ALL: `scripts/` was protected per-file (~20 names), and the class demonstrated itself
+# live — `scripts/branch-protection-apply.sh` was born 2026-08-06 outside the hand list and was
+# guard-writable and mergeable as `ordinary` for ten days. `profiles/` carries the enforcement-bearing
+# surfaces an adopter's CI actually runs (`adopter-gates.yml`, `ratification.yml`, per-stack `ci.yml`,
+# `BRANCH-PROTECTION.md`), and any curated sub-list inside it would be the same defect reborn.
+# The DEEP arm (`*/scripts/*`, `*/profiles/*`) SHIPS on measurement, not on taste: `git archive HEAD`
+# retains 403 `profiles/` paths (no export-ignore entry) and `scripts/incept.sh` §5a4 keeps
+# `profiles/<STACK>/`, `ratification.yml` and `adopter-gates.yml`, so incepted adopter trees carry a
+# real `profiles/` root; the arm also catches the 14 tracked `profiles/*/scaffold/scripts/*` files.
+# ⚠️ DISCLOSED, NOT DISCOVERED LATER: "scripts" and "profiles" are far commoner directory names in an
+# adopter app tree than conformance/skills/adapters, so `frontend/scripts/build.js` and
+# `src/profiles/user.ts` become guard-DENY in ANY adopter tree where this hook is wired (byte-literal
+# on every platform — the case-conditioning only ever protects case-VARIANT spellings). Fail-safe by
+# direction, and the price is stated rather than waved at: ~37 profiles-touching commits/month
+# measured on the kit itself, all of which become dev-clone + ratification work.
+# ⚠️ THERE IS NO "OBSERVE MODE" ON THIS ROUTE, AND AN EARLIER DRAFT OF THIS COMMENT SAID OTHERWISE.
+# `LOOP_STATE_MODE` softens the CI class/loop-state route ONLY. This file has no mode knob of any
+# kind, and `.claude/` ships in the adopter export — so wherever the PreToolUse hook is wired, these
+# denies are UNCONDITIONAL from the first tool call. "Observe-mode adopters see advisories, not
+# blocks" was false here and is the kind of softener that turns a disclosed cost into a surprise.
+# The per-name `scripts/*.sh` entries below are now SUBSUMED by the family. They are kept, not pruned:
+# they are the byte-identical mirror of Tier 1's floor, and deleting entries from the list that decides
+# what may be edited at all is a change that would need its own evidence — not a tidy-up.
+# THE CURATED ROOT ADDITIONS, with the property named. `agents.md` (the roster-authority floor; the
+# file `incept` renames into the adopter's governing doc), `required-checks.md` (binds which CI
+# contexts block merge — the same enforcement-bearing class), and `.gitattributes` AT EVERY DEPTH
+# (`git archive` honors it per-directory, so a nested `docs/.gitattributes` flipping `export-ignore`
+# carries the identical export-control property; root-only would have been incomplete). `.gitignore` is
+# deliberately EXCLUDED — untracked files never export, so the property does not cover it.
+# ⚠️ HONEST CEILING: root-level governing files are NOT structurally derivable. This stays a curated
+# list, and a NEW root governing file still needs a list edit. The compensating detection is a
+# guard-vs-class census lock (S2), which is where "the list drifted" becomes a red instead of a probe
+# finding. Do not read the families above as covering this row.
+# THE HOME-INSTRUMENTATION RELIEF ARM IS MIRRORED HERE, BYTE-IDENTICALLY, AND FIRST
+# (GUARD-CLAUDE-HOME-INSTRUMENTATION-FP — the full rationale sits above `_cpp_kitowned`, where the
+# same arm leads Tier 1). Kept byte-identical rather than merely equivalent, exactly as the
+# `.claude/*` family patterns are, because Tier 1 ⊆ Tier 2 is asserted structurally and a relief
+# present in only one tier is the failure mode that check exists to catch. `case` is
+# first-match-wins: this arm must precede the family arm below or it is inert.
+_cpp_match() {
+  case "$1" in
+    .claude/projects/*|*/.claude/projects/*|.claude/plans/*|*/.claude/plans/*) return 1 ;;
+    .claude/*|*/.claude/*|\
+    docs/governance/.meta-control-last|*/docs/governance/.meta-control-last|\
+    docs/governance/meta-control-log.md|*/docs/governance/meta-control-log.md|\
+    docs/governance/decisions.md|*/docs/governance/decisions.md|\
+    docs/governance/promotion-contract.md|*/docs/governance/promotion-contract.md|\
+    docs/governance/promotion-log.md|*/docs/governance/promotion-log.md|\
+    templates/project-readme-template.md|*/templates/project-readme-template.md|\
+    templates/project-claude-template.md|*/templates/project-claude-template.md|\
+    templates/runbook-template.md|*/templates/runbook-template.md|\
+    templates/required-checks-template.md|*/templates/required-checks-template.md|\
+    templates/security-template.md|*/templates/security-template.md|\
+    templates/decisions-template.md|*/templates/decisions-template.md|\
+    templates/waiver-register.md|*/templates/waiver-register.md|\
+    templates/model-map-template.conf|*/templates/model-map-template.conf|\
+    templates/backlog-template.md|*/templates/backlog-template.md|\
+    templates/jira-setup-template.md|*/templates/jira-setup-template.md|\
+    templates/tracker-setup-template.md|*/templates/tracker-setup-template.md|\
+    templates/threat-model-template.md|*/templates/threat-model-template.md|\
+    templates/privacy-review-template.md|*/templates/privacy-review-template.md|\
+    templates/ai-system-card-template.md|*/templates/ai-system-card-template.md|\
+    templates/ai-policy-template.md|*/templates/ai-policy-template.md|\
+    templates/ai-transparency-signoff-template.md|*/templates/ai-transparency-signoff-template.md|\
+    templates/a11y-signoff-template.md|*/templates/a11y-signoff-template.md|\
+    templates/bia-template.md|*/templates/bia-template.md|\
+    templates/uat-signoff-template.md|*/templates/uat-signoff-template.md|\
+    templates/postmortem-template.md|*/templates/postmortem-template.md|\
+    templates/review-record-template.md|*/templates/review-record-template.md|\
+    templates/plan-record-template.md|*/templates/plan-record-template.md|\
+    templates/feature-request-template.md|*/templates/feature-request-template.md|\
+    templates/task-context-contract-template.md|*/templates/task-context-contract-template.md|\
+    templates/opportunity-brief-template.md|*/templates/opportunity-brief-template.md|\
+    templates/shaping-doc-template.md|*/templates/shaping-doc-template.md|\
+    templates/kit-feedback-template.md|*/templates/kit-feedback-template.md|\
+    templates/ai-artifact-lineage-template.md|*/templates/ai-artifact-lineage-template.md|\
+    templates/eval-plan-template.md|*/templates/eval-plan-template.md|\
+    templates/test-plan-template.md|*/templates/test-plan-template.md|\
+    templates/field-report-template.md|*/templates/field-report-template.md|\
+    templates/restore-drill-template.md|*/templates/restore-drill-template.md|\
+    */hooks/pre-push|hooks/pre-push|*/scripts/kit-guard|scripts/kit-guard|\
+    */.github/workflows/*|.github/workflows/*|*/codeowners|codeowners|*/.git/*|.git/*|.git|*/.git|\
+    .gitleaks.toml|*/.gitleaks.toml|.gitleaksignore|*/.gitleaksignore|.publish-identifiers|*/.publish-identifiers|\
+    .semgrepignore|*/.semgrepignore|.trivyignore|*/.trivyignore|\
+    .checkov.yaml|*/.checkov.yaml|.checkov.yml|*/.checkov.yml|\
+    conformance/*|*/conformance/*|adapters/*|*/adapters/*|\
+    skills/*|*/skills/*|\
+    scripts/*|*/scripts/*|\
+    profiles/*|*/profiles/*|\
+    agents.md|*/agents.md|\
+    required-checks.md|*/required-checks.md|\
+    waiver-register.md|*/waiver-register.md|\
+    .gitattributes|*/.gitattributes|\
+    scripts/fixtures/*|*/scripts/fixtures/*|\
+    scripts/incept.sh|*/scripts/incept.sh|scripts/dora.sh|*/scripts/dora.sh|\
+    scripts/tracker-conf.sh|*/scripts/tracker-conf.sh|\
+    scripts/tracker-jira.sh|*/scripts/tracker-jira.sh|\
+    scripts/tracker-read.sh|*/scripts/tracker-read.sh|\
+    scripts/board.sh|*/scripts/board.sh|\
+    scripts/agent-scorecard.sh|*/scripts/agent-scorecard.sh|\
+    scripts/agent-trace.sh|*/scripts/agent-trace.sh|\
+    scripts/escalate.sh|*/scripts/escalate.sh|\
+    scripts/coverage-ratchet.sh|*/scripts/coverage-ratchet.sh|\
+    scripts/license-check.sh|*/scripts/license-check.sh|\
+    scripts/preflight.sh|*/scripts/preflight.sh|\
+    scripts/new-adapter.sh|*/scripts/new-adapter.sh|\
+    scripts/new-profile.sh|*/scripts/new-profile.sh|\
+    scripts/doctor.sh|*/scripts/doctor.sh|\
+    scripts/doctor-boundary.sh|*/scripts/doctor-boundary.sh|\
+    scripts/postmortem.sh|*/scripts/postmortem.sh|\
+    scripts/tier-advice.sh|*/scripts/tier-advice.sh|\
+    scripts/sparkwright|*/scripts/sparkwright|\
+    scripts/containment-audit.sh|*/scripts/containment-audit.sh|\
+    scripts/sod-check.sh|*/scripts/sod-check.sh|\
+    .kit/budget.conf|*/.kit/budget.conf|\
+    .kit/roster.conf|*/.kit/roster.conf|\
+    .kit/model-tiers.conf|*/.kit/model-tiers.conf|\
+    .kit/model-map.conf|*/.kit/model-map.conf|\
+    .kit/dials.conf|*/.kit/dials.conf|\
+    .kit/ratification-seats.conf|*/.kit/ratification-seats.conf|\
+    .kit/control-plane.conf|*/.kit/control-plane.conf|\
+    .kit/tracker.conf|*/.kit/tracker.conf|\
+    .kit/boundary-optout.conf|*/.kit/boundary-optout.conf|\
+    .kit/ci-pre-approval.conf|*/.kit/ci-pre-approval.conf|\
+    scripts/model-tier.sh|*/scripts/model-tier.sh|\
+    scripts/runaway-guard.sh|*/scripts/runaway-guard.sh|\
+    scripts/orchestrator-run.sh|*/scripts/orchestrator-run.sh|\
+    scripts/release-tag.sh|*/scripts/release-tag.sh|\
+    scripts/promotion-verify.sh|*/scripts/promotion-verify.sh|\
+    agents/*.agent.md|*/agents/*.agent.md|\
+    development-standards.md|*/development-standards.md|\
+    development-process.md|*/development-process.md|\
+    claude.md|*/claude.md)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# --- CP-8c: dev-clone affordance ----------------------------------------------------
+# _resolve_physical "<path>": echo the physical (symlink-resolved) absolute path. Resolves the
+# DEEPEST EXISTING ancestor with `cd … && pwd -P` (collapsing `..`, symlinks, the macOS
+# /tmp->/private/tmp landmine) and re-appends the not-yet-existing tail.
+# SUBPROCESSES: `pwd -P` (CP-4's sanctioned one), plus `readlink` for the leaf loop below and `tr`
+# in _under_temp's folded arm — both added 2026-08-01 by GUARD-PATH-ALIAS-BYPASS. The earlier
+# "`pwd -P` is the one sanctioned subprocess" wording is superseded; leaving it would have been a
+# false certification of the same shape as the cp/hardlink one this slice also corrects. Both new
+# calls fail SAFE: an absent `readlink` returns 127 => `return 1` => callers deny.
+# ⚠️ It resolves the physical PARENT plus a symlink-resolved leaf — it does NOT detect HARDLINKS
+# (a hardlink has no link to follow; see GUARD-CP-HARDLINK-ALIAS).
+_resolve_physical() {
+  _rp=$1
+  case "$_rp" in
+    /*) : ;;
+    *) _rp="$(pwd)/$_rp" ;;
+    esac
+  # GUARD-PATH-ALIAS-BYPASS (P0): resolve a symlinked LEAF. The ancestor walk below never examines
+  # the final component, so a one-symlink leaf named innocuously reached any target unseen. Bounded
+  # at 64: SYMLOOP_MAX is 32 here, so exhaustion means adversarial, never deep-but-legitimate.
+  # Exit on "still a symlink" rather than on the counter, so a legitimate chain of exactly 64 that
+  # DID resolve is not refused. A relative target resolves against the LINK's own directory; `..`
+  # inside a target is left to `cd -P` and never collapsed textually. Failure => rc 1 => callers deny.
+  _n=0
+  while [ -L "$_rp" ] && [ "$_n" -lt 64 ]; do
+    _t=$(readlink "$_rp") || return 1
+    case "$_t" in
+      /*) _rp=$_t ;;
+      *) _rp="$(dirname "$_rp")/$_t" ;;
+      esac
+    _n=$((_n+1))
+  done
+  [ -L "$_rp" ] && return 1
+  [ "$_rp" = / ] && { printf '/'; return 0; }   # degenerate root; avoids a `//` result
+  _rpd=$(dirname "$_rp"); _rpb=$(basename "$_rp"); _rps=$_rpb
+  while [ ! -d "$_rpd" ]; do
+    _rpb=$(basename "$_rpd"); _rpd=$(dirname "$_rpd"); _rps="$_rpb/$_rps"
+    [ "$_rpd" = "/" ] && break
+  done
+  # `cd` (logical) canonicalises `..` against the path STRING before chdir, so a `..` following a
+  # symlink erases the symlink instead of following it — the original P0. `-P` chdirs physically.
+  _rpp=$(CDPATH='' cd -P "$_rpd" 2>/dev/null && pwd -P) || return 1
+  if [ "$_rpp" = / ]; then printf '/%s' "$_rps"; else printf '%s/%s' "$_rpp" "$_rps"; fi
+}
+
+# _under_temp "<physical_path>": 0 iff the path is under a HARDCODED temp root. The set is FIXED
+# and never read from $TMPDIR — reading an env var to WIDEN "disposable temp" is the fail-open
+# direction (a poisoned TMPDIR=$HOME would relax ~/.claude). Covers Linux /tmp, macOS
+# /private/tmp, and the macOS per-user temp (resolved: /private/var/folders/*/T/).
+_under_temp() {
+  case "$1/" in
+    /tmp/*|/private/tmp/*|/var/folders/*/T/*|/private/var/folders/*/T/*) return 0 ;;
+  esac
+  # GUARD-UNDER-TEMP-CASE: a case-folded SECOND arm, never a replacement. Folding only the subject
+  # against the list above would make its literal uppercase `T` unmatchable — and since a bare
+  # `mktemp -d` yields /var/folders/…/T/… on macOS, every dev-clone would stop relaxing while Linux
+  # CI (TMPDIR unset => /tmp) stayed green. Arm 1 is byte-identical to before and returns first, so
+  # this can only ever ADD a temp match. The short-circuit keeps the hot path subprocess-free —
+  # but with an EXPLICIT set, not `[A-Z]`: under a UTF-8 locale bash's range collation matches
+  # lowercase too, so `[A-Z]` fires on every path and spawns the very subprocess it exists to avoid.
+  # Measured — bash-as-/bin/sh matched "/tmp/foo"; dash did not. (Line 90 carries the same latent
+  # issue in a colder path; left alone here to keep this slice's diff to its own subject.)
+  case "$1" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) : ;;
+    *) return 1 ;;
+    esac
+  _ut=$(printf '%s/' "$1" | LC_ALL=C tr 'A-Z' 'a-z')
+  case "$_ut" in
+    /tmp/*|/private/tmp/*|/var/folders/*/t/*|/private/var/folders/*/t/*) return 0 ;;
+  esac
+  return 1
+}
+
+# guard_dev_clone_relaxable "<path>" "<protected_root>": return 0 IFF a control-plane edit to
+# <path> is safe to relax. THREE conditions, all physically resolved:
+#   1. <path> is UNDER a (hardcoded) temp root, AND
+#   2. <path> is OUTSIDE the protected repo root, AND
+#   3. the protected root is NOT itself under temp.
+# Condition 3 is load-bearing: when the protected tree is itself disposable (the mktemp'd export,
+# a CI checkout), a path escaping the root lands as a temp-SIBLING that satisfies 1+2 — condition 3
+# disables the affordance there, where there is no live control plane to protect anyway. A real
+# repo (~/Development/…) is never under temp, so the dev-clone case is unaffected.
+# SWAS-885 slice 1: two exclusions live in the CALLER, not here: guard_check_path turns the relax off for a path with a `.git`
+# component (_g885_dotgit_any) and runs the live-hooks-directory deny whatever the relax (_g885_live_hooks_hit).
+# Empty protected_root => 1 (fail-safe). A surviving `..` in the resolved path => 1 (an unresolved
+# tail that could escape back into root). Only the CALLER (guard_check_path) uses this, only to skip
+# the control-plane deny — never the secret or destructive denies.
+guard_dev_clone_relaxable() {
+  _dp=$1; _droot=$2
+  [ -n "$_droot" ] || return 1
+  _dphys=$(_resolve_physical "$_dp") || return 1
+  _drootp=$(_resolve_physical "$_droot") || return 1
+  [ -n "$_dphys" ] && [ -n "$_drootp" ] || return 1
+  # GUARD-PATH-ALIAS-BYPASS (P0): this predicate is the one that turns control-plane denies OFF, so
+  # it takes the CONJUNCTION — the LITERAL path must qualify too, not just the resolved one.
+  # Without it, leaf resolution carries an inside-root control-plane path out to temp, all three
+  # resolved-side conditions hold, and DENY flips to ALLOW. $_dp arrives RAW (:303) — absolutise and
+  # collapse `..` (the same fixpoint guard_check_path uses) or relative spellings sail past.
+  # NOT `|| is_control_plane_path "$_dp"`: _cp8c_relax is only read where that is already true, so
+  # the disjunct would be unconditionally true and disable the affordance entirely (measured).
+  _dpa=$_dp
+  case "$_dpa" in
+    /*) : ;;
+    *) _dpa="$(CDPATH='' pwd -P)/$_dpa" ;;
+    esac
+  _dpa=$(printf '%s' "$_dpa" | sed -e 's#//*#/#g' -e 's#/\./#/#g' -e ':a' -e 's#[^/]*/\.\./##' -e 'ta')
+  case "$_drootp" in
+    /) return 1 ;;
+    esac              # degenerate root: `//*` matches nothing
+  case "$_dpa/" in
+    "$_drootp"/*) return 1 ;;
+    esac     # literal inside the root => never relax
+  # The literal must ALSO be under temp. When it is not but the RESOLVED path is, the caller was
+  # addressing a genuine clone through a symlink from outside temp — a legitimate workflow that used
+  # to work. Flag it so guard_check_path can name the real-path remedy instead of falling through to
+  # the generic control-plane reason, whose only signposted escape is the global kill switch.
+  if ! _under_temp "$_dpa"; then
+    # Only promise the real-path remedy when that spelling would GENUINELY relax — i.e. when the
+    # affordance's OTHER conditions already hold: the root must not itself be under temp (condition
+    # 3), the resolved path must be outside the root (condition 2), and must carry no surviving
+    # `..`. Without these the message sends the operator to a spelling that also denies, and THAT
+    # denial's only signpost is the global kill switch — the endorsed-bypass class, one hop out.
+    if _under_temp "$_dphys" && ! _under_temp "$_drootp"; then
+      case "/$_dphys/" in
+        *"/../"*) : ;;
+        *) case "$_dphys/" in
+             "$_drootp"/*) : ;;
+             *) _cp8c_hint=symlinked-clone ;;
+           esac ;;
+      esac
+    fi
+    return 1
+  fi
+  case "/$_dphys/" in
+    *"/../"*) return 1 ;;
+    esac
+  _under_temp "$_drootp" && return 1          # condition 3: disposable root => affordance off
+  case "$_dphys/" in
+    "$_drootp"/*) return 1 ;;
+    esac  # condition 2: must be outside root
+  _under_temp "$_dphys" && return 0           # condition 1: target under temp
+  return 1
+}
+
+# =============================================================================================
+# GUARD-CP-HARDLINK-ALIAS — the guard resolves SYMLINKS but not HARDLINKS. A hardlink is a second
+# directory entry for one inode; there is no link to follow, so a benign-named hardlink's resolved
+# path IS the benign name and every union arm (literal ∨ normalised ∨ resolved) passes it. This adds
+# a RESOLVED-INODE disjunct to the same unions: if the resolved target shares its inode with a
+# control-plane or secret file reached by a different directory entry, it writes/reads THAT file, and
+# the name it is reached by does not change what it touches. (design 2026-08-18-guard-cp-hardlink-alias)
+# =============================================================================================
+
+# _is_secret_path "<path>" — the ONE source of truth for "is this a secret filename". Reproduces the
+# two arms every direct secret site carries: the byte-literal glob AND the case-folded arm (a
+# case-variant .ENV/.PEM on a case-insensitive filesystem reaches the same inode). Consolidated here
+# (GUARD-CP-HARDLINK-ALIAS §2c) from the eight inlined copies so the pattern cannot drift; the coupling
+# selftest in agent-autonomy.sh pins the alternation string byte-identical. The TEMPLATE allowlist is
+# deliberately NOT folded in — it stays byte-literal at each call site (never fold an allow matcher).
+_is_secret_path() {
+  case "$1" in
+    *.env|*/.env|*.env.*|*.pem|*.key|*id_rsa*|*/secrets/*|*/secret/*|secrets/*|secret/*) return 0 ;;
+  esac
+  case "$1" in
+    *[A-Za-z]*)
+    _isp=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z')
+    case "$_isp" in
+      *.env|*/.env|*.env.*|*.pem|*.key|*id_rsa*|*/secrets/*|*/secret/*|secrets/*|secret/*) return 0 ;;
+    esac ;;
+  esac
+  return 1
+}
+
+# _is_secret_hit "<path>" — the secret classifier the INODE check uses. Same as _is_secret_path but
+# with the TEMPLATE-NAME EXEMPTION (BUILD CONDITION A, vet round 2): the inode wrapper has no allowlist
+# in front of it, so without this a hardlinked `.env.example` whose only sibling is a benign file would
+# self-classify (its own returned name `.env.example` matches `*.env.*`) and over-deny every write/read
+# to a legitimate hardlinked template. A find-returned name that IS a template name does not count as a
+# secret hit; the cloak still denies because the REAL `.env` sibling is a non-template secret.
+_is_secret_hit() {
+  case "$(basename "$1" 2>/dev/null || printf '%s' "$1")" in
+    .env.example|.env.sample|.env.template|.env.dist) return 1 ;;
+  esac
+  _is_secret_path "$1"
+}
+
+# _nlink_of "<path>" — echo the target's hard-link count; rc 1 (echo nothing) when it cannot be a
+# number. BSD (`stat -f '%l'`, darwin) vs GNU (`stat -c '%h'`) branch: GNU form tried first because
+# BSD stat rejects `-c` (measured: "illegal option -- c"), while GNU stat's `-f` means --file-system
+# (a different datum), so the order matters. ⚠️ BUILD MANDATE (vet, HIGH): parse with the
+# DECLINE-ON-NON-DIGIT negated-class idiom — an empty/absent/non-digit count routes to fail-safe (the
+# caller treats rc 1 as "cannot count => run find / deny"), NEVER to a head-anchored positive match
+# that would let ""/"x" slip to the nlink==1 ALLOW.
+_nlink_of() {
+  _nl=$(stat -c '%h' "$1" 2>/dev/null) || _nl=$(stat -f '%l' "$1" 2>/dev/null) || _nl=''
+  case "$_nl" in
+    ''|*[!0-9]*) return 1 ;;
+    esac   # decline-on-non-digit (vet BUILD MANDATE)
+  printf '%s' "$_nl"
+}
+
+# _devino_of "<path>" — echo "<device> <inode>" (both decimal); rc 1 on any non-"digits SP digits".
+# Same BSD/GNU branch and the same decline-on-non-digit discipline as _nlink_of.
+_devino_of() {
+  _di=$(stat -c '%d %i' "$1" 2>/dev/null) || _di=$(stat -f '%d %i' "$1" 2>/dev/null) || _di=''
+  _dio_sp=' '
+  case "$_di" in
+    *[!0-9"$_dio_sp"]*|''|*' '*' '*) return 1 ;;   # exactly two space-separated digit fields
+  esac
+  case "$_di" in
+    *' '*) : ;;
+    *) return 1 ;;
+    esac
+  printf '%s' "$_di"
+}
+
+# _hl_physical_home — echo the PHYSICALLY-resolved $HOME (rc 1 + empty when $HOME is unset/unreadable).
+# ⚠️ H1 (reviewer, round 3): the cap MUST compare the PHYSICAL $HOME, not the raw env string. A
+# symlinked $HOME (e.g. HOME=/tmp/homelink -> /private/tmp/fakehome) never prefix-matches a
+# physically-resolved candidate, so a raw-env compare silently misses and reopens the `find $HOME` DoS.
+_hl_physical_home() { CDPATH= cd "${HOME:-/}" 2>/dev/null && pwd -P; }
+
+# _hl_at_or_above_home "<physical-path>" — rc 0 iff <physical-path> IS $HOME or an ancestor of $HOME
+# (then "$HOME/" glob-matches "$path"/*). Used to CAP both the derived AND the passed root (LOW-1):
+# a repo rooted at/above $HOME would scope a home-or-wider find. Empty/unreadable home => rc 1 (no cap).
+_hl_at_or_above_home() {
+  # NOT a fault boundary: `_hl_physical_home` is builtins only (cd, pwd), so there is no fork to protect, and a
+  # missing/unsearchable HOME legitimately fails - dash's `cd` returns 2 there (bash: 1), so an rc >= 2 test
+  # would fault a legitimate Read/Write. A failed fork of this `$(...)` itself aborts the shell, which the
+  # hardlink-cp / hardlink-secret boundaries around the caller already catch.
+  _hah_home=$(_hl_physical_home) || return 1
+  [ -n "$_hah_home" ] || return 1
+  case "$_hah_home/" in
+    "$1"/*) return 0 ;;
+    esac
+  return 1
+}
+
+# _hlink_repo_root "<path>" — derive the NEAREST ancestor of <path> containing .git or .claude
+# (GUARD-CP-HARDLINK-ALIAS §2d). ONLY reached when no protected root was PASSED (kit-guard CLI, older
+# adapters, and — until MEDIUM-1 threaded it — the read side); when a root is passed, that
+# authoritative, unsteerable value is used directly.
+# ⚠️ NEAREST, and CAPPED STRICTLY BELOW the PHYSICAL $HOME (H1). The earlier OUTERMOST climb was a DoS:
+# `~/.claude` EXISTS on a real machine, so for a repo under `~` the outermost ancestor became $HOME and
+# `find $HOME -inum` walked the ENTIRE home directory on the highest-frequency tool path. So: return
+# the NEAREST `.git`/`.claude` ancestor, and NEVER $HOME, any ancestor at/above $HOME, or `/`. If the
+# nearest boundary IS $HOME, or the walk reaches $HOME/`/` with no repo boundary strictly below,
+# derivation FAILS (rc 1) → the engine fail-safes to a HIT (deny) for that one nlink>1 target.
+_hlink_repo_root() {
+  _hrr=$1
+  case "$_hrr" in
+    /*) : ;;
+    *) _hrr="$(pwd)/$_hrr" ;;
+    esac
+  _hrhome=$(_hl_physical_home) || _hrhome=''
+  _hrd=$(dirname "$_hrr")
+  while : ; do
+    case "$_hrd" in
+      /) return 1 ;;
+      esac                       # reached / with no boundary => fail
+    if [ -n "$_hrhome" ]; then
+      # A candidate that IS $HOME or an ancestor of $HOME is disqualified — BEFORE the boundary test,
+      # so a repo at/above $HOME never scopes a home-or-wider find. Strictly-below or outside passes.
+      case "$_hrhome/" in
+        "$_hrd"/*) return 1 ;;
+        esac
+    fi
+    if [ -e "$_hrd/.git" ] || [ -d "$_hrd/.claude" ]; then printf '%s' "$_hrd"; return 0; fi
+    _hrd=$(dirname "$_hrd")
+  done
+}
+
+# _hl_find_inode "<root>" "<ino>" — echo the names sharing <ino> under <root> (standard prune),
+# guarded by a fail-safe WATCHDOG (reviewer I1, the durable class-closer). If the find exceeds
+# KIT_HL_FIND_BUDGET seconds it is KILLED and this returns rc 1 (=> the engine fail-safes to a
+# HIT/deny). `timeout(1)` is not portable (absent on macOS), so: the find runs in the background
+# writing a trap-cleaned temp file; a DISARM-FLAG watchdog kills it on expiry and can never kill a
+# REUSED pid (it checks the flag first). Any orphaned `sleep` self-terminates and finds its flag gone.
+_hl_find_inode() {
+  _hlf_root=$1; _hlf_ino=$2
+  _hlf_tmp=$(mktemp 2>/dev/null) || return 1
+  _hlf_arm="$_hlf_tmp.arm"; : > "$_hlf_arm" 2>/dev/null || { rm -f "$_hlf_tmp"; return 1; }
+  # ⚠️ Both background jobs MUST detach ALL inherited fds (</dev/null >/dev/null 2>&1). This engine is
+  # itself run inside a `$(...)` capture by the caller; a backgrounded job that inherits the capture's
+  # stdout pipe holds it open, so `$(...)` blocks for the FULL budget even when find returns instantly
+  # (measured: ~10s per check). find writes to its own temp file; the watchdog talks to no one.
+  if [ "${3:-}" = noprune ]; then   # H4-NOPRUNE: SWAS-278a (N7, L-a), the any-name search keeps the object store AND .git/lfs (a `clone --local` can hardlink either); only node_modules is pruned
+    find "$_hlf_root" -xdev \
+        \( -type d -name node_modules \) -prune \
+        -o -inum "$_hlf_ino" -print > "$_hlf_tmp" 2>/dev/null </dev/null &
+  else
+    find "$_hlf_root" -xdev \
+        \( -type d \( -path '*/.git/objects' -o -path '*/.git/lfs' -o -name node_modules \) \) -prune \
+        -o -inum "$_hlf_ino" -print > "$_hlf_tmp" 2>/dev/null </dev/null &
+  fi
+  _hlf_fpid=$!
+  ( sleep "${KIT_HL_FIND_BUDGET:-10}" 2>/dev/null; [ -f "$_hlf_arm" ] && kill "$_hlf_fpid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  _hlf_wpid=$!
+  if wait "$_hlf_fpid" 2>/dev/null; then _hlf_rc=0; else _hlf_rc=1; fi   # non-zero (error OR kill) => fail-safe
+  rm -f "$_hlf_arm"                          # DISARM: an orphaned sleep now finds the flag gone (no PID-reuse kill)
+  kill "$_hlf_wpid" 2>/dev/null || :         # best-effort reap of the watchdog subshell
+  wait "$_hlf_wpid" 2>/dev/null || :
+  if [ "$_hlf_rc" -eq 0 ]; then cat "$_hlf_tmp" 2>/dev/null; rm -f "$_hlf_tmp"; return 0; fi
+  rm -f "$_hlf_tmp"; return 1
+}
+
+# _hardlink_alias_hit "<resolved>" "<root>" "<classifier-fn>" — the engine. Returns rc 0 in TWO cases,
+# both of which the caller treats as a HIT (deny): a GENUINE hit echoes the (sanitized) offending path;
+# a FAIL-SAFE hit echoes NOTHING (empty). rc 1 = no alias (ALLOW), echoes nothing. So the caller
+# denies on rc 0 and picks its reason by whether the echoed name is non-empty (M1 — a DISTINCT
+# fail-safe reason, true for what may be an ordinary file). Fail-safe fires on any tooling anomaly
+# (stat/find cannot run, no root derivable, device mismatch, root at/above $HOME, or the find watchdog
+# timing out) — over-denying a resolvable target rather than silently opening the alias route.
+_hardlink_alias_hit() {
+  _ha_res=$1; _ha_root=$2; _ha_cls=$3
+  # 0. A hardlink requires an EXISTING file (a new-file Write, or an unresolved leaf, has no inode and
+  #    no aliases) — so a non-existent target is NOT a hit here (the string matchers already judge its
+  #    NAME). This must precede the stat fail-safe, or every write to a new path would over-deny.
+  [ -e "$_ha_res" ] || return 1
+  # 0b. GUARD-HL-REVIEW-FASTFOLLOW F1 — a DIRECTORY subject exits HERE, before the nlink pre-filter.
+  #    Every directory has st_nlink >= 2 (`.` + its parent entry + one per subdir), so step 1's cheap
+  #    exit NEVER fires for one; and guard.sh routes Grep/Glob `.tool_input.path` (usually a directory)
+  #    through guard_check_read, so the agent's highest-frequency search tools were paying mktemp + a
+  #    backgrounded repo-wide find + the watchdog subshell per call (~83ms measured).
+  #    SOUNDNESS — scoped to the SUPPORTED filesystems (ext*/xfs/btrfs/APFS): POSIX link() on a
+  #    directory is refused there, and BOTH classifier arms (is_control_plane_path, _is_secret_hit)
+  #    only ever name FILES, so a directory can never be the hardlink alias of a CP/secret file — the
+  #    skipped inode check is provably redundant for it. Legacy HFS+ DID allow directory hardlinks;
+  #    that is disclosed in docs/operations/runtime-guards.md. A directory named at a control-plane
+  #    path is still judged by the STRING matchers, which run outside this helper. Symlinked
+  #    directories are unaffected (symlinks resolve BEFORE this helper, which takes the resolved path).
+  #    The dir-swap-between-decision-and-write TOCTOU is §4 CEILING 2's existing class, not a new one.
+  [ -d "$_ha_res" ] && return 1
+  # 1. Fast pre-filter: link count. nlink<=1 => no alias => ALLOW (the subprocess-cheap common case).
+  #    On an EXISTING target a count that cannot be parsed is anomalous and fails safe to a HIT.
+  _ha_nl=$(_nlink_of "$_ha_res") || return 0
+  [ "$_ha_nl" -le 1 ] 2>/dev/null && return 1
+  # 2. The target's own (dev,ino). Fail-safe HIT if unreadable.
+  _ha_di=$(_devino_of "$_ha_res") || return 0
+  _ha_dev=${_ha_di%% *}; _ha_ino=${_ha_di##* }
+  # 3. Root: the PASSED protected root (live hook — authoritative) else derive the NEAREST repo
+  #    boundary strictly below $HOME (§2d). No derivable root fails safe to a HIT.
+  if [ -z "$_ha_root" ]; then
+    _ha_root=$(_hlink_repo_root "$_ha_res") || return 0
+  fi
+  # 3b. Cap the FINAL root — passed OR derived — at the PHYSICAL $HOME (LOW-1). A repo rooted AT $HOME
+  #     (or above) would `find $HOME`; resolve the root physically and fail safe to a HIT there. The
+  #     physical resolution also aligns the root with _res (both physical) for the scan below.
+  _ha_root=$(CDPATH= cd "$_ha_root" 2>/dev/null && pwd -P) || return 0
+  _hl_at_or_above_home "$_ha_root" && return 0
+  # 4. Device coherence (vet C3, MEDIUM). A hardlink cannot cross devices, so any alias is on _res's
+  #    device. If the root sits on a DIFFERENT device, do NOT skip (skip = no-hit = fail-OPEN): re-root
+  #    at _res's own repo (re-capped); if that is still cross-device, fail safe to a HIT.
+  _ha_rd=$(_devino_of "$_ha_root") || return 0
+  if [ "${_ha_rd%% *}" != "$_ha_dev" ]; then
+    _ha_root=$(_hlink_repo_root "$_ha_res") || return 0
+    _ha_root=$(CDPATH= cd "$_ha_root" 2>/dev/null && pwd -P) || return 0
+    _hl_at_or_above_home "$_ha_root" && return 0
+    _ha_rd=$(_devino_of "$_ha_root") || return 0
+    [ "${_ha_rd%% *}" = "$_ha_dev" ] || return 0
+  fi
+  # 5. Enumerate the inode's other names within the repo, on the one filesystem (-xdev), under the
+  #    fail-safe find WATCHDOG (I1). PRUNE ONLY the internally-hardlinked BULK that never shares an
+  #    inode with a worktree write-target: .git/objects, .git/lfs (vet C1 — the rest of .git, incl.
+  #    config/hooks/refs, is control-plane and STAYS in scope) and node_modules (vet C2 — DISCLOSED
+  #    residual). A find that errors OR exceeds the time budget fails safe to a HIT.
+  _ha_names=$(_hl_find_inode "$_ha_root" "$_ha_ino") || return 0
+  # 6. Classify each returned name whose DEVICE equals _res's (kills the inode-number-coincidence FP
+  #    across devices). A genuine hit echoes the sanitized path (LOW-3: strip control chars, cap length
+  #    — a newline in a filename would otherwise break the deny JSON).
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  _ha_ofs=$IFS; IFS='
+'
+  _ha_gf=0; case "$-" in
+    *f*) _ha_gf=1 ;;
+    esac
+  set -f
+  for _ha_p in $_ha_names; do
+    [ -n "$_ha_p" ] || continue
+    # rc 1 = unreadable name (a vanished file: skip it); rc >= 2 = fault, never a skipped alias name.
+    _ha_pdrc=0; _ha_pd=$(_devino_of "$_ha_p") || _ha_pdrc=$?
+    [ "$_ha_pdrc" -le 1 ] || _guard_fault hardlink-devino
+    [ "$_ha_pdrc" = 0 ] || continue
+    [ "${_ha_pd%% *}" = "$_ha_dev" ] || continue
+    if "$_ha_cls" "$_ha_p"; then
+      # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+      IFS=$_ha_ofs
+      [ "$_ha_gf" = 1 ] || set +f
+      printf '%s' "$_ha_p" | tr -d '\000-\037\177' | cut -c1-200
+      return 0
+    fi
+  done
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_ha_ofs
+  [ "$_ha_gf" = 1 ] || set +f
+  return 1
+}
+
+# Thin wrappers over the one engine (design §2b). BOTH forward the PASSED protected root ($2) — the
+# live hook's root is authoritative and unsteerable, and using it avoids the home-walk DoS entirely
+# (the engine only DERIVES when $2 is empty). The CP wrapper classifies with is_control_plane_path;
+# the SECRET wrapper with _is_secret_hit (template exemption). When no root is passed (kit-guard CLI),
+# the engine derives the NEAREST repo boundary strictly below the PHYSICAL $HOME.
+# _hardlink_root_alias_hit "<resolved>" "<root>": SWAS-278a (design §3.5, Sec-M5, N7), the RELAXED-path hardlink check. A dev-clone path is
+# relaxed for the control-plane denies, and the arms above are skipped for it (the gate in guard_check_path), so an Edit through a clone name
+# that is a hardlink to a root file used to write the ROOT's inode. For an existing relaxed file with more than one link this asks whether ANY
+# other name of its inode lies under the protected root (control-plane or not: the ruling forbids any hardlink reaching main), pruning only
+# node_modules (bulk that never shares an inode with a worktree write target); the object store and .git/lfs ARE searched. rc 0 = hit (echoes
+# the sanitized name; echoes nothing for the engine's fail-safe, which includes a printed name that cannot be confirmed), rc 1 = no alias. A
+# root on another device answers "no alias": an inode cannot be shared across devices. Both names inside the clone stay allowed.
+_hardlink_root_alias_hit() (
+  _hr_res=$1; _hr_root=$2
+  [ -e "$_hr_res" ] || return 1
+  [ -d "$_hr_res" ] && return 1
+  _hr_nl=$(_nlink_of "$_hr_res") || return 0
+  [ "$_hr_nl" -le 1 ] 2>/dev/null && return 1
+  _hr_di=$(_devino_of "$_hr_res") || return 0
+  _hr_rp=$(CDPATH= cd "$_hr_root" 2>/dev/null && pwd -P) || return 0
+  _hl_at_or_above_home "$_hr_rp" && return 0
+  _hr_rd=$(_devino_of "$_hr_rp") || return 0
+  [ "${_hr_rd%% *}" = "${_hr_di%% *}" ] || return 1
+  _hr_names=$(_hl_find_inode "$_hr_rp" "${_hr_di##* }" noprune) || return 0
+  _hr_bad=0
+  # the body is a subshell: the newline IFS and -f below end with it, and the walk is linear in the list (security M1)
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_cp8b_nl
+  set -f
+  for _hr_p in $_hr_names; do
+    [ -n "$_hr_p" ] || continue
+    _hr_pd=$(_devino_of "$_hr_p") || { _hr_bad=1; continue; }
+    [ "${_hr_pd%% *}" = "${_hr_di%% *}" ] || continue
+    printf '%s' "$_hr_p" | tr -d '\000-\037\177' | cut -c1-200
+    return 0
+  done
+  [ "$_hr_bad" = 1 ] && return 0   # H-LB-FAILSAFE
+  return 1
+)
+_hardlink_alias_hit_cp()     { _hardlink_alias_hit "$1" "$2" is_control_plane_path; }
+_hardlink_alias_hit_secret() { _hardlink_alias_hit "$1" "$2" _is_secret_hit; }
+
+# guard_check_read "<file>": deny reading SECRET material into the agent's context (the read half of
+# exfil, A8 family 6) — the secret then reaches the model provider / logs / a PR. Symmetric with the
+# secret-WRITE deny in guard_check_path but NARROWER: it does NOT deny control-plane reads (reading the
+# guard/CI to understand it is legitimate). Template env files (.env.example/.sample/.template/.dist)
+# are allowed; a single file_path means `*.env.*` is safe here (no multi-arg form to abuse). Honest
+# ceilings: an interpreter (python -c open()) bypasses the shell path, and jq-absent leaves Read allowed.
+guard_check_read() {
+  fp=$1
+  # MEDIUM-1 (round 3): the live hook now threads its PROTECTED_ROOT here as $2, so the read-side
+  # secret-inode check uses the AUTHORITATIVE, unsteerable root instead of always deriving (closes the
+  # live-read planted-`sub/.git` steer). Empty $2 (kit-guard CLI) keeps the nearest-derive fallback.
+  _gcr_root=${2:-}
+  base=$(basename "$fp" 2>/dev/null || printf '%s' "$fp")
+  # GUARD-PATH-ALIAS-BYPASS (P0): the read half was the variant proven reachable end to end — a
+  # renamed symlink returned a planted secret's contents through the real Read tool. Same union
+  # rule as the write side: allowlist on literal AND resolved; deny on literal OR resolved; a
+  # failure to resolve is itself a denial. The allowlist below short-circuits before everything,
+  # which is exactly why it must take the conjunction rather than either name alone.
+  _rres=''; _rrok=0
+  _rres=$(_resolve_physical "$fp") && _rrok=1 || _rrok=0
+  _rrbase=''; [ "$_rrok" = 1 ] && _rrbase=$(basename "$_rres" 2>/dev/null || printf '%s' "$_rres")
+  if ! selfedit_allowed && [ "$_rrok" = 0 ]; then
+    printf '13: path (%s) could not be resolved - refusing to read a target that cannot be identified.%s' "$fp" "$(_guard_stop_pointer unresolvable-path)"; return 1
+  fi
+  # GUARD-CP-HARDLINK-ALIAS (§2b): the secret-INODE check goes BEFORE the template allowlist (vet
+  # HIGH-1) — a single end-of-function placement would be dead code for the flagship cloak (a hardlink
+  # named `.env.example` onto a real `.env` satisfies the conjunctive allowlist and returns ALLOW
+  # first). Gated `! selfedit_allowed` only (there is no root on the read path; the wrapper derives it).
+  # Reads of CONTROL-PLANE files stay legitimate, so the read side denies ONLY on a secret hit — this
+  # closes the silent-exfil case a gate provably cannot catch. A non-empty name => a genuine secret
+  # hardlink; empty => the engine's fail-safe (M1: a DISTINCT, true reason, not the secret-specific one).
+  if ! selfedit_allowed && [ "$_rrok" = 1 ]; then
+    # rc 0 = hit (deny), rc 1 = no alias; rc >= 2 is a FAULT (a failed fork aborts the `$(…)`), never "no alias".
+    _hlrc=0; _hlnamed=$(_hardlink_alias_hit_secret "$_rres" "$_gcr_root") || _hlrc=$?
+    [ "$_hlrc" -le 1 ] || _guard_fault hardlink-secret-read
+    if [ "$_hlrc" = 0 ]; then
+      if [ -n "$_hlnamed" ]; then
+        printf '13: this path is a hardlink to secret material (%s) - reading it is the read half of exfil, human-gated. The name it is reached by does not change what it reads.%s' "$_hlnamed" "$(_guard_stop_pointer secret-read)"
+      else
+        printf '13: could not verify the target'\''s hardlink aliases (stat/find unavailable, timed out, or an ambiguous root) - denied fail-safe (refusing to read a target whose aliases cannot be confirmed). Remedy: usually an unreadable directory under the repo root, or a find that exceeded its time budget - the owner may make that directory searchable or raise the find budget (escape card R34 hardlink-unverified)'
+      fi
+      return 1
+    fi
+  fi
+  case "$base" in
+    .env.example|.env.sample|.env.template|.env.dist)
+      case "$_rrbase" in
+        .env.example|.env.sample|.env.template|.env.dist) return 0 ;;
+      esac ;;
+  esac
+  if ! selfedit_allowed; then
+    # GUARD-CP-HARDLINK-ALIAS §2c: the byte-literal + case-folded secret arms are consolidated into
+    # _is_secret_path (one source of truth, byte-identity-coupled). The template ALLOW above stays
+    # byte-literal (never folded), so a case-variant `.ENV.EXAMPLE` still falls through to this deny —
+    # the existing accepted over-deny (design §3/§4a). Deny MESSAGE stays here (literal wording).
+    if _is_secret_path "$fp"; then
+      printf '13: reading secret material (%s) into context is the read half of exfil (-> model/logs/PR) - human-gated.%s' "$base" "$(_guard_stop_pointer secret-read)"; return 1
+    fi
+    # …and the union on the RESOLVED target (both arms, via the same helper), so a benign name cannot
+    # front a secret file.
+    if [ "$_rrok" = 1 ] && _is_secret_path "$_rres"; then
+      printf '13: this path resolves to secret material (%s) - reading it is the read half of exfil, human-gated. The name it is reached by does not change what it reads.%s' "$_rres" "$(_guard_stop_pointer secret-read)"; return 1
+    fi
+  fi
+  return 0
+}
+
+# --- CP-8a: leading-verb discipline -------------------------------------------------
+# A segment's LEADING VERB decides whether its arguments are CODE or DATA. These two
+# commands contain identical bytes; only the verb tells them apart:
+#     bash -c "rm -rf /"          <- the argument is CODE   (a weapon)   -> must DENY
+#     grep -rn "rm -rf" scripts/  <- the argument is DATA   (a search)   -> must ALLOW
+# guard_read_only_command returns 0 ONLY for a command that is provably a SINGLE read-only
+# invocation; for everything else the destructive matrix below runs UNCHANGED on the RAW
+# command. It never rewrites or splits the command (see the closing note).
+#
+# INVARIANT (load-bearing): a verdict may only move DENY -> ALLOW when a safe lead is
+# POSITIVELY RECOGNIZED. An unknown lead strips nothing, so behaviour is byte-for-byte
+# today's. A bug here therefore fails CLOSED (over-denies), never OPEN.
+#
+# There is NO splitting: a shell metacharacter (; | & < > $ ( ) or backtick) ANYWHERE makes
+# the whole command non-exempt outright. That is why a quoted separator cannot trick the
+# exemption — it never parses the command into segments at all. Fail-closed.
+#
+# A segment is exempt ONLY if ALL of these hold:
+#   1. it contains no < > $ ( ) or backtick — a redirect can truncate a file even under a
+#      read verb (`echo -n > ci.yml`), and a command substitution smuggles code past it
+#      (`grep foo $(rm -rf /)`). Unparseable => never exempt.
+#   2. its first token carries no env-assignment (`GIT_EXTERNAL_DIFF=rm git diff`) and is not
+#      a wrapper — the lead must be the verb itself, plainly.
+#   3. that verb is in the STRICT set below: tools that write ONLY to stdout.
+# The set deliberately EXCLUDES every tool with a write/exec escape, exactly as the WS1 note
+# at guard_check_command already established — this is that vetted list, not a fresh one:
+#   sed  (`s///e` EXECUTES the pattern space; `w file` writes one)
+#   awk  (`system()`, `print > "file"`)
+#   find (`-exec` / `-delete`)
+#   sort (`-o file`)  ·  uniq (`uniq in out`)  ·  less/more (`!cmd`)  ·  xxd (`-r` writes)
+# Admitting any of them would hand the guard an arbitrary-execution primitive to save a
+# keystroke. `sed -n` stays denied; `head`/`tail` do the same job with no escape.
+# `git` is admitted only on subcommands that cannot destroy (NOT push/reset/clean/checkout);
+# `kit-guard` only on its read-only subcommands, so a guard slice can probe the guard.
+# Returns 0 (exempt) ONLY for a command that is provably a SINGLE read-only invocation.
+# It never REWRITES the command: on the non-exempt path the destructive matrix receives the
+# raw string byte-for-byte, so not one of its ~40 rules has its assumptions perturbed. (An
+# earlier draft split the command into segments and rejoined them with ';' — that destroyed
+# the pipe `curl x | sh` detects and the end-of-string `--admin` anchors on, silently turning
+# two DENY rules into ALLOW. Do not reintroduce rewriting.)
+guard_read_only_command() {
+  _c=$1
+  # 1. ANY separator, redirect, substitution, expansion or backtick => not a simple, single
+  #    invocation => never exempt. This is what makes the exemption safe rather than clever:
+  #    `grep foo && rm -rf /`, `grep foo $(rm -rf /)`, `echo -n > ci.yml` all fail here.
+  _gmq read-only-exempt "$_c" -q '[;|&<>$()`]' && return 1
+  # 2. the leading verb, plainly: strip only whitespace and a leading backslash. An
+  #    env-assignment prefix (`GIT_EXTERNAL_DIFF=rm git diff`) is not plainly a verb.
+  _lead=$(printf '%s' "$_c" | sed -E 's/^[[:space:]]*\\?[[:space:]]*//; s/[[:space:]].*$//')
+  _arg1=$(printf '%s' "$_c" | sed -E 's/^[[:space:]]*//; s/^[^[:space:]]+[[:space:]]+//; s/[[:space:]].*$//')
+  case "$_lead" in
+    *=*) return 1 ;;
+    # 3. STRICT set: tools that write ONLY to stdout. Deliberately EXCLUDES every tool with a
+    #    write/exec escape — exactly as the WS1 note below already established. This is that
+    #    vetted list, not a fresh one:
+    #      sed  (`s///e` EXECUTES the pattern space; `w file` writes one)
+    #      awk  (`system()`, `print > "file"`)   ·  find (`-exec` / `-delete`)
+    #      sort (`-o file`)  ·  uniq (`uniq in out`)  ·  less/more (`!cmd`)  ·  xxd (`-r`)
+    #    Admitting any of them would hand the guard an arbitrary-execution primitive to save a
+    #    keystroke. `sed -n` therefore stays denied; head/tail do the job with no escape.
+    grep|egrep|fgrep|rg|ls|cat|head|tail|wc|diff|stat|du|cut|tr|nl|od|hexdump|column|tac|comm|cmp|basename|dirname|realpath|readlink|echo|printf|which|type)
+      return 0 ;;
+    git)
+      # only subcommands that cannot destroy — NOT push/reset/clean/checkout.
+      case "$_arg1" in
+        # NOT diff|log|show — they honor --output=<file>, an arbitrary file WRITE via the
+        # diff machinery (see the git --output deny in guard_check_command). commit|status|
+        # blame|describe carry no such write flag.
+        commit|status|blame|describe) return 0 ;;
+      esac ;;
+    kit-guard|*/kit-guard)
+      # the guard's own read-only CLI, so a guard slice can probe the guard.
+      # ⚠️ GUARD-READONLY-FP-RELIEF structural finding S2 (2026-08-19, measured both ways, security
+      # vet L1): this clause is DEAD FOR CP-CLASSIFYING ARGUMENTS ONLY — STILL REQUIRED FOR BARE
+      # `kit-guard` PROBING. `guard_read_only_command` runs at the bottom of `guard_check_command`,
+      # AFTER the CP-8b control-plane block, so a `kit-guard path <control-plane-path>` has already
+      # been decided (and, before Arm A, denied) by the time control reaches here — which is why
+      # relief for that face is built in the CP arms (`_cp8b_tad_is_kit_query`) and NOT here.
+      # The clause is LIVE for the far more common probe whose argument is a destructive command
+      # rather than a path: `kit-guard cmd 'rm -rf /'` reaches this line and is exempted from the
+      # destructive matrix by it. Deleting it would break guard self-probing outright.
+      case "$_arg1" in
+        cmd|path|mcp) return 0 ;;
+      esac ;;
+  esac
+  return 1
+}
+
+# --- CP-8b: bind a verb/flag to its TARGET ------------------------------------------
+# The block this replaces matched the CO-OCCURRENCE of a mutation verb and a control-plane path
+# anywhere in the flat command string, and never asked whether the verb's TARGET was that path. Two
+# symmetric faces of that one missing relation:
+#   over-DENY : `cp conformance/x /tmp/b` (copying OUT) - both tokens present, so denied.
+#   over-ALLOW: `git archive -o conformance/x` (a real write) - `git archive` is not a mutation verb,
+#               and `mv conformance /tmp` (the BARE directory) - the path patterns all require a
+#               trailing slash, so they match a file INSIDE the dir and never the dir ITSELF.
+# See docs/architecture/2026-07-12-cp8-guard-ergonomics-design.md sections 7-13.
+#
+# INVARIANT (load-bearing, inherited from CP-8a): a verdict may move DENY -> ALLOW only where a safe
+# shape is POSITIVELY RECOGNIZED. Every relaxation below is an allow-back from the existing deny floor;
+# anything unrecognized keeps today's behavior. A bug here therefore fails CLOSED, never OPEN.
+
+# bare control-plane DIRECTORY names, for TARGET matching only. is_control_plane_path is deliberately
+# NOT widened: it also drives the Write/Edit path (guard_check_path), and this slice adds no blast
+# radius there. `mv conformance/ /tmp` was already denied; `mv conformance /tmp` was not - and that one
+# command relocates every gate in the repo.
+# CASE-INSENSITIVE since A2, for the same reason as is_control_plane_path and via the same two-step:
+# literal first (zero subprocesses for an all-lowercase target), fold only on an uppercase miss.
+# Measured before the fix: `mv skills /tmp/x` -> DENY but `mv Skills /tmp/x` -> ALLOW, and on a
+# case-insensitive filesystem that second command relocates the REAL skills/ directory — precisely the
+# command the comment above exists to deny. is_control_plane_path does NOT cover these: its patterns
+# are `skills/*`, which a bare directory name never matches.
+is_control_plane_target() {
+  is_control_plane_path "$1" && return 0
+  # GUARD-CP-WRITE-ROUTES Cure 1 (Route 1): normalize the subject through _cp8b_norm (collapse
+  # //, a /./ FIXPOINT, trailing /, leading ./, and .. traversal) before the exact-literal match,
+  # so a redundant-syntax spelling (hooks//pre-push, hooks/./pre-push, hooks/./././pre-push,
+  # x/../hooks/pre-push) can no longer evade it. The normalized value feeds is_control_plane_path
+  # AS WELL AS _ctm_match: the Route-1 exploit targets are FILES (hooks/pre-push, scripts/kit-guard,
+  # scripts/dora.sh) matched ONLY by is_control_plane_path — _ctm_match is bare-DIRECTORY names, so
+  # feeding _ctm_match alone would leave the file route open (K-N1b pins this line). Canonical-only:
+  # normalization collapses redundant syntax, it never reclassifies a genuinely-ordinary path.
+  _ct=$(_cp8b_norm "$1")
+  is_control_plane_path "$_ct" && return 0
+  _ctm_match "$_ct" && return 0
+  case "$_ct" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _ctm_match "$(printf '%s' "$_ct" | LC_ALL=C tr 'A-Z' 'a-z')" && return 0 ;;
+  esac
+  # GUARD-DENY-TRIO M1: a glob-spelled target whose literal prefix segment-intersects a protected leaf
+  # (`hooks/pre-pus*`, `AGENTS.m*`, `agents/*.agent.m*`) is a write to a governing file. Reached from the
+  # write-verb route (_cp8b_cp_target_in), the combined-redirect route (_cp8b_tad_redir_cp /
+  # _cp8b_redirect_hits_cp) and the bare-token walk (_cp8b_tok_is_cp) — one site covers all. Reads never
+  # reach here (read verbs' args are data). Fast-exits on a metachar-free target, so ordinary paths and
+  # the hot path are untouched; the broad-glob relief (`*`, `docs/*`, `build/out-*`) survives inside it.
+  _cp8b_glob_hits_cp "$1" && return 0
+  return 1
+}
+
+# Bare control-plane DIRECTORY names, LOWERCASED (see the _cpp_match warning: an uppercase byte in any
+# pattern here can never match a folded subject and would silently un-protect that directory).
+#
+# ⚠️ THIS IS THE FOURTH MATCHER, AND IT IS THE ONE A NEW DIRECTORY FAMILY IS MOST LIKELY TO MISS.
+# The C5 completeness discipline names THREE matcher sites (`is_control_plane_path` + the two pathhit
+# regex tiers); this list is a fourth, and it is invisible from all three because it holds BARE
+# directory names — `is_control_plane_path`'s patterns are `profiles/*`, which a bare `profiles` never
+# matches. GUARD-PATH-ENUMERATION-INCOMPLETE S1 shipped the `profiles/` family through the three named
+# sites and left this one out; measured on the shipped build, `mv profiles /tmp/x` and
+# `chmod -R 777 profiles` both ALLOWED while every file inside `profiles/` denied. That is the exact
+# hole the `mv conformance /tmp` note above records, reopened for a new family one release later: a
+# family is only as protected as its least-protected route, and the single command that relocates the
+# whole directory is the one worth the most to an attacker. ANY future directory family must be added
+# HERE as well as to `_cpp_match` and both pathhit tiers — four sites, not three.
+_ctm_match() {
+  case "$1" in
+    conformance|skills|adapters|agents|scripts|profiles|hooks|.claude|.github|.git|.kit|\
+    */conformance|*/skills|*/adapters|*/agents|*/scripts|*/profiles|*/hooks|*/.claude|*/.github|*/.git|*/.kit|\
+    templates|*/templates|governance|*/governance)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# GUARD-DENY-TRIO M1 — close the glob-spelled write-route evasion by LITERAL-PREFIX-ANCHORED,
+# SEGMENT-SAFE disqualification (design docs/architecture/2026-08-18-guard-deny-trio-design.md §3,
+# D-240816-1). A write-verb argument or combined-redirect target spelled as a glob (`hooks/pre-pus*`,
+# `AGENTS.m*`, `agents/*.agent.m*`) evades the exact-literal pathhit corpus: `hooks/pre-push` is a
+# full-filename leaf, so `hooks/pre-pus*` matches no exact pattern and ALLOWs. The cure denies a glob
+# token IFF, after Cure-1 normalization, its NON-EMPTY literal prefix segment-intersects a protected
+# leaf. NOT the naive `case "<leaf>" in <token>)` (design H-1, REJECTED): POSIX `case` lets `*` cross
+# `/`, so that shape denies `cp x.txt docs/*` (`docs/*` would match `docs/governance/…`). The SLASH-COUNT
+# guard in _cp8b_glob_scan is the H-1 lock — token and leaf must have equal slash counts, which makes a
+# `*` unable to consume a `/`, so the match is per-segment even though POSIX `case` is used.
+#
+# _CP8B_GLOB_LEAVES is the residual pathhit-T1 leaf set (the SAME protected NAMES is_control_plane_path
+# classifies — NOT a new enumeration of glob spellings, the D-240816-1 trap — the existing leaf NAMES
+# re-consulted prefix-wise). Directory-family members (.claude/ .github/ .git/ conformance/ skills/
+# adapters/ scripts/ profiles/) are DELIBERATELY ABSENT: a glob under them already pathhits
+# (`skills/[^space]*` matches `skills/foo*`), so they need no prefix consult. `agents/*.agent.md` is
+# the one glob-shaped leaf (agents/ is not a directory family — only `agents/*.agent.md` is protected),
+# kept as a glob and matched by _cp8b_glob_scan's DIRECTIONAL branch (§10 A3), NOT a raw `case` — a
+# raw `case "$leaf" in $token)` under-matched every CONCRETE-name glob (`agents/reviewer.agent.m*`).
+# A selftest cross-checks every entry is
+# is_control_plane_path-classified, binding this list to the authoritative corpus so it cannot drift to
+# a non-CP name. ⚠️ A NEW full-filename CP leaf OUTSIDE a directory family must be added HERE too — this
+# is the glob-write route's site, and for a `.kit/*.conf` it is one of the SIX the corpus block below
+# enumerates and `dt_corpus_ok` grades (CP-MATCHER-CORPUS-DERIVED; the older "a FIFTH alongside the
+# is_control_plane_path/_ctm_match/two-pathhit sites" wording undercounted, and the seats conf shipped
+# into the gap that undercount left). `_LC` mirrors _CP8B_PATHHIT_T1_LC: a lowercased
+# copy consulted on an uppercase-token miss (so `CODEOWNER*`, `AGENTS.m*`, `REQUIRED-CHECKS.m*` fold),
+# authored lowercase to match a folded subject.
+# ⚠️ ADOPTER-SAFETY CONSTRAINT (what _cp8b_glob_scan actually requires): a PATTERN leaf must be
+# single-dir-segment with the `*` in the FINAL path segment (the `dir/*.ext` shape, e.g.
+# `agents/*.agent.md`). A leaf with the glob NOT last, or a multi-segment-deep protected family, is NOT
+# covered by _cp8b_glob_scan and would silently UNDER-match — add such a family to the pathhit tiers /
+# _cpp_match instead, or extend _cp8b_glob_scan first. (The nested-depth residual is §10 A5.)
+# === CP-MATCHER-CORPUS-DERIVED — THE `.kit/` CONF CORPUS, DECLARED ONCE ==========================
+# ⚠️ THE C5 COMPLETENESS DISCIPLINE NAMES SIX SITES FOR A `.kit/*.conf`, NOT THREE, and the count is
+# the defect this declaration answers. `.kit/ratification-seats.conf` shipped in three of them
+# (`_cpp_kitowned`, `_cpp_match`, the glob leaves) and its own header said "all three matchers carry
+# it" — TRUE under that count. guard-core's C5 comment counts a DIFFERENT three
+# (`is_control_plane_path` + the two pathhit tiers), and the file was in NEITHER tier, so every
+# interpreter-form write to it (`python3 -c open(…,w)`, `perl -e`, `node -e`) measured ALLOW while the
+# identical forms on `.kit/dials.conf` denied. Two honest enumerations; the gap lived between them.
+# THE SIX SITES a `.kit/<name>.conf` must appear in:
+#   1. `_cpp_kitowned`   (case)      4. `_CP8B_GLOB_LEAVES_LC`  (lowercased copy)
+#   2. `_cpp_match`      (case)      5. `_CP8B_PATHHIT_T1`      (regex)
+#   3. `_CP8B_GLOB_LEAVES`           6. `_CP8B_PATHHIT_T1_LC`   (lowercased regex)
+# THIS LIST IS AN ORACLE, NOT A GENERATOR, and that is deliberate (D-240816-1's enumeration trap read
+# the other way round). Two of the six sites are POSIX `case` patterns, and a `case` cannot take its
+# alternation from a variable — so a runtime derivation would cover four sites and leave two
+# hand-maintained, which is precisely the drift it would claim to close. The sites stay literal; the
+# list is what `dt_corpus_ok` in conformance/agent-autonomy.sh grades them against, in BOTH directions
+# (a listed name missing from any site FAILS; a `.kit/*.conf` at any site missing from the list FAILS,
+# so a site cannot quietly grow past the list either), plus an on-disk leg over `git ls-files .kit/*.conf`.
+# It lives HERE, in the control plane, so no agent can widen the corpus silently.
+_KIT_CONF_CORPUS='budget roster model-tiers model-map dials ratification-seats control-plane tracker boundary-optout ci-pre-approval'
+# === ROOT-LEVEL CONTROL-PLANE LEAVES corpus (CP-MATCHER-CORPUS-ALL-FAMILIES) ======================
+# The third family that is named by hand at the same SIX sites: EVERY root-level control-plane leaf
+# named at the `case` sites (CLAUDE.md and the two DEVELOPMENT-* documents included) that belongs to
+# neither the `.kit/*.conf` corpus nor the governance-source corpus below. Real-case names, one per
+# leaf; `agents/*.agent.md` is the one PATTERN leaf (exactly one `*`, in the final segment — the shape
+# `_cp8b_glob_scan` handles and the shape `dt_root_corpus_ok` asserts). DECLARATION ONLY: nothing here
+# consults it at hook time. `dt_root_corpus_ok` in conformance/agent-autonomy.sh grades it against
+# the six sites (every listed leaf reachable at every site; every `_CP8B_GLOB_LEAVES` /
+# `_CP8B_GLOB_LEAVES_LC` token belongs to one of the three corpora), so a root name dropped from any one
+# site reds the battery. It lives HERE, in the control plane, so no agent widens or shrinks it silently.
+_ROOT_LEAF_CORPUS='hooks/pre-push docs/governance/meta-control-log.md docs/governance/.meta-control-last CODEOWNERS AGENTS.md REQUIRED-CHECKS.md WAIVER-REGISTER.md CLAUDE.md DEVELOPMENT-STANDARDS.md DEVELOPMENT-PROCESS.md .gitattributes .gitleaks.toml .gitleaksignore .publish-identifiers .semgrepignore .trivyignore .checkov.yaml .checkov.yml agents/*.agent.md'
+# === GOVERNANCE-SOURCE-FILES corpus (CONTROL-PLANE-COVERAGE slice 3c) ============================
+# The kit's OWN governing SOURCE files: the templates `incept`/`postmortem` stamp into an adopter's
+# charter, the templates a LIVE gate reads by path at runtime, and the three named governance
+# artifacts. The SUBJECT is the kit's SOURCE `templates/X` — never the adopter's stamped instance
+# (`docs/governance/THREAT-MODEL.md` stays ordinary; it is filled per feature at a different path).
+# Real-case names; `dt_gov_corpus_ok` in conformance/promotion-readiness-wired.sh grades this against
+# the SIX matcher sites in BOTH directions and folds each name for the four lowercase sites, and it
+# RE-DERIVES the incept `for _t` loop list (not the `${_t}` variable) so a stamp rename cannot silently
+# shrink coverage. `.kit/tracker.conf` is NOT here — it rides the `.kit/*.conf` corpus (`_KIT_CONF_CORPUS`
+# + `dt_corpus_ok`) with the other confs. It lives HERE, in the control plane, so no agent widens it silently.
+_GOV_SUBJECT_CORPUS='docs/governance/DECISIONS.md docs/governance/promotion-contract.md docs/governance/promotion-log.md templates/PROJECT-README-TEMPLATE.md templates/PROJECT-CLAUDE-TEMPLATE.md templates/RUNBOOK-TEMPLATE.md templates/REQUIRED-CHECKS-TEMPLATE.md templates/SECURITY-TEMPLATE.md templates/DECISIONS-TEMPLATE.md templates/WAIVER-REGISTER.md templates/MODEL-MAP-TEMPLATE.conf templates/BACKLOG-TEMPLATE.md templates/JIRA-SETUP-TEMPLATE.md templates/TRACKER-SETUP-TEMPLATE.md templates/THREAT-MODEL-TEMPLATE.md templates/PRIVACY-REVIEW-TEMPLATE.md templates/AI-SYSTEM-CARD-TEMPLATE.md templates/AI-POLICY-TEMPLATE.md templates/AI-TRANSPARENCY-SIGNOFF-TEMPLATE.md templates/A11Y-SIGNOFF-TEMPLATE.md templates/BIA-TEMPLATE.md templates/UAT-SIGNOFF-TEMPLATE.md templates/POSTMORTEM-TEMPLATE.md templates/REVIEW-RECORD-TEMPLATE.md templates/PLAN-RECORD-TEMPLATE.md templates/FEATURE-REQUEST-TEMPLATE.md templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md templates/OPPORTUNITY-BRIEF-TEMPLATE.md templates/SHAPING-DOC-TEMPLATE.md templates/KIT-FEEDBACK-TEMPLATE.md templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md templates/EVAL-PLAN-TEMPLATE.md templates/TEST-PLAN-TEMPLATE.md templates/FIELD-REPORT-TEMPLATE.md templates/RESTORE-DRILL-TEMPLATE.md'
+_CP8B_GLOB_LEAVES='hooks/pre-push docs/governance/meta-control-log.md docs/governance/.meta-control-last CODEOWNERS AGENTS.md REQUIRED-CHECKS.md WAIVER-REGISTER.md CLAUDE.md DEVELOPMENT-STANDARDS.md DEVELOPMENT-PROCESS.md .gitattributes .gitleaks.toml .gitleaksignore .publish-identifiers .semgrepignore .trivyignore .checkov.yaml .checkov.yml .kit/budget.conf .kit/roster.conf .kit/model-tiers.conf .kit/model-map.conf .kit/dials.conf .kit/ratification-seats.conf .kit/control-plane.conf .kit/tracker.conf .kit/boundary-optout.conf .kit/ci-pre-approval.conf docs/governance/DECISIONS.md docs/governance/promotion-contract.md docs/governance/promotion-log.md templates/PROJECT-README-TEMPLATE.md templates/PROJECT-CLAUDE-TEMPLATE.md templates/RUNBOOK-TEMPLATE.md templates/REQUIRED-CHECKS-TEMPLATE.md templates/SECURITY-TEMPLATE.md templates/DECISIONS-TEMPLATE.md templates/WAIVER-REGISTER.md templates/MODEL-MAP-TEMPLATE.conf templates/BACKLOG-TEMPLATE.md templates/JIRA-SETUP-TEMPLATE.md templates/TRACKER-SETUP-TEMPLATE.md templates/THREAT-MODEL-TEMPLATE.md templates/PRIVACY-REVIEW-TEMPLATE.md templates/AI-SYSTEM-CARD-TEMPLATE.md templates/AI-POLICY-TEMPLATE.md templates/AI-TRANSPARENCY-SIGNOFF-TEMPLATE.md templates/A11Y-SIGNOFF-TEMPLATE.md templates/BIA-TEMPLATE.md templates/UAT-SIGNOFF-TEMPLATE.md templates/POSTMORTEM-TEMPLATE.md templates/REVIEW-RECORD-TEMPLATE.md templates/PLAN-RECORD-TEMPLATE.md templates/FEATURE-REQUEST-TEMPLATE.md templates/TASK-CONTEXT-CONTRACT-TEMPLATE.md templates/OPPORTUNITY-BRIEF-TEMPLATE.md templates/SHAPING-DOC-TEMPLATE.md templates/KIT-FEEDBACK-TEMPLATE.md templates/AI-ARTIFACT-LINEAGE-TEMPLATE.md templates/EVAL-PLAN-TEMPLATE.md templates/TEST-PLAN-TEMPLATE.md templates/FIELD-REPORT-TEMPLATE.md templates/RESTORE-DRILL-TEMPLATE.md agents/*.agent.md'
+_CP8B_GLOB_LEAVES_LC='hooks/pre-push docs/governance/meta-control-log.md docs/governance/.meta-control-last codeowners agents.md required-checks.md waiver-register.md claude.md development-standards.md development-process.md .gitattributes .gitleaks.toml .gitleaksignore .publish-identifiers .semgrepignore .trivyignore .checkov.yaml .checkov.yml .kit/budget.conf .kit/roster.conf .kit/model-tiers.conf .kit/model-map.conf .kit/dials.conf .kit/ratification-seats.conf .kit/control-plane.conf .kit/tracker.conf .kit/boundary-optout.conf .kit/ci-pre-approval.conf docs/governance/decisions.md docs/governance/promotion-contract.md docs/governance/promotion-log.md templates/project-readme-template.md templates/project-claude-template.md templates/runbook-template.md templates/required-checks-template.md templates/security-template.md templates/decisions-template.md templates/waiver-register.md templates/model-map-template.conf templates/backlog-template.md templates/jira-setup-template.md templates/tracker-setup-template.md templates/threat-model-template.md templates/privacy-review-template.md templates/ai-system-card-template.md templates/ai-policy-template.md templates/ai-transparency-signoff-template.md templates/a11y-signoff-template.md templates/bia-template.md templates/uat-signoff-template.md templates/postmortem-template.md templates/review-record-template.md templates/plan-record-template.md templates/feature-request-template.md templates/task-context-contract-template.md templates/opportunity-brief-template.md templates/shaping-doc-template.md templates/kit-feedback-template.md templates/ai-artifact-lineage-template.md templates/eval-plan-template.md templates/test-plan-template.md templates/field-report-template.md templates/restore-drill-template.md agents/*.agent.md'
+
+# _cp8b_glob_scan "<token>" "<leaf-list>": 0 iff <token> (a glob pattern, already normalized/folded)
+# segment-safe intersects a leaf. Slash-count equality per leaf (pure parameter-expansion counter, no
+# fork) forbids `*` from crossing `/`. TWO leaf shapes:
+#   • CONCRETE leaf (no metachar): `case "$leaf" in $token)` — the token-glob matches the literal leaf.
+#   • PATTERN leaf (`agents/*.agent.md`, carrying its OWN `*`): the raw `case` above UNDER-matches — a
+#     literal `*` in the SUBJECT aligns only a token whose metachar sits at the same spot, so a
+#     CONCRETE-name glob like `agents/reviewer.agent.m*` (which expands onto the real `.agent.md` file)
+#     slipped (GUARD-DENY-TRIO §10 A3, both review seats). Instead do a DIRECTIONAL glob-intersection:
+#     split the leaf at its `*` into LP (`agents/`) and LS (`.agent.md`); the token DENIES iff its
+#     DIRECTORY segment glob-intersects the leaf's literal dir (leaf-dir as SUBJECT / token-dir as
+#     PATTERN, so a dir metachar like `ag*`/`agent?`/`agen[t]s` that expands onto `agents/` still
+#     commits — §10 A4) AND its BASENAME COMMITS ITS LITERAL to LS — some suffix that STARTS WITH LS's
+#     first byte glob-matches LS (`case "$LS" in <suffix>)`). The starts-with-LS[0] anchor is the
+#     non-overshoot lock: a bare trailing `*` never starts with `.`, so `agents/foo*` and
+#     `ag*/notes.txt` (broad globs that do NOT spell `.agent…`) stay ALLOW — `agents/` is NOT a blanket
+#     CP prefix; only the `*.agent.md` family is. slash-count equality keeps both single-segment (no
+#     `*` crosses `/`). The leaf word-split runs under `set -f`.
+_cp8b_glob_scan() {
+  _gsn=0; _gsr=$1; while : ; do case "$_gsr" in
+    */*) _gsn=$((_gsn+1)); _gsr=${_gsr#*/} ;;
+    *) break ;;
+    esac; done
+  _gsg=0; case "$-" in
+    *f*) _gsg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split of the leaf list; globbing disabled above
+  for _gl in $2; do
+    _gln=0; _glr=$_gl; while : ; do case "$_glr" in
+      */*) _gln=$((_gln+1)); _glr=${_glr#*/} ;;
+      *) break ;;
+      esac; done
+    [ "$_gsn" = "$_gln" ] || continue
+    case "$_gl" in
+      *[*?[]*)
+        # PATTERN leaf: directional glob-intersection (see header). Split the leaf at its first metachar
+        # into LP (dir, incl trailing /) and LS (literal suffix); split the TOKEN at its LAST / into a
+        # directory segment and a basename.
+        _glp=${_gl%%[*?[]*}; _gls=${_gl#*[*?[]}
+        case "$1" in
+          */*) _gtd=${1%/*}; _gtb=${1##*/} ;;
+          *) continue ;;
+          esac
+        # The token's DIRECTORY segment must glob-INTERSECT the leaf's literal dir (leaf-dir as SUBJECT,
+        # token-dir as PATTERN — the concrete-leaf branch's own shape), so a DIR-segment metachar
+        # (`ag*`, `agent?`, `agen[t]s`) that expands onto `agents/` still commits. The first A3 cut
+        # anchored LP as a LITERAL (`case "$1" in "$LP"*`) and evaded on exactly those spellings
+        # (§10 A4). slash-count equality already bounds both to a single dir segment, so POSIX `*`
+        # cannot cross a `/` here — no H-1 over-deny (`ag*/notes.txt` stays ALLOW via the LS test below).
+        # shellcheck disable=SC2254  # $_gtd is a DELIBERATE glob pattern (the token's dir segment)
+        case "${_glp%/}" in
+          $_gtd) : ;;
+          *) continue ;;
+          esac
+        # …AND the token's BASENAME must COMMIT its literal to LS: some suffix that STARTS WITH LS's
+        # first byte glob-matches LS. The starts-with-LS[0] anchor is the non-overshoot lock — a bare
+        # trailing `*` never starts with `.`, so `<dir>/notes.txt` and `<dir>/foo*` stay ALLOW.
+        _gl0=${_gls%"${_gls#?}"}
+        _gss=$_gtb
+        while [ -n "$_gss" ]; do
+          case "$_gss" in
+            "$_gl0"*)
+              # shellcheck disable=SC2254  # $_gss is a DELIBERATE glob pattern (a token-basename suffix)
+              case "$_gls" in
+                $_gss) [ "$_gsg" = 1 ] || set +f; return 0 ;;
+                esac ;;
+          esac
+          _gss=${_gss#?}
+        done ;;
+      *)
+        # shellcheck disable=SC2254  # $1 is a DELIBERATE glob pattern (the proposed write token)
+        case "$_gl" in
+          $1) [ "$_gsg" = 1 ] || set +f; return 0 ;;
+        esac ;;
+    esac
+  done
+  [ "$_gsg" = 1 ] || set +f
+  return 1
+}
+
+# _cp8b_glob_hits_cp "<token>": 0 (DENY) iff <token> is a glob whose non-empty literal prefix segment-
+# intersects a _CP8B_GLOB_LEAVES member. Fast-exits on the common no-metachar token (one `case`), so the
+# hot path pays nothing; only a glob-bearing write/redirect target runs the scan. Cure-1 normalization
+# runs BEFORE the prefix test (design H-2), so `./hooks/pre-pus*` (leading `./` stripped) and
+# `hooks//pre-pus*` (// collapsed) deny like `hooks/pre-pus*`. An EMPTY literal prefix (bare `*`, or
+# `./*` -> `*` after norm) never denies — the broad-glob relief (`*`, `docs/*`, `cp x.txt ./*`).
+_cp8b_glob_hits_cp() {
+  case "$1" in
+    *[*?[]*) : ;;
+    *) return 1 ;;
+    esac      # no glob metachar -> not this predicate
+  _gt=$(_cp8b_norm "$1")
+  case "${_gt%%[*?[]*}" in
+    '') return 1 ;;
+    esac        # empty literal prefix -> ALLOW (bare * / ./*)
+  _cp8b_glob_scan "$_gt" "$_CP8B_GLOB_LEAVES" && return 0
+  case "$_gt" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) : ;;
+    *) _cp8b_glob_scan "$_gt" "$_CP8B_GLOB_LEAVES_LC"; return ;;
+    esac      # fold only on an uppercase byte (mirrors :93); an all-lowercase glob is its own fold, so scan the folded leaves directly (SWAS-715, deny-only)
+  _cp8b_glob_scan "$(printf '%s' "$_gt" | LC_ALL=C tr 'A-Z' 'a-z')" "$_CP8B_GLOB_LEAVES_LC"
+}
+
+# _cp8b_joinlines: collapse backslash-newline CONTINUATIONS to a space. A continuation is NOT a command
+# separator, and grep is LINE-oriented: `git push \<nl> origin main` puts `push` and `main` on different
+# lines, so the flat push rule's regex matches neither (a pre-existing hole). Join first, split second.
+_cp8b_joinlines() {
+  printf '%s\n' "$1" | sed -e :a -e '/\\$/N; s/\\\n/ /; ta'
+}
+
+# _cp8b_joinlines_empty: the same collapse, but to NOTHING instead of a space. Both spellings are
+# needed and neither is a substitute for the other, because a continuation means different things at
+# different places in a command. BETWEEN tokens the shell yields a word break, so the space-joined
+# view is the faithful one (`git push \<nl> origin main` really is three words) — that is
+# `_cp8b_joinlines` above, and the push arm must keep it. INSIDE a token there is no break at all:
+# `--ad\<nl>min` executes as `--admin`, and the space-joined view says `--ad min`, which matches
+# nothing. T2 round 2: that intra-token case was a live bypass on BOTH halves of the --admin arm
+# (`gh pr merge 5 --ad\<nl>min` and `gh api … pulls/5/me\<nl>rge` both ALLOWED at 35a2032f).
+# The arm therefore reads BOTH views and denies on either — add-only, so no existing deny is lost,
+# and the space-joined view keeps holding the between-token forms the empty-joined one would mangle.
+_cp8b_joinlines_empty() {
+  printf '%s\n' "$1" | sed -e :a -e '/\\$/N; s/\\\n//; ta'
+}
+
+# _cp8b_strip_subst: remove shell substitutions to a FIXPOINT — `$(…)`, `` `…` `` and `${…}`.
+# Each sed expression is NON-NESTED by construction (`[^()]*`, `[^`]*`, `[^{}]*`), which means one
+# pass strips only the INNERMOST occurrences: `$(echo $(echo))` loses its inner `$(echo)` and leaves
+# `$(echo )` standing. Round 1 ran exactly one pass and called the class closed; the seat then walked
+# straight through it with `--ad$(echo $(echo))min` and ``--ad`echo \`echo\``min``. Iterating to a
+# fixpoint is what makes "innermost-first" actually reach the outermost, and it terminates because
+# every pass that changes the string strictly shortens it. The cap is belt-and-braces against a
+# pathological input, not a correctness bound.
+# Newlines are flattened to a SPACE FIRST, because sed is line-oriented and a substitution may
+# straddle one (`--ad$(<nl>)min`). A space rather than nothing, so the flattening cannot silently
+# weld two separate command lines into one merge-shaped string.
+_cp8b_strip_subst() {
+  _ssv=$(printf '%s' "$1" | tr '\n' ' ')
+  _ssi=0
+  while [ "$_ssi" -lt 8 ]; do
+    _ssp=$_ssv
+    _ssv=$(printf '%s' "$_ssv" | sed -e 's/\$([^()]*)//g' -e 's/`[^`]*`//g' -e 's/\${[^{}]*}//g')
+    [ "$_ssv" = "$_ssp" ] && break
+    _ssi=$((_ssi + 1))
+  done
+  printf '%s' "$_ssv"
+}
+
+# _cp8b_gh_pr_merge_order "<view>": 0 iff <view> is `gh pr merge` SHAPED — by TOKEN ORDER, not by
+# adjacency. This is T2 round 3's fix, and the defect it closes was PRE-EXISTING and critical.
+# ── THE DEFECT. Every `gh pr merge --admin` arm in this file is gated by a shape test that was the
+# regex `gh[[:space:]]+pr[[:space:]]+merge` — an ADJACENCY match. But `gh` takes its GLOBAL flags
+# BEFORE the sub-command (`-R/--repo`, `--hostname`, and friends), so the ordinary operator spelling
+# `gh -R o/r pr merge 5 --admin` puts two tokens between `gh` and `pr`, matches nothing, and was
+# MEASURED ALLOW at 07928fc1 — as were `--repo o/r` and `--repo=o/r`. Worse, round 2's glue
+# disqualifier asks SHAPE FIRST, so `gh -R o/r pr merge 5 --admin $(date)` ALLOWED too: the rule that
+# was supposed to close the joiner class "by construction" never ran, because the construction was
+# gated on the wrong question. ★ THE LESSON IS NOT ROUND 1's OR ROUND 2's. Those rounds hardened the
+# NORMALISATION; nobody re-examined the PREDICATE the normalisation feeds. Four faithful views of a
+# string are worth nothing if the question asked of all four is wrong.
+# ── THE RULE. Tokenise on whitespace and walk in order: find a token `gh` (or any path ending `/gh`,
+# so `/usr/local/bin/gh` still counts), then a token `pr`, then a token `merge`. Tokens in between may
+# only be a FLAG (`-`-prefixed, which covers `--repo=o/r` fused) or the VALUE of the flag immediately
+# preceding (which covers `-R o/r`). Anything else — a bare word that is not what we are looking for —
+# ends that candidate, and the walk restarts from it.
+# The token we are LOOKING FOR always wins over the flag-value skip. That ordering is load-bearing:
+# in `gh --verbose pr merge`, `--verbose` takes no value, and a naive "skip the token after a flag"
+# would eat `pr`. Pinned by a cell.
+# ⚠️ THAT ORDERING BUYS ONE RESIDUAL, and T2 round 4 names it rather than leaving it implied: when a
+# flag's VALUE is itself the token being looked for, the value wins and the candidate ends — so
+# `gh --repo pr pr merge 5 --admin` ALLOWs (the first `pr` is taken as the sub-command, `merge` is not
+# where the walk then looks). It is priced, not a hole: `gh` REJECTS that command because `pr` is not
+# an OWNER/REPO, so no merge can happen. Pinned as a MEASURED-UNCOVERED ALLOW by the cell
+# `T2R4 CEILING (v) --repo VALUE collides with the sub-command` in conformance/agent-autonomy.sh.
+# ── THE LEAD TOKEN IS COMPARED CASE-INSENSITIVELY (T2 round 4). APFS and NTFS are case-insensitive
+# file systems, so `GH pr merge 5 --admin` and `/usr/local/bin/GH …` RUN on the owner's own host, and
+# every shape test here compared `gh` case-sensitively — MEASURED ALLOW at both 07928fc1 and 2be451ae.
+# ONLY the lead token is folded, never the whole view: `--ADMIN` is not a flag `gh` accepts, so folding
+# the flags too would invent an over-deny on a command that cannot bypass anything. Pinned both ways.
+# ── WHAT IT REFUSES, which is the reason it is an ORDER test and not a "these three tokens appear"
+# test: `gh pr list | grep merge` and `gh pr list --search merge` are NOT shaped — `list` sits between
+# `pr` and `merge` and is neither a flag nor a flag's value. Those are READS this row exists to keep
+# working, and both are pinned as ALLOW cells.
+# ── ADD-ONLY. It ships as a DISJUNCT beside the incumbent adjacency grep at both call sites, never as
+# a replacement. The union can only ever add a deny, so no verdict that denied at 07928fc1 can stop
+# denying — which is what keeps M-R1..M-R12's anchors valid. It matters concretely: the adjacency
+# regex is a SUBSTRING match and can fire inside a token this walk would reject.
+# `set -f` is saved and restored around the split, because the view may contain glob metacharacters
+# and pathname expansion here would rewrite the very tokens being judged.
+# K-3b: THE WALK IS GENERALISED — `_cp8b_gh_order "<view>" "<subs>" "<verbs>" [strict]`.
+# `<subs>` is the sub-command path as space-separated tokens (`repo`, or `repo deploy-key`), `<verbs>`
+# the set any one of which completes a hit. `gh pr merge` is now one instantiation of it and keeps its
+# own name below, so `M-R13`'s anchor — and the two call sites that read it — are untouched.
+#
+# WHY GENERALISE RATHER THAN COPY. Faces A and B of GUARD-ADMIN-ARMS need the SAME walk over the SAME
+# four views for seven `<sub>`×`<verbs>` pairs. Copying it seven times would mean seven places for the
+# next joiner lesson to be forgotten in — and the joiner lessons in this file cost four rounds to
+# learn. One walk, seven arguments.
+#
+# `strict` — THE VERB-POSITION EXPANSION DISQUALIFIER, and it is OPT-IN for a measured reason.
+# When the walk has consumed `<subs>` and the very next classifiable token carries a `$` or a backtick,
+# the sub-verb is a byte the guard cannot read (`gh repo ed$Xit`, `gh repo $V`) and the command is NOT
+# CERTIFIED — it denies, without ever asking what the expansion would have produced. That is the
+# absent-bytes ceiling narrowed to the ONE position where narrowing costs nothing: an unreadable
+# sub-verb is never a legitimate spelling of a read.
+# ⚠️ IT IS OPT-IN BECAUSE TURNING IT ON FOR `gh pr merge` WOULD HAVE UNBOUND M-R5. That mutant's whole
+# subject is `gh pr me$()rge 5 --admin` — a verb hidden inside a substitution, held today by the
+# substitution-stripped twin. A disqualifier here would deny it whatever the twins do, the verdict
+# would stop changing, and the mutant would pass while proving nothing. The wrapper passes no fourth
+# argument, so the incumbent arm is byte-identical to what it was.
+#
+# `set -f` is saved and restored around the split, because the view may contain glob metacharacters
+# and pathname expansion here would rewrite the very tokens being judged.
+_cp8b_gh_order() {
+  _go_sf=0; case "$-" in
+    *f*) _go_sf=1 ;;
+    esac
+  set -f
+  _go_g=0; _go_rem=$2; _go_prev=''; _go_r=1
+  for _go_t in $1; do
+    # the LEAD token only, case-folded (see the header); flags and sub-commands stay case-sensitive.
+    _go_tl=$(printf '%s' "$_go_t" | tr 'A-Z' 'a-z')
+    if [ "$_go_g" = 0 ]; then
+      case "$_go_tl" in
+        gh|*/gh) _go_g=1; _go_rem=$2; _go_prev='' ;;
+        esac
+      continue
+    fi
+    if [ -n "$_go_rem" ]; then
+      _go_need=${_go_rem%% *}
+      if [ "$_go_t" = "$_go_need" ]; then
+        case "$_go_rem" in
+          *' '*) _go_rem=${_go_rem#* } ;;
+          *) _go_rem='' ;;
+          esac
+        _go_prev=''; continue
+      fi
+    else
+      case " $3 " in
+        *" $_go_t "*) _go_r=0; break ;;
+        esac
+    fi
+    case "$_go_t" in
+      -*) _go_prev=$_go_t; continue ;;
+      esac
+    case "$_go_prev" in
+      -*) _go_prev=''; continue ;;
+      esac
+    # ⚠️ THE `strict` DISQUALIFIER SITS **HERE**, BELOW THE FLAG AND FLAG-VALUE SKIPS, and the position
+    # is the fix (fix round 1, R-4). It used to run in the `else` arm ABOVE them, so it fired on any
+    # token in the walk once the sub-command matched — including a hoisted flag's VALUE. That denied
+    # `gh repo -R $REPO view`, an ordinary READ, while the equivalent `gh repo view -R $REPO` allowed:
+    # the same command, two spellings, two verdicts, and the denied one is the one `gh` itself
+    # documents. The rule was only ever about the SUB-VERB position — a sub-verb the guard cannot read
+    # is not certified — so it now fires only where a sub-verb could stand: after `<subs>` is consumed
+    # (`_go_rem` empty), on a token that is neither a flag nor a flag's value.
+    # `${4:-}`, NOT `$4`: this file is sourced into hosts running `set -u`, where a bare `$4` on a
+    # three-argument call is an unbound-variable ABORT — measured, and it silently turned
+    # `gh pr view 5` into an error the caller read as rc 0. The wrapper below is exactly such a call.
+    if [ -z "$_go_rem" ] && [ -n "${4:-}" ]; then
+      case "$_go_t" in
+        *'$'*|*'`'*) _go_r=0; break ;;
+        esac
+    fi
+    _go_g=0; _go_rem=$2; _go_prev=''
+    case "$_go_tl" in
+      gh|*/gh) _go_g=1 ;;
+      esac
+  done
+  [ "$_go_sf" = 1 ] || set +f
+  # BRANCH ON THE RESULT, then unset EVERYTHING and return a literal (fix round 1, R-6). Capturing the
+  # verdict into one more variable so it survives the `unset` just moves the leak to that variable;
+  # two exit paths cost nothing and leave no `_go*` name set for the next arm to read by accident.
+  if [ "$_go_r" = 0 ]; then
+    unset _go_sf _go_g _go_rem _go_prev _go_t _go_tl _go_need _go_r 2>/dev/null || :
+    return 0
+  fi
+  unset _go_sf _go_g _go_rem _go_prev _go_t _go_tl _go_need _go_r 2>/dev/null || :
+  return 1
+}
+# The incumbent, kept as its own name so its two call sites and `M-R13` read exactly as before.
+_cp8b_gh_pr_merge_order() {
+  _cp8b_gh_order "$1" 'pr' 'merge'
+}
+# ── K-3b FACE A — `_s6_gh_porcelain_admin "<view>"`: the gh VERBS that ARE a Tier-3 endpoint. ───────
+# THE DERIVATION, and it is the whole point of the face. Every verb below is one row of a table
+# mapping `gh <sub> <verb>` (all 17 `gh repo` subcommands at gh 2.96.0, plus `ssh-key` and `gpg-key`)
+# to the endpoint it calls, and a verb is IN the set iff `_s6_admin_path_verdict` already denies that
+# endpoint under that method. `gh repo edit` is `PATCH /repos/:o/:r`; `gh repo delete` is
+# `DELETE /repos/:o/:r`; `archive`/`unarchive`/`rename` are the same PATCH with a different field;
+# `gh repo deploy-key add|delete` is `POST|DELETE /repos/:o/:r/keys`; `gh ssh-key|gpg-key add|delete`
+# is the account mint `POST|DELETE /user/*keys`. So this face adds no NEW rule — it stops the porcelain
+# CLIENT from walking past a rule the REST client already obeys.
+# ⚠️ `edit` IS DENIED FOR EVERY FIELD, not only `--default-branch`, and that is the derivation being
+# honest rather than convenient (owner decision 2, 2026-09-09). The judge denies the repo ROOT under
+# PATCH for ANY field — "no legitimate agent traffic writes to any of these paths" — so a porcelain arm
+# that enumerated the dangerous flags would be asserting a different rule than the one it claims to
+# derive from, and enumerating flags is the losing move this row exists to stop. The price is
+# `gh repo edit --description x` and `--add-topic`, priced as M1 on the escape card.
+# STAYS ALLOW, measured: `gh repo view|list|fork|create|clone|sync|set-default|gitignore|license|
+# read-dir|read-file`, `gh repo autolink *`, `gh repo deploy-key list`, `gh ssh-key list`,
+# `gh ruleset list|view` (gh 2.96.0 has NO `ruleset delete` — the fold-epic's face closed by
+# measurement, not by an arm).
+_s6_gh_porcelain_admin() {
+  _cp8b_gh_order "$1" 'repo' 'edit delete archive unarchive rename' strict && return 0
+  _cp8b_gh_order "$1" 'repo deploy-key' 'add delete' strict && return 0
+  _cp8b_gh_order "$1" 'ssh-key' 'add delete' strict && return 0
+  _cp8b_gh_order "$1" 'gpg-key' 'add delete' strict && return 0
+  return 1
+}
+# ── K-3b FACE B — `_s6_gh_persist_denied "<view>"`: gh's own PERSISTENCE primitives. ────────────────
+# THE RULE KEYS ON THE PRIMITIVE THAT MOVES BYTES OUT OF THE COMMAND LINE, never on what the bytes say.
+# `gh alias set mm 'pr merge --admin'` ALLOWed at 7a5255c3 — pinned as ceiling (i) by its own cell —
+# and so did `gh alias set --shell mm 'curl -X PUT .../merge'`, `gh alias import aliases.yml`,
+# `gh config set pager /tmp/evil.sh` and `gh auth refresh -s delete_repo`. The body is NOT inspected,
+# because the body of an alias is a command the guard never sees RUN, the value of a config key can be
+# a PROGRAM (`pager`, `editor`, `browser` — the 3a `git -c core.pager=…` class one tool over), and the
+# bodies of `alias import` live in a FILE outside the command entirely. Inspecting them would be
+# enumerating what a later command might say; refusing the primitive is a rule about this command.
+# ⚠️ `gh auth (login|refresh|switch)` IS HERE, not in a stub (owner decision 8, vet S-5). The CREDENTIAL
+# is the persistence primitive that decides every later command: `refresh -s delete_repo` widens the
+# very token the whole platform-safety boundary rests on, and `login --with-token` / `switch` swap it
+# for one the guard never sees. `auth status|setup-git|logout` stay ALLOW, and so do `alias list|
+# delete`, `config get|list|clear-cache` — reads and removals move no bytes out of the command line.
+# The priced casualties are `gh alias set co 'pr checkout'` and `gh config set git_protocol ssh` (M2).
+_s6_gh_persist_denied() {
+  _cp8b_gh_order "$1" 'alias' 'set import' strict && return 0
+  _cp8b_gh_order "$1" 'config' 'set' strict && return 0
+  _cp8b_gh_order "$1" 'auth' 'login refresh switch' strict && return 0
+  return 1
+}
+# ── K-3b FACE C — `_s6_http_admin "<view>"`: THE REQUEST, NOT THE CLIENT, judged PER SEGMENT. ───────
+# WHAT WAS MEASURED. Thirty-three spellings of the SAME four admin endpoints reached them through a
+# client this guard had never heard of, and every one ALLOWed at 7a5255c3: `curl -X PUT
+# .../pulls/5/merge` and its `-XPUT` / `--request PUT` / `--request=PUT` / `-X 'PUT'` twins, a
+# scheme-less host, a GHES `api/v3/` path, `-X DELETE .../repos/o/r`, `-X PUT .../branches/main/
+# protection`, `-X DELETE .../rulesets/7`, `-X PUT .../collaborators/mallory`, `-X PATCH .../git/refs`,
+# a body with NO method at all (curl's rule, as `gh api`'s: a body makes it POST), `wget --method=PUT`,
+# httpie/xh's positional `http PUT …`, `/usr/bin/curl`, `command curl`, `$CURL`, a renamed binary.
+# ★ THE CLIENT'S SPELLING VARIES; THE REQUEST DOES NOT. So this face asks NOTHING about the lead. It
+# asks what is being REQUESTED, and hands the endpoint to the same judge `gh api` is measured against.
+# That is the row's own sentence — an enumeration of clients protects only the clients we happened to
+# have — applied to the one arm that was still an enumeration of one.
+#
+# ⚠️ PER SEGMENT, AND THE FIRST DRAFT WAS NOT (security design vet, S-1 HIGH). Matching the indicator
+# anywhere in the string (a) re-denied every refund face D is about — `gh api -X POST …/comments -f
+# body="… /protection"` carries both a `-X` and an admin path — and (b) reopened the round-3 read FP
+# through a LATER PIPE STAGE: `gh api …/branches/main/protection | grep -F x` is the owner's own A3
+# read-back out of RUNBOOK §5, and `grep -F` is a body-shaped flag. A guard that blocks the command the
+# runbook prescribes is one people learn to route around. So the view is cut into SEGMENTS first and
+# each is judged alone, and a `gh`-led segment is declined outright — `gh` is faces A, B and D's
+# domain, and only they know which of its tokens is the endpoint.
+#
+# THE SEGMENTATION IS THE F-a QUOTED-SPAN WALKER, UNGATED, WITH A NARROWED DECLINE SET.
+# `_cp8b_segments` alone is quote-BLIND, so a separator inside a quoted body would split a command that
+# the shell does not split. `_cp8b_mask_quoted`'s walker settles that — but its gate (every segment led
+# by a vetted read verb) exists to authorise a RELAXATION and this use is deny-side, so the gate is not
+# consulted; and its decline set refuses ANY `$`, which would have cost the commonest authenticated
+# read there is. THE NARROWING, and why each byte is or is not in the set:
+#   `\"` `\'` `\\`   an escaped quote is not a span boundary; a walker that reads it as one
+#                    desynchronises. (The three pairs of `_cp8b_mask_bs`, unchanged from F-a.)
+#   backtick, `$(`, `${`   the bytes that RUN are not the bytes here, and a substitution can contain a
+#                    quote or a separator that moves a boundary.
+#   `<<`, a residual newline/CR, an odd `"` or `'` count, an OPEN span at the end of the walk
+#                    — F-a's own set, for F-a's own reasons.
+#   a plain `$NAME`, `$1`, `$@`   NOT in the set. A parameter expansion's RESULT is never re-read for
+#                    quotes or separators, so it cannot move a boundary in the TEXT. That is what keeps
+#                    `curl -s -H "Authorization: Bearer $TOKEN" …/protection | grep -F x` settleable —
+#                    and ALLOW. (`K-3b-M18` pins the refund; the lens pass added it.)
+# ON DECLINE the WHOLE view is one segment: coarser and deny-ward, a priced over-deny on a command
+# whose quoting cannot be settled (M8), never a missed deny.
+# `_s6_http_segments "<view>"`: the segments, one per line. Exit 0 = the walk SETTLED and the segments
+# are real; exit 1 = it DECLINED and the single "segment" printed is the whole view.
+# ⚠️ THE EXIT STATUS IS LOAD-BEARING (fix round 1, R-2 = S-3 HIGH). It used to be discarded, so the
+# caller could not tell a real segmentation from the coarse fallback — and in the fallback a LATER
+# stage's GET token suppressed an EARLIER admin write across the whole view:
+#   curl -X PUT …/pulls/5/merge -d "$(cat b.json)" | grep -X GET x        ALLOW, measured
+#   curl -X PUT …/merge && echo "don't" && curl -X GET …/repos/o/r        ALLOW, measured
+# Both are a complete merge bypass with a decoy in a stage that never runs the request. The fallback is
+# the DENY-WARD direction by construction, so it must never honour a suppressor; the caller now knows
+# which mode it is in and passes `nosuppress`.
+_s6_http_segments() {
+  # Runs inside the caller's `$(…)`: a fault here exits that subshell rc 2 (the caller faults on rc >= 2).
+  _hqi=$(_cp8b_joinlines "$1") || _guard_fault http-joinlines
+  _guard_vanished http-joinlines "$1" "$_hqi"
+  _hqok=1
+  case "$_hqi" in
+    *'`'*|*'$('*|*'${'*|*'<<'*)   _hqok=0 ;;
+    *"$_cp8b_nl"*|*"$_cp8b_cr"*)  _hqok=0 ;;
+  esac
+  if [ "$_hqok" = 1 ] && _gmq http-segment-mask "$_hqi" LC_ALL=C -q "$_cp8b_mask_bs"; then _hqok=0; fi
+  # ⚠️ THE FOURTH ESCAPED PAIR, ADDED IN FIX ROUND 2 (security C-2, HIGH) — and it is F-a's own
+  # reasoning applied to the bytes F-a never had to care about. F-a's decline set is `\"`, `\'` and
+  # `\\`, the three pairs that can desynchronise a QUOTE-SPAN walk. But this face uses the walk to find
+  # SEPARATORS, and `\;` `\|` `\&` are exactly as escaped as `\"` is: the shell hands curl a literal
+  # `;` ARGUMENT, while `_cp8b_segments` reads it as a command separator and cuts the request in half.
+  # Measured at 626103a7, all ALLOW: `curl …/pulls/5/merge \; -X PUT` (URL in one "segment", method in
+  # the other), `\|`, `\&`, `\&\&`, `\|\|`, the method-first spelling, and a two-URL form. Declining
+  # hands the whole view to the `nosuppress` fallback, which denies — the deny-ward direction, and no
+  # new grammar. It is a SEPARATE pattern from `_cp8b_mask_bs` on purpose: widening that one would
+  # change what the READ lanes accept, which is a different frontier with its own cells.
+  if [ "$_hqok" = 1 ] && _gmq http-segment-escape "$_hqi" LC_ALL=C -q '\\[;|&]'; then _hqok=0; fi
+  if [ "$_hqok" = 1 ]; then
+    _hqd=$(printf '%s' "$_hqi" | tr -dc '"' | wc -c | tr -d ' ')
+    [ "$((_hqd % 2))" = 0 ] || _hqok=0
+  fi
+  if [ "$_hqok" = 1 ]; then
+    _hqs=$(printf '%s' "$_hqi" | tr -dc "$_cp8b_sq" | wc -c | tr -d ' ')
+    [ "$((_hqs % 2))" = 0 ] || _hqok=0
+  fi
+  _hqm=''
+  if [ "$_hqok" = 1 ]; then
+    _hqm=$(_cp8b_mask_walk "$_hqi") || _hqok=0
+  fi
+  if [ "$_hqok" = 1 ]; then
+    _cp8b_segments "$_hqm" | tr "$_cp8b_mk_all" '|;&><'
+    unset _hqi _hqok _hqd _hqs _hqm 2>/dev/null || :
+    return 0
+  fi
+  printf '%s\n' "$_hqi"
+  unset _hqi _hqok _hqd _hqs _hqm 2>/dev/null || :
+  return 1
+}
+# `_s6_http_get_words "<segment>"`: read the GET/HEAD SUPPRESSOR as WORDS, never as a substring.
+# Sets exactly two flags: `_S6H_DECL` (the quote-aware join could not settle the segment) and
+# `_S6H_GETFLAG` (an EXPLICIT `-X`/`--request`/`--method` carrying GET or HEAD).
+# ⚠️ A THIRD FLAG, `_S6H_GETANY` ("that, or a bare `get`/`head` word anywhere"), WAS ASSIGNED ON FIVE
+# PATHS AND READ NOWHERE, and it is deleted rather than wired up (reviewer round 2, N-1). It was
+# written for a "both a method and a GET are present => deny" rule that the caller ended up enforcing
+# more simply and more strictly: the suppressor may only speak when there is NO mutating method at all,
+# so both-present already denies and a separate flag for it could only ever disagree with the code.
+# A variable nothing reads is a claim nothing checks — the same call that deleted `_sgpost`.
+# ⚠️ HIGH. The method suppressor is not an unanchored, case-folded SUBSTRING test such as
+# `(-[A-Za-z]*X|--request|--method)[[:space:]=]*(get|head)`: that would let a token that is not a method at all
+# suppress a real mutating request. A substring test ALLOWED all of these (measured):
+#   curl -X PUT …/merge -A "-X GET"            the string lives in a USER-AGENT value
+#   … --data-urlencode "x=-X GET"              …in a body field
+#   … -H "X: --method=head"                    …in a header value
+#   curl --request PUT --request GET …/merge   two methods; curl takes the LAST, the guard guessed
+#   curl -x get.proxy.example:8080 -X PUT …    `-x` is curl's PROXY flag, and the host began "get."
+#   curl -sSLx get.proxy… -X PUT …             the same, inside a cluster
+# ★ THE LESSON IS THE ARM'S OWN, ONE DIRECTION OVER: a deny arm defeated by a quote was round 3's
+# defect; an ALLOW arm satisfied by a quoted decoy is the same bug with the sign flipped, and a
+# SUPPRESSOR is allow-side. So it is read strictly and fails CLOSED at every step:
+#   · WORDS come from `_cp8b_word_join`, where a space inside a quoted span is a SENTINEL — so
+#     `"-X GET"` is ONE word that matches nothing, which is the whole cure for the first three.
+#   · when the join DECLINES, no suppressor is honoured at all (there is nothing to be strict about).
+#   · the flag letter is CASE-SENSITIVE: `-X` is the method, `-x` is the proxy. `-i` is not `-I`.
+#   · `-I`/`--head` are deliberately NOT suppressors here. Adding them would be ALLOW-ward against
+#     today (`curl -I -d x …/merge` would flip), and `curl -I` already allows through the
+#     no-indicator path with its own cell. Widening an allow-side test needs its own measurement.
+#   · BOTH a mutating method and a GET present => DENY (the caller's rule). curl takes the last; the
+#     guard declines to guess, and the priced mover is M9.
+_s6_http_get_words() {
+  _S6H_DECL=0; _S6H_GETFLAG=0
+  _hwj=$(_cp8b_word_join "$1") || { _S6H_DECL=1; unset _hwj 2>/dev/null || :; return 0; }
+  _hwsf=0; case "$-" in
+    *f*) _hwsf=1 ;;
+    esac
+  set -f
+  _hwpend=0
+  for _hww in $_hwj; do
+    _hwd=$(_cp8b_word_real "$_hww" | tr 'A-Z' 'a-z')
+    if [ "$_hwpend" = 1 ]; then
+      _hwpend=0
+      case "$_hwd" in
+        get|head) _S6H_GETFLAG=1 ;;
+        esac
+      continue
+    fi
+    case "$_hww" in
+      --request=*|--method=*)
+        case "${_hwd#*=}" in
+          get|head) _S6H_GETFLAG=1 ;;
+          esac
+        continue ;;
+      --request|--method) _hwpend=1; continue ;;
+    esac
+    # `-X` or a cluster ENDING in a capital X takes the next word; a cluster with letters AFTER the X
+    # carries the value fused. The grep is what keeps `--MAX` and `-x` out: the pattern admits one
+    # leading `-` and then letters only, and the X is capital.
+    if _gmq http-method-flag "$_hww" -Eq '^-[A-Za-z]*X$'; then _hwpend=1; continue; fi
+    if _gmq http-method-flag "$_hww" -Eq '^-[A-Za-z]*X[A-Za-z]+$'; then
+      case "$(printf '%s' "${_hww##*X}" | tr 'A-Z' 'a-z')" in
+        get|head) _S6H_GETFLAG=1 ;;
+      esac
+      continue
+    fi
+  done
+  [ "$_hwsf" = 1 ] || set +f
+  unset _hwj _hwsf _hwpend _hww _hwd 2>/dev/null || :
+  return 0
+}
+# `_s6_http_seg_admin "<segment>"`: 0 (DENY) iff ONE segment is a mutating request to an admin endpoint.
+# THE THREE CONDITIONS, in the order they are cheapest to refuse on:
+#   (i)   the segment's lead is not `gh` — see the per-segment note above;
+#   (ii)  a MUTATION INDICATOR is present, and an explicit GET/HEAD SUPPRESSES outright. The grammar is
+#         appendix C of the design: `-X M` / `-XM` / `-X=M` / `--request M|=M` (curl, cluster-tolerant
+#         per vet S-2 — `-sXPUT`, `-fsSLX DELETE`), `--method M|=M` (wget), a BARE `PUT|POST|PATCH|
+#         DELETE` token in any case (httpie/xh's positional method, incl. the `:/path` shorthand), or a
+#         BODY flag with no explicit GET — curl's and wget's "a body makes it POST" rule, which is the
+#         same rule the judge already applies to `gh api -f`;
+#   (iii) after normalisation the segment contains an admin path under `substring` mode.
+# ⚠️ THE `..` DISQUALIFIER (vet S-4). curl COLLAPSES `x/../pulls/5/merge` before it sends, and a
+# substring match cannot. So a mutating segment carrying a `..` is NOT CERTIFIED and denies — the
+# fail-by-disqualification shape, not a path resolver. Priced as M7: any mutating HTTP line whose URL
+# carries `..` denies, and the retry is to write the path plainly.
+# HONEST CEILINGS, all disclosed on the escape card R17 and in design §5: the interpreter forms
+# (`python3 -c "requests.put(…)"`, `node -e "fetch(…)"`); ABSENT bytes and glue (`-X $M`, `$URL`,
+# `-X PU$()T`) — face C has NO glue net BY DESIGN, because an HTTP line is not merge-SHAPED in the S6
+# sense and a glue disqualifier over every curl would deny every `-H "Authorization: Bearer $TOKEN"`
+# read; a curl CONFIG FILE (`-K cfg`), whose method and body are outside the command; percent-encoded
+# route words; and no case-fold of the route (GitHub 404s uppercase route words, so it is not live —
+# face D folds because its endpoint is one token and the fold costs nothing there).
+# GUARD-QUOTED-EXEC-INTERMITTENT — the per-segment judge's forks. Here an EMPTY derivation reads as "no
+# method / no path => not an admin write" (allow-ward), so each one must tell a failed fork from a legitimate
+# "no match". The device: every extraction runs in one of the three `( … )`-BODIED primitives below, and a
+# pipeline is safe ONLY there. In a `( … )` body a failed fork anywhere in the pipeline makes the shell raise
+# "Cannot fork" and ABORT the subshell (dash: rc 2; bash after its retries: 254), so the caller sees a subshell
+# DEATH (rc >= 2), never a silent empty stdin handed to grep with a clean rc. The `{ }` wrappers then decide,
+# in the CALLER's shell: grep 0 = match, 1 = no match (LEGITIMATE), >= 2 = fault; sed/tr non-zero = fault.
+# (They were here-documents first; dropped because semgrep's bundled tree-sitter-bash loses its heredoc state.)
+# The trailing `\n` printf adds is what a here-document fed, and the `$(…)` at the call site strips it.
+_s6_hd_grep() (
+  printf '%s\n' "$3" | grep "$1" -e "$2"
+)
+# `_s6_hd_tr "<text>" "<set>"`: tr -d <set> over <text>.
+_s6_hd_tr() (
+  printf '%s\n' "$1" | tr -d "$2"
+)
+# `_s6_hd_sed "<text>" <sed args…>`: sed over <text>; the arguments are the program (-E, -e …) verbatim.
+_s6_hd_sed() (
+  _hdtext=$1
+  shift
+  printf '%s\n' "$_hdtext" | sed "$@"
+)
+# `_s6_hn_has <grep-flags> <pattern>`: does the normalised segment `$_hn` match? rc 0/1, fault on >= 2.
+_s6_hn_has() {
+  _shr=0
+  _s6_hd_grep "$1" "$2" "$_hn" || _shr=$?
+  [ "$_shr" -le 1 ] || _guard_fault http-seg-grep
+  return "$_shr"
+}
+# `_s6_apv_has <pattern>`: the same over the admin-path view `$_apv` (-Eq).
+_s6_apv_has() {
+  _shr=0
+  _s6_hd_grep -Eq "$1" "$_apv" || _shr=$?
+  [ "$_shr" -le 1 ] || _guard_fault http-path-grep
+  return "$_shr"
+}
+# `_s6_apc_has <pattern>`: the same over the contexts-removed view `$_apc`.
+_s6_apc_has() {
+  _shr=0
+  _s6_hd_grep -Eq "$1" "$_apc" || _shr=$?
+  [ "$_shr" -le 1 ] || _guard_fault http-path-grep
+  return "$_shr"
+}
+# `_s6_sgn_has <grep-flags> <pattern>`: the same over the `gh api` scan's normalised string `$_sgn`.
+_s6_sgn_has() {
+  _shr=0
+  _s6_hd_grep "$1" "$2" "$_sgn" || _shr=$?
+  [ "$_shr" -le 1 ] || _guard_fault gh-api-grep
+  return "$_shr"
+}
+_s6_http_seg_admin() {
+  # The LEAD: a failed fork here leaves `_hl` empty or wrong, which only means "not `gh`" — the segment is then
+  # JUDGED rather than declined, the deny-ward direction — so it is deliberately not a fault site.
+  _hl=$(_cp8b_dequote "$(_cp8b_lead "$1")" | tr 'A-Z' 'a-z')
+  case "$_hl" in
+    gh|*/gh) unset _hl; return 1 ;;
+    esac
+  _hn=$(_s6_hd_tr "$1" "'\"\\\\") || _guard_fault http-seg-norm
+  _hm=''
+  for _hx in put post patch delete; do
+    if _s6_hn_has -Eiq "(-[A-Za-z]*X|--request|--method)[[:space:]=]*$_hx"; then _hm=$_hx; break; fi
+  done
+  if [ -z "$_hm" ]; then
+    # httpie / xh: the method is a bare positional token. It needs no client name for the same reason
+    # the rest of this face needs none — but it DOES need the admin-path condition to carry the weight,
+    # which is why `git log --grep=DELETE -- repos/o/r` (no whitespace before the word) stays ALLOW.
+    for _hx in put post patch delete; do
+      if _s6_hn_has -Eiq "(^|[[:space:]])$_hx([[:space:]]|$)"; then _hm=$_hx; break; fi
+    done
+  fi
+  _hb=0
+  if _s6_hn_has -Eq '(^|[[:space:]])-[A-Za-z]*[dFT]' \
+     || _s6_hn_has -Eq '(^|[[:space:]])--(data|data-raw|data-binary|data-urlencode|data-ascii|json|form|form-string|upload-file|post-data|post-file|body-data|body-file)([[:space:]]|=|$)'; then
+    _hb=1
+  fi
+  # ── THE SUPPRESSOR, read as WORDS and only in per-segment mode (fix round 1, R-2/R-3). `$2` is
+  # `nosuppress` when the caller is judging the WHOLE VIEW because the span walk declined: there is no
+  # "this segment" for a GET to belong to, so a GET anywhere in it means nothing and is not honoured.
+  # Suppression needs everything to line up: a settled join, an EXPLICIT GET/HEAD method flag, NO
+  # mutating method word, and NO body. Anything less and the request is judged.
+  # ⚠️ THE SUPPRESSOR IS SUBORDINATE, and the ordering is the other half of the cure. Round 0 asked
+  # "is there a GET?" FIRST and returned on it, so the answer outranked the method and the body. It now
+  # comes LAST and may only speak when nothing else has: a settled join, an explicit GET/HEAD method
+  # flag, NO mutating method word (so BOTH present => deny — curl sends the LAST one and the guard does
+  # not guess which; priced mover M9), and NO body. Each conjunct is a separate holder of a separate
+  # measured bypass, which is why `K-3b-M22` reverts them together: the property has two halves and
+  # reverting either alone leaves the other holding (the M-R16a shape).
+  if [ "${2:-}" != nosuppress ]; then
+    _s6_http_get_words "$1"
+    if [ "$_S6H_DECL" = 0 ] && [ "$_S6H_GETFLAG" = 1 ] && [ -z "$_hm" ] && [ "$_hb" = 0 ]; then
+      unset _hl _hn _hm _hx _hb _S6H_DECL _S6H_GETFLAG 2>/dev/null || :
+      return 1
+    fi
+    # The two flags are the callee's OUTPUT and this is the only consumer, so they are torn down as
+    # soon as they are read (reviewer round 2, N-2). A stale `_S6H_GETFLAG=1` left set for the NEXT
+    # segment — one the walk may have declined — would be a suppressor arriving from another command.
+    unset _S6H_DECL _S6H_GETFLAG 2>/dev/null || :
+  fi
+  if [ -z "$_hm" ] && [ "$_hb" = 1 ]; then _hm=post; fi
+  if [ -z "$_hm" ]; then unset _hl _hn _hm _hx _hb; return 1; fi
+  if _s6_hn_has -q '\.\.'; then unset _hl _hn _hm _hx _hb; return 0; fi
+  # NORMALISATION, in the judge's own order plus the two face-C additions: the host is ANY host —
+  # userinfo (`u:p@`), an IPv6 literal in brackets, an explicit `:443` all live inside the one
+  # `[^/[:space:]]*` class — and `api/v3/` is stripped AFTER the host so a GHES URL normalises to the
+  # same path as a github.com one. `/./` collapses because curl collapses it too (vet S-4).
+  # ⚠️ SHELL SEPARATORS BECOME SPACES, and that line is a fix-round-1 find rather than a tidy. The
+  # judge's family terminator is `([[:space:]/]|$)`, which a `;` is not — so in the WHOLE-VIEW fallback
+  # `…/pulls/5/merge; curl $(echo -s) --request GET …` spelled the merge endpoint and matched NOTHING,
+  # and the F3 subject stayed ALLOW even with the suppressor correctly disarmed. Per-segment the
+  # segmenter had already removed the separator, so the hole existed only where the walk declined —
+  # i.e. exactly where this face is meant to be at its most conservative. Mapping to a SPACE (never to
+  # nothing) can only ever ADD a terminator match, so it is deny-ward by construction and no existing
+  # deny can be lost. It does not touch `_s6_gh_api_admin`'s own scan, where the same class is the
+  # separately-boarded `GUARD-GH-API-SEMICOLON-TAIL`.
+  # ONE process on a here-document (not `printf | sed`): a failed fork must read as a non-zero status and never as
+  # an empty path, which `_s6_admin_path_verdict` would judge "not admin" (GUARD-QUOTED-EXEC-INTERMITTENT).
+  _hp=$(_s6_hd_sed "$_hn" -E -e 's#[Hh][Tt][Tt][Pp][Ss]?://[^/[:space:]]*/# #g' \
+             -e 's#api/v3/# #g' \
+             -e ':a' -e 's#/\./#/#g' -e 'ta' \
+             -e 's/[;&|]/ /g' \
+             -e 's/[?#]/ /g' -e 's#//+#/#g') || _guard_fault http-seg-path
+  if _s6_admin_path_verdict "$_hm" "$_hp" substring; then
+    unset _hl _hn _hm _hx _hb _hp 2>/dev/null || :
+    return 0
+  fi
+  unset _hl _hn _hm _hx _hb _hp 2>/dev/null || :
+  return 1
+}
+_s6_http_admin() {
+  # THE CHEAP PRECHECK, and it is a COST fix rather than a rule. Face C is the only arm in this block
+  # that runs a span walk AND a segmentation, and since C-1 it runs TWO of each (both joined views), so
+  # it would otherwise do all four on every command the S6 site reaches.
+  # ⚠️ THE FIGURE BELOW IS RE-MEASURED, NOT INHERITED (fix round 3, N-4). It read "~0.1s per command",
+  # which was true when the arm ran ONE join and ONE walk; C-1 doubled the work and the old number
+  # would have quietly become folklore — the exact failure this comment's own standard names. MEASURED
+  # on this head, 20 runs each through `scripts/kit-guard cmd`: an admin-shaped path 0.80s, the same
+  # command without one 0.60s, an ordinary `gh pr view 5` 0.70s, a bare `echo` 0.15s. So face C's
+  # marginal cost is ~0.2s and this line is what keeps it off everything that cannot match.
+  # ★ The first measurement also CORRECTED the assumption that motivated the line, and that still
+  # holds: the ~0.7s an ordinary `gh pr view 5` costs is the S6 block's pre-existing four-view
+  # machinery, NOT this face. EVERY family in `_s6_admin_path_verdict` begins `repos/`, `orgs/` or
+  # `user/` — check the
+  # table above and it is exhaustive — so a view containing none of those three byte-sequences cannot
+  # match under either mode.
+  # ⚠️⚠️ THE FIRST CUT OF THIS LINE READ THE RAW COMMAND, AND THAT MADE IT A BYPASS, NOT A SHORTCUT
+  # (fix round 1, R-1 = S-1, HIGH). Its comment claimed the skip "can only ever skip an ALLOW". THAT
+  # SENTENCE WAS FALSE and is retired: a quote or a backslash inside the ROUTE ROOT is a joiner the
+  # shell removes, so the bytes `repos/` were simply not in the raw string while the request still
+  # reached `/repos/…`. Eleven spellings ALLOWED, measured — `…/re''pos/…`, `…/re""pos/…`,
+  # `…/'repos'/…`, `…/repos\/o/…`, `…/rep\os/…`, `"https://api.github.com/repos"/o/r/…`, the same
+  # trick on `or''gs` and `us''er`, and through wget and httpie. ★ A PRECHECK IS PART OF THE MATCHER.
+  # It must read the SAME BYTES the matcher reads, or it is a second, weaker matcher placed in front
+  # of the real one — which is exactly the joiner lesson this arm learnt four times over, re-learnt on
+  # a line added for SPEED. It now reads the continuation-joined, quote-and-backslash-deleted view the
+  # segment judge itself reads, so the two cannot disagree.
+  # ⚠️ IF A FAMILY IS EVER ADDED WHOSE PATH STARTS ELSEWHERE, THIS LINE MUST GAIN ITS PREFIX, or the
+  # family will be inert in face C while its cells (which name a `repos/` path) still pass. The judge's
+  # table is the source of truth; this is a derived list and is commented as one.
+  # ⚠️⚠️ TWO JOINED VIEWS, NOT ONE (fix round 2, security C-1, HIGH) — and this is the SAME lesson the
+  # arm above learnt at T2 round 2, arriving late at a face that was written after it. A backslash-
+  # newline INSIDE a token is not a separator: the shell removes both bytes and the fragments
+  # concatenate, so the SPACE-join turns `re\<nl>pos` into `re pos` and matches nothing, while curl
+  # receives `repos`. Seven spellings ALLOWED at 626103a7 — the route root, the route word, an inner
+  # path segment, the METHOD (`-X PU\<nl>T`), a wget long flag (`--meth\<nl>od=PUT`), `rule\<nl>sets`
+  # and `prot\<nl>ection`. The control that made it obvious: `gh api -X PUT …/me\<nl>rge` DENIES,
+  # because the S6 site has read an EMPTY-joined twin since round 2 (M-R9's own subject) — one face of
+  # this file knew and the new one did not.
+  # The cure is add-only by construction: judge BOTH joins and deny on either. Every view is a superset
+  # match, so nothing that denied before can stop denying.
+  # GUARD-QUOTED-EXEC-INTERMITTENT: BOTH views are derived ONCE, up front, each checked (rc and vanished-result):
+  # an unchecked empty view reads as "no admin path here" (the precheck below returns 1) or as zero segments.
+  _hav1=$(_cp8b_joinlines "$1") || _guard_fault http-joinlines
+  _guard_vanished http-joinlines "$1" "$_hav1"
+  _hav2=$(_cp8b_joinlines_empty "$1") || _guard_fault http-joinlines-empty
+  _guard_vanished http-joinlines-empty "$1" "$_hav2"
+  _hapre=$(_s6_dequote "$_hav1") || _guard_fault http-dequote
+  _hapre2=$(_s6_dequote "$_hav2") || _guard_fault http-dequote
+  _hapre=$_hapre$_hapre2
+  _gmq http-precheck "$_hapre" -Eq '(repos|orgs|user)/' || { unset _hapre _hapre2; return 1; }
+  unset _hapre _hapre2 2>/dev/null || :
+  for _hajv in "$_hav1" "$_hav2"; do
+    # THE MODE IS CARRIED, not inferred (R-2 = S-3): exit 1 from the segmenter means the span walk
+    # declined and the one "segment" below is the whole view, in which no GET can belong to any
+    # particular request — so the judge is told not to honour a suppressor at all.
+    # rc is 0 or 1 ONLY; rc >= 2 is a FAULT, and so is an EMPTY result from a non-empty view: a pipeline returns
+    # its LAST stage's status, so a segmenter whose left side aborted exits 0 with nothing, which would judge
+    # ZERO segments and read as "not an admin write". An empty result from content is therefore never trusted.
+    _hawrc=0; _haw=$(_s6_http_segments "$_hajv") || _hawrc=$?
+    [ "$_hawrc" -le 1 ] || _guard_fault http-segments
+    _guard_vanished http-segments "$_hajv" "$_haw"
+    if [ "$_hawrc" = 0 ]; then _hamode=''; else _hamode=nosuppress; fi
+    while [ -n "$_haw" ]; do
+      case "$_haw" in
+        *"$_cp8b_nl"*) _has=${_haw%%"$_cp8b_nl"*}; _haw=${_haw#*"$_cp8b_nl"} ;;
+        *)             _has=$_haw; _haw='' ;;
+      esac
+      # fork-free blank test (a failed fork must not skip a segment)
+      case $_has in
+        *[![:space:]]*) ;;
+        *) continue ;;
+      esac
+      if _s6_http_seg_admin "$_has" "$_hamode"; then
+        unset _haw _has _hamode _hajv _hav1 _hav2 2>/dev/null || :
+        return 0
+      fi
+    done
+  done
+  unset _haw _has _hamode _hajv _hav1 _hav2 2>/dev/null || :
+  return 1
+}
+
+# _CP8B_API_MUTATOR: the presence-only MUTATION INDICATOR pattern for (A)'s REST disjunct (T2 round
+# 3). PRESENCE, never a value: `--method $(echo PUT)` hides the method behind glue and still denies,
+# because the indicator token is plainly there. A lone variable so ONE mutant (M-R14) can drop the
+# whole requirement, and so this list cannot drift apart from the comment that explains it.
+_CP8B_API_MUTATOR='(^|[[:space:]])(-X|--method|-f|-F|--field|--raw-field|--input)'
+
+# _CP8B_API_READONLY_FLAGS: the value-taking flags of `gh api` that cannot carry a METHOD or a BODY.
+# A lone variable so ONE mutant can drop the whole exclusion, and so the list cannot drift apart from
+# the comment that explains it (the same shape as `_CP8B_API_MUTATOR` above).
+# MEASURED AGAINST `gh version 2.96.0 (2026-07-02)` — this list is a CLI surface, not a protocol one,
+# so a later gh that gives one of these flags a body-carrying meaning silently widens the exclusion.
+# Re-measure the list when the pinned version moves; that is the maintenance this line exists to ask for.
+_CP8B_API_READONLY_FLAGS='--jq -q -H --header --template -t --cache --hostname --preview -p'
+
+# _cp8b_api_expansion_indicator "<view>": 0 iff <view> carries a token that CONTAINS an expansion byte
+# (`$` or a backtick) and is NOT the value of a read-only flag. T2 round 4, and it exists because
+# round 3 REGRESSED here.
+# ── THE REGRESSION. `$_CP8B_API_MUTATOR` above is a LITERAL-token test, so a method carried by an
+# expansion has no indicator to find: `gh api "$X" repos/o/r/pulls/5/merge` — with the ordinary
+# `X=-XPUT` — DENIED at 07928fc1 and ALLOWED at 2be451ae, and nothing else in the guard caught it.
+# ★ The lesson is about DIRECTION: round 3's narrowing was measured against the over-denies it
+# refunded and not against the denies it silently dropped. A narrowing needs both measurements.
+# ── THE RULE, and it is deliberately NOT a revert (round 2's unconditional disjunct is the over-deny
+# that M-R14 locks the refund of). The guard cannot read what an expansion expands to, so fail-CLOSED
+# is to assume it could be the method: a token that is wholly `$NAME`, `${…}`, `$(…)` or a backtick
+# pair COUNTS as a mutation indicator — UNLESS the token immediately BEFORE it is one of the read-only
+# value-taking flags below. Presence of the FLAG, never its value, exactly as the literal indicator is
+# presence-only. `--jq "$(cat q)"`, `-H "X-Y: $(cat h)"` and `--jq "$(cat q)" -q .x` therefore keep
+# round 3's refund.
+# ── T2 ROUND 5: THE PREDICATE IS `CONTAINS`, NOT `IS`, AND THAT IS THE WHOLE CHANGE.
+# ★ Round 4 wrote "the token is WHOLLY an expansion" and anchored a regex on it. That is an INSTANCE
+# shape dressed as a rule: it describes the five spellings round 4 had in front of it and nothing
+# else, and six more measured DENY at 07928fc1 and ALLOW at cec9bce4 — round 4's own re-deny left the
+# regression it was written to close still open. `$(cat m)` and `$*` WORD-SPLIT, so no fragment is
+# wholly an expansion; `$@`, `$1`, `${X}${Y}` and `"$X$Y"` are single tokens the anchored alternation
+# simply did not describe; `"$X"suffix` needs only one extra byte. Enumerating expansion SYNTAXES is
+# the same losing move as enumerating paths — so the question is no longer "which expansion is this?"
+# but "is there an expansion byte in this token at all?". A token containing `$` or a backtick
+# ANYWHERE counts. The guard still cannot read what an expansion expands to; fail-CLOSED is still to
+# assume it could be the method.
+# ── THE EXCLUSION IS UNCHANGED IN ROLE and is what keeps round 3's refund: presence of a read-only
+# value-taking flag immediately BEFORE the token (or FUSED to it as `--jq=…`), never the flag's value.
+# ── ⚠️ THE TOKENIZER IS NOW QUOTE-AWARE, AND IT HAD TO BECOME SO. Round 4 ran over the DE-QUOTED
+# views, where `-H "A: $X"` — ONE shell word — word-splits into `A:` and `$X`, whose preceding token
+# is `A:` and not `-H`. Under `IS` that read survived by ACCIDENT (`$(cat` in the sibling `-H "X-Y:
+# $(cat h)"` is not wholly an expansion, so the accident even looked like a rule); under `CONTAINS` it
+# would have denied an ordinary header read. MEASURED, not reasoned: `gh api -H "A: $X"
+# repos/o/r/pulls/5/merge` was ALREADY DENIED at cec9bce4 — an unpinned round-4 over-deny in exactly
+# the read lane this row exists to protect — and it is refunded here and pinned by its own cell.
+# So this function takes a view with its QUOTES INTACT (`$_pj`/`$_pe`, not `$_pn`/`$_pne`) and splits
+# on unquoted whitespace only, dropping the quote bytes. A backslash is treated as a joiner exactly as
+# `_s6_dequote` treats it: the byte is dropped and the next byte kept, so `\$` reads as `$` and denies
+# — fail-closed, and one byte's worth of over-deny on a shape nobody writes.
+# ── WHY awk. A POSIX `for` loop over `$1` cannot see quotes; the alternative is a character walk in
+# shell, which is an order of magnitude slower on every command the hook judges. awk is already used
+# in this file (`_cp8b_hd_consumer`). No `set -f` dance is needed any more: the split happens inside
+# awk, so pathname expansion never touches the tokens.
+_cp8b_api_expansion_indicator() {
+  printf '%s\n' "$1" | awk -v roflags="$_CP8B_API_READONLY_FLAGS" '
+    BEGIN { n = split(roflags, fl, " "); for (i = 1; i <= n; i++) ro[fl[i]] = 1; buf = "" }
+    { buf = buf $0 " " }
+    END {
+      q = ""; tok = ""; started = 0; prev = ""; hit = 0; L = length(buf)
+      for (i = 1; i <= L; i++) {
+        c = substr(buf, i, 1)
+        if (q != "") { if (c == q) { q = "" } else { tok = tok c } ; started = 1; continue }
+        if (c == "\047" || c == "\042") { q = c; started = 1; continue }
+        if (c == "\\") { i++; if (i <= L) { tok = tok substr(buf, i, 1) } ; started = 1; continue }
+        if (c == " " || c == "\t") {
+          if (started) {
+            e = index(tok, "=")
+            fused = (e > 1 && (substr(tok, 1, e - 1) in ro))
+            if (!(prev in ro) && !fused && (index(tok, "$") > 0 || index(tok, "\140") > 0)) { hit = 1; break }
+            prev = tok; tok = ""; started = 0
+          }
+          continue
+        }
+        tok = tok c; started = 1
+      }
+      exit (hit ? 0 : 1)
+    }'
+}
+
+# _s6_dequote: delete the JOINER bytes `'`, `"` and `\`. In the shell a quote is a joiner, not a
+# boundary — `me''rge` executes as `merge` — so a matcher that respects quotes is a matcher that can
+# be walked through. Extracted as a helper at T2 round 2 so the porcelain arm's four views share ONE
+# definition (and so one mutant can revert all four; see M-R1).
+# ⚠️ NAMED `_s6_`, NOT `_cp8b_`, ON PURPOSE. `_cp8b_dequote` ALREADY EXISTS further down this file
+# (the token de-quoter used by the control-plane target parse). A second definition under that name
+# would not be an error — the shell simply keeps the LAST one — so this arm would have silently
+# called the other function, and M-R1 would have mutated a dead definition and passed while proving
+# nothing. Caught by the mutant's own "matched 2 lines" report during the build. The two helpers do
+# similar things and must NOT be merged: that one strips a `--flag=` prefix and is load-bearing for
+# path matching; this one only deletes bytes.
+_s6_dequote() {
+  printf '%s' "$1" | tr -d "'\"\\\\"
+}
+
+# _cp8b_segments "<cmd>": print one segment per line (split on ; && || | & and newline).
+# Used ONLY by the CP-8b logic below. It is NEVER fed back into the destructive matrix, which keeps
+# seeing the raw, unsplit string. (CP-8a: an earlier draft split the command and REJOINED it with ';',
+# which destroyed the pipe `curl x | sh` detects and the end-of-string `--admin` anchors on, silently
+# turning two DENY rules into ALLOW. Nothing is rejoined here.)
+# A separator inside a quoted string over-splits into a bogus segment whose lead is unrecognized ->
+# scan-and-deny. Over-DENY, fail-closed - and identical to today's verdict.
+# GUARD-DENY-TRIO M1 (fd-dup/combined-redirect half): the `&` of a REDIRECT operator (`>&`, `&>`,
+# `2>&`, `>>&`) is NOT a command separator and must not split the command. Before this, `s/&/;/g`
+# turned `echo x >&conformance/verify.sh` into `echo x >` + `conformance/verify.sh`, orphaning the
+# redirect TARGET into a bare segment that the kit-exec recognizer then read as "running the script" and
+# ALLOWED — a combined-redirect WRITE laundered as a command. (The boarded GUARD-REDIRECT-FD-DUP-
+# COMBINED-BYPASS mechanism, absorbed here.) The design named `_redir_targets`' `&`-exclusion as the
+# fix, but the split happens HERE first, so `_redir_targets` never saw `>&word`; both must change. A
+# redirect `&` is protected via the _cp8b_soh sentinel across the `&`->`;` pass, then restored, so ONLY
+# a true separator `&` (background/`&&` already collapsed above) splits. fd-dups (`2>&1`, `>&-`) keep
+# their `&` and stay one segment — _redir_targets then classifies them (numeric/`-` => excluded).
+# GUARD-CLOBBER-REDIRECT-INVISIBLE (the `>|` half of the same class): the `|` of the CLOBBER operator
+# `>|` (and `N>|`) is NOT a command separator either, and it was laundering CP writes exactly as the
+# redirect `&` did before M1 — `echo x >| conformance/verify.sh` split into `echo x >` (an empty
+# redirect target) and a bare, verbless ` conformance/verify.sh`, and BOTH halves allowed. The row
+# text named `_redir_targets` as the fix site; that was measured WRONG, for the same reason M1 records
+# above: the split happens HERE first, so the extractor never saw a `>|`. It is protected with its own
+# sentinel `_cp8b_etx` (0x03) across the `|`->`;` passes and restored after — a FRESH byte, distinct
+# from `_cp8b_soh` (0x01, the `>&` protector) and `_cp8b_stx` (0x02, _cp8b_pipe_segments' pipe-fed
+# marker) and from F-a's five mask bytes, because a shared byte would let one mechanism's bookkeeping
+# forge the other's. K-MASK-SENTINELS counts all eight.
+_cp8b_soh=$(printf '\001')
+_cp8b_etx=$(printf '\003')
+_cp8b_segments() {
+  _cp8b_joinlines "$1" \
+    | sed -e "s/>|/>$_cp8b_etx/g" \
+          -e 's/&&/;/g' -e 's/||/;/g' -e 's/|/;/g' \
+          -e "s/>&/>$_cp8b_soh/g" -e "s/&>/$_cp8b_soh>/g" \
+          -e 's/&/;/g' \
+          -e "s/$_cp8b_soh/\&/g" \
+          -e "s/$_cp8b_etx/|/g" \
+    | tr ';\n' '\n\n'
+}
+
+# === GUARD-READ-LANE-2 F-a — THE QUOTED-SPAN MASK, GATED ON A READ-LED WHOLE =======================
+# design: docs/architecture/2026-08-26-guard-read-lane-2-design.md §3-F-a.
+#
+# THE DEFECT. `_cp8b_segments` above is quote-BLIND. A separator byte inside a `'…'` or `"…"` span is
+# not a separator at all, but it splits anyway — so `grep -E "a|b" conformance/verify.sh` becomes the
+# fragments `grep -E "a` and `b" conformance/verify.sh`, the second of which has an unrecognized lead
+# and is scan-and-denied on its control-plane token. Every measured face of this row (R3, R4, R5) is
+# that one bug, and it denies PLAIN READS.
+#
+# THE CURE, AND ITS SHAPE. This is FAIL-BY-DISQUALIFICATION, never fail-by-parse (`D-240813-3`; three
+# rounds of this class were reverted, each having reopened a control-plane WRITE hole). It is NOT a
+# shell parser. It builds a SEGMENTATION COPY in which the five separator bytes are replaced by
+# sentinels WHEN THEY LIE INSIDE A QUOTED SPAN, and it keeps that copy only under a gate. On ANY byte
+# whose quoting it cannot settle by inspection it DECLINES — returns the input untouched — and the
+# command is judged exactly as it is today, byte for byte. Every path out of here is either "today"
+# or "a whole command led end-to-end by read verbs".
+#
+# THE DECLINE SET, and why each byte is in it:
+#   `\` BEFORE `"`, `'` OR `\`   an escaped quote (`x\"`) is NOT a span boundary. A walker that reads
+#               it as one masks the REAL `;` after it and merges a write into a read: reverted round
+#               3's exact defect. `\\` is in the set because it CONSUMES the next backslash, so the
+#               byte after it must not be read as an escape either.
+#               ⚠️ NARROWED FROM "ANY BACKSLASH" BY THE T8 REVIEW (commit B). The whole-string form
+#               cost the row its own headline faces — `grep -n "readonly\|READONLY" <cp>` and
+#               `grep -rn "speed bump\|speed-bump" docs skills`, i.e. grep BRE alternation, the single
+#               commonest read spelling in this repo. THE NARROWING IS STILL A DISQUALIFICATION, not a
+#               parser: every OTHER `\X` is TWO LITERAL BYTES to the shell and to the walker alike, so
+#               it cannot move a span boundary, and the walker needs no rule to handle it correctly.
+#               Only the three pairs above can desynchronise a span-kind walk, and only those decline.
+#               (`$` and backtick still decline the WHOLE string; `\`+newline is already gone at
+#               `_cp8b_joinlines`.) Mutants M-A2 / M-A2b / M-A2c pin the set and each of its members;
+#               `K-MASK-BSLASH` pins all three pairs at source level.
+#               ⚠️ AND THE SPELLING IS LOAD-BEARING. Written as a `case` pattern, `*'\\"'*` is TWO
+#               backslashes inside single quotes and matches NOTHING: the decline vanishes silently
+#               while the line is still visibly in the file (the seat measured M-A2 flipping ALLOW
+#               against exactly that). It is a `grep` against `_cp8b_mask_bs`, assembled once below
+#               from `_cp8b_sq` so no layer of quoting has to be counted by eye.
+#   `` ` ``     a command substitution: the bytes that run are not the bytes here.
+#   `$`         the same, plus `${…}` and `$VAR`. Design §8's invariant is that NO recogniser in this
+#               slice accepts a `$` (it is what keeps GUARD-KIT-EXEC-REDIRECT-UNRESOLVED-TARGET out
+#               of reach); this honours it.
+#   `<<`        a heredoc. Its body is Arm E's subject and its quoting rules are not these.
+#   newline/CR  after joining, a residual newline means more than one command line; the segmenter
+#               splits on it and the mask has no opinion about what the second line quotes.
+#   odd `"` or odd `'` count  unbalanced quoting over the whole string: the walker's span model and
+#               the shell's cannot be shown to agree, so it is not asserted.
+#   an OPEN SPAN at the end of the walk (T8 review finding F-2)  the counts are a PRECHECK, not the
+#               property: CROSS-KIND PARITY (two `'` and two `"`, one of the `"` inert inside the
+#               single-quoted span) passes both counts and still ends mid-span. The walk itself now
+#               reports its end state and this declines on it.
+# With those bytes gone, "the current opening quote kind wins until its match" IS the shell's rule,
+# which is why the walker tracks nothing else.
+#
+# THE LOAD-BEARING GATE. Masking is kept only if EVERY segment of the masked copy is led by a verb on
+# `_CP8B_MASK_GATE_VERBS`. That list is a SEPARATELY DECLARED, re-vetted subset — NOT `_CP8B_READ_VERBS`
+# and not a runtime subtraction of it, because the seat's vet (§10-A1 findings 4-5) falsified the first
+# draft's "complete by inheritance": `file -C -m X` WRITES `X.mgc`, and the git "read subs" include
+# `add`/`commit`/`stash`, which mutate the index and the worktree (`git stash push -- <cp>` discards
+# guard edits). So `file` is OUT of the gate and the git subs are the declared query forms only. Those
+# verbs keep their existing DATA recognition in the old arms — nothing about their verdict changes —
+# they simply may not AUTHORISE re-segmentation.
+# What the gate buys, stated HONESTLY — and the first draft of this paragraph overclaimed, so read the
+# correction rather than the slogan. WHAT IS TRUE: with the mask kept, every segment's LEAD VERB is on
+# this list, so no segment can be led by `cp`/`install`/`mv`/`rm`/`sh`/a kit script, and the mutation
+# arms keyed on those LEADS are not reached. WHAT IS NOT TRUE, and was claimed: that the segments are
+# therefore harmless. A LEXICON IS A VERB LIST; THE EXEC/WRITE FLAG LIVES IN THE ARGV. The T8 review
+# (finding F-1) MEASURED four verbs on the first draft of this list that carry one — `rg --pre <cmd>`
+# and `git grep -O <cmd>` EXEC an arbitrary program, `diff --to-file=<path>` and `column -o <path>`
+# WRITE one — and all four ALLOW at pristine 4b3debc3, i.e. they are PRE-EXISTING data-lexicon holes
+# this gate would have amplified by re-segmenting whole commands on their authority. They are OFF the
+# list below, fail-closed, and the underlying holes stay boarded and open (narrowing the data lexicon
+# is a different row; doing it here would widen over-deny across the whole read lane unmeasured).
+# THE PROPERTY THAT REMAINS, and it is the one a reviewer can check: the mask may only ever be kept for
+# a command every one of whose segments is led by a verb this list VETTED — vetting that is a human
+# judgement per verb, re-done when a verb is added, NOT an inference from the read lexicon and NOT a
+# proof of harmlessness. Any other lead — `sh`, `python3`, `xargs`, `tee`, `cp`, a kit script, an empty lead — discards the
+# mask outright. This is what separates F-a from reverted round 2, which classified on the FIRST lead.
+# The lead is judged DE-QUOTED (T7's critical: a de-quoted lookup beside a raw test is how `'-delete'`
+# slipped find's allowlist), so `'sh'` and `"tee"` are the words they will actually be.
+#
+# ORDERING. T1's `_cp8b_piped_interp_hit` runs on the RAW command in both arms BEFORE the mask is even
+# consulted, so a pipe into an interpreter is judged raw whatever the quoting looks like.
+#
+# SENTINEL DISCIPLINE (seat finding 7). FIVE DISTINCT bytes, all different from the `>&` sentinel
+# `_cp8b_soh` (0x01) used by `_cp8b_segments` above, from `_cp8b_stx` (0x02) used by
+# `_cp8b_pipe_segments`, and from `_cp8b_etx` (0x03), the `>|` CLOBBER protector both segmenters use
+# — a shared byte would let one mechanism's bookkeeping forge the other's.
+# One byte per separator so the restore is exact and total.
+_cp8b_mk_pipe=$(printf '\016')
+_cp8b_mk_semi=$(printf '\017')
+_cp8b_mk_amp=$(printf '\020')
+_cp8b_mk_gt=$(printf '\021')
+_cp8b_mk_lt=$(printf '\022')
+_cp8b_mk_all="$_cp8b_mk_pipe$_cp8b_mk_semi$_cp8b_mk_amp$_cp8b_mk_gt$_cp8b_mk_lt"
+# Two users, both below: the mask walk's decline set (`_cp8b_mask_quoted`) and `_cp8b_strip_heredocs`.
+_cp8b_cr=$(printf '\r')
+_cp8b_sq=$(printf '\047')
+# _cp8b_mask_bsset / _cp8b_mask_bs — the NARROWED backslash disqualifier (T8 review, commit B).
+# THE SET, on its own line, is the reviewable half: the three bytes a `\` may not immediately precede.
+# `"` and `'` because an ESCAPED QUOTE is not a span boundary and a walker that reads it as one
+# desynchronises (reverted round 3's defect); `\` because a backslash consumes the next backslash, so
+# the byte after the pair must not be read as an escape either. Nothing else belongs here: every other
+# `\X` is two literal bytes to the shell and to the walker alike.
+# THE PATTERN is a BRE — one literal backslash, then that set as a bracket expression. Assembled once,
+# from variables, rather than spelled at the use site: the `'` arrives as `$_cp8b_sq` and the literal
+# backslash as a double-quoted `\\\\`, so nothing here depends on counting quote layers by eye. See
+# the decline-set note above for the `case`-pattern trap this avoids. Resulting bytes: \\["'\\]
+_cp8b_mask_bsset="\"$_cp8b_sq\\\\"
+_cp8b_mask_bs="\\\\[$_cp8b_mask_bsset]"
+# The gate lexicon: `_CP8B_READ_VERBS` MINUS `file`, and `git` admitted only through the sub list.
+# ⚠️ IT IS A COPY ON PURPOSE and must NOT be rewritten as a subtraction of `_CP8B_READ_VERBS`: the two
+# lists answer different questions (that one asks "are this verb's arguments data?", this one asks
+# "may this verb authorise re-segmentation of the whole command?"), and `file` is the measured proof
+# they differ. A future addition to the read lexicon must be re-vetted before it appears here.
+# ⚠️ T8 REVIEW FINDING F-1 — FOUR VERBS REMOVED, and the removals are the vet, not a style change:
+#   `rg`     — `rg --pre <cmd>` runs an arbitrary preprocessor per file (EXEC).
+#   `git grep` (the sub `grep`) — `-O/--open-files-in-pager <cmd>` runs a pager command (EXEC).
+#   `diff`   — a `--to-file=<path>` operand is not read-only in every diff implementation (WRITE).
+#   `column` — `-o <arg>` is an output SEPARATOR in one dialect and an output FILE in another, and the
+#              guard cannot tell which binary it faces (WRITE).
+# Bare `grep`/`egrep`/`fgrep` STAY: they carry no exec or write flag. The price is priced and celled —
+# a flagless `rg`/`diff`/`column`/`git grep` quoted-alternation read of a CP file is DENY again, one
+# retry away from `grep -E`. Removal is fail-closed; adding a verb back requires its own measurement.
+# GUARD-READ-PATTERN-RELIEF Face 1 — `cd` JOINS THE GATE, and only `cd`. It is added on its own
+# MEASUREMENT (design §3 Face 1, lane-2 §10-A1's per-lead rule, never inheritance): `cd` reads no
+# stdin, executes no argument and writes no file, so it cannot be the pipe-fed interpreter this gate
+# exists to keep upstream data away from; its one effect on a later segment is the cwd, which
+# `_cp8b_eff_update` already follows (`cd conformance && sed -i s/a/b/ verify.sh` is celled DENY).
+# `pwd true false test [ export unset` were cleared on the same grounds but have ZERO measured
+# denials, so they are NOT here. The gate buys the MASK, nothing else: the pipe rule, the redirect
+# arm and every mutation arm still run on the unmasked bytes.
+# ⚠️ `cd` IS APPENDED, not prepended: M-A1-rg's mutation expression anchors on `='grep`.
+_CP8B_MASK_GATE_VERBS='grep egrep fgrep ls cat head tail wc stat du cut tr nl od hexdump tac comm cmp basename dirname realpath readlink echo printf which type shellcheck jq shasum md5 cksum yamllint git cd'
+_CP8B_MASK_GATE_GIT_SUBS='status blame describe diff log show ls-files'
+# _cp8b_unmask_quoted "<s>": the sentinels back to their bytes. Total and exact — one byte per byte.
+_cp8b_unmask_quoted() {
+  printf '%s' "$1" | tr "$_cp8b_mk_all" '|;&><'
+}
+# _cp8b_mask_walk "<joined-cmd>": the span walk. Tracks ONLY the current opening quote kind, which is
+# the shell's own rule once the decline set has removed every byte that could complicate it. awk, not
+# a sed pass: a regex cannot carry the open/closed state a span needs, and a shell `while read -n1`
+# loop over every command is a per-byte fork budget this hook does not have.
+_cp8b_mask_walk() {
+  printf '%s\n' "$1" | awk -v P="$_cp8b_mk_pipe" -v S="$_cp8b_mk_semi" -v A="$_cp8b_mk_amp" \
+                           -v G="$_cp8b_mk_gt" -v L="$_cp8b_mk_lt" -v Q="$_cp8b_sq" '
+    NR == 1 {
+      n = length($0); q = ""; out = ""
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (q == "") { if (c == "\"" || c == Q) { q = c }; out = out c; continue }
+        if (c == q)  { q = ""; out = out c; continue }
+        if      (c == "|") out = out P
+        else if (c == ";") out = out S
+        else if (c == "&") out = out A
+        else if (c == ">") out = out G
+        else if (c == "<") out = out L
+        else               out = out c
+      }
+      printf "%s", out
+      # T8 review finding F-2 - THE END STATE IS PART OF THE ANSWER. A walk that reaches the end of
+      # the string with a span still OPEN did not model the shell, it guessed. The two even-count
+      # prechecks in _cp8b_mask_quoted cannot see that case, because CROSS-KIND PARITY satisfies them:
+      # a string with two single quotes and two double quotes passes both counts even when one double
+      # quote is INERT (it sits inside the single-quoted span) and the other opens a span that never
+      # closes. The real separator after it was then masked and a write onto the guard was merged into
+      # a read verb data argument. Measured DENY at pristine, ALLOW at 41d4278e: a regression.
+      # Exit non-zero and the caller declines to today path. M-A4 pins it.
+      if (q != "") exit 1
+    }'
+}
+# _cp8b_mask_gate_ok "<masked-cmd>": 0 iff EVERY non-blank segment of the masked copy is led by a gate
+# verb. Fails CLOSED on anything it cannot name: an empty lead, a lead carrying a sentinel (`"gr|ep"`),
+# an unresolvable git sub — none is on the list, so none passes.
+_cp8b_mask_gate_ok() {
+  # Runs inside `_cp8b_mask_quoted`'s `$(…)`: a fault exits that subshell with NO output, and
+  # `_cp8b_walk_load` turns the vanished mask into the fault (see the note there).
+  _mgw=$(_cp8b_segments "$1") || _guard_fault mask-gate-segments
+  _guard_vanished mask-gate-segments "$1" "$_mgw"
+  while [ -n "$_mgw" ]; do
+    case "$_mgw" in
+      *"$_cp8b_nl"*) _mgs=${_mgw%%"$_cp8b_nl"*}; _mgw=${_mgw#*"$_cp8b_nl"} ;;
+      *)             _mgs=$_mgw; _mgw='' ;;
+    esac
+    # fork-free blank test
+    case $_mgs in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    _mgp=$(_cp8b_strip_wrappers "$_mgs")
+    _mgl=$(_cp8b_dequote "$(_cp8b_lead "$_mgp")")
+    # GUARD-READ-PATTERN-RELIEF Face 2 — a `sed`/`awk` segment is a gate lead ONLY IF THE STRICT READ
+    # GRAMMAR F-b ALREADY TRUSTS ACCEPTS IT. Neither verb goes on the lexicon: `sed -i`, a `w`/`e`/`s`
+    # script, a second script, an extra flag, a flag-shaped operand or a redirect all decline here and
+    # keep discarding the mask, exactly as today. Fail-by-disqualification, no new parser.
+    # ⚠️ THE UNMASK IS LOAD-BEARING (vet C3), NOT STYLE. The grammar is called on
+    # `_cp8b_unmask_quoted "$_mgs"` — the IDENTICAL bytes the arm judges at :3077/:4150 — never on the
+    # masked copy. Hand it the masked copy and a sentinel inside a path token stops looking like the
+    # separator it is: `_cp8b_seg_path_ok` refuses `"x;y.txt"` on the `;` and passes the sentinel, so
+    # the gate and the arm would see different tokens and a quoted separator would survive into a
+    # kept mask. M-RPR2 mutates exactly this argument and its anchor flips DENY -> ALLOW.
+    case "$_mgl" in
+      sed) _cp8b_seg_sed_n_strict "$(_cp8b_unmask_quoted "$_mgs")" && continue
+           return 1 ;;
+      awk) _cp8b_seg_awk_range_strict "$(_cp8b_unmask_quoted "$_mgs")" && continue
+           return 1 ;;
+    esac
+    _cp8b_in_list "$_mgl" "$_CP8B_MASK_GATE_VERBS" || return 1
+    if [ "$_mgl" = git ]; then
+      _mgb=$(_cp8b_dequote "$(_cp8b_git_sub "$_mgp")")
+      _cp8b_in_list "$_mgb" "$_CP8B_MASK_GATE_GIT_SUBS" || return 1
+    fi
+  done
+  return 0
+}
+# _cp8b_mask_quoted "<cmd>": PRINTS the string the CP arms should segment — the masked copy when every
+# decline passed and the gate held, otherwise the INPUT UNCHANGED. Exit status is informational only
+# (0 = mask kept); no caller may branch on it, because "declined" and "kept but identical" must be the
+# same thing to everything downstream.
+_cp8b_mask_quoted() {
+  # GUARD-QUOTED-EXEC-INTERMITTENT: this runs inside the caller's `$(…)`, so an exit here leaves only that
+  # subshell — which is the point: it prints NOTHING, and `_cp8b_walk_load` faults on the vanished result.
+  _mqi=$(_cp8b_joinlines "$1") || _guard_fault mask-joinlines
+  _guard_vanished mask-joinlines "$1" "$_mqi"
+  case "$_mqi" in
+    *'`'*|*'$'*|*'<<'*)                        printf '%s' "$1"; return 1 ;;
+    *"$_cp8b_nl"*|*"$_cp8b_cr"*)               printf '%s' "$1"; return 1 ;;
+  esac
+  # THE NARROWED BACKSLASH DISQUALIFIER (T8 review, commit B) — decline iff a `\` is IMMEDIATELY
+  # followed by `"`, `'` or `\`. Those three pairs are the only ones that can move a span boundary;
+  # every other `\X` is two literal bytes and the walk handles it correctly with no rule at all. This
+  # is what refunds R3/R4 (`grep "a\|b"`, BRE alternation) without re-opening reverted round 3.
+  if _gmq quote-mask "$_mqi" LC_ALL=C -q "$_cp8b_mask_bs"; then printf '%s' "$1"; return 1; fi
+  _mqd=$(printf '%s' "$_mqi" | tr -dc '"' | wc -c | tr -d ' ')
+  [ "$((_mqd % 2))" = 0 ] || { printf '%s' "$1"; return 1; }
+  _mqs=$(printf '%s' "$_mqi" | tr -dc "$_cp8b_sq" | wc -c | tr -d ' ')
+  [ "$((_mqs % 2))" = 0 ] || { printf '%s' "$1"; return 1; }
+  # F-2 (T8 review): the walk's EXIT STATUS carries its end state — non-zero means it finished with a
+  # span still open, which the even-count prechecks above cannot detect (see the note in the walk).
+  # An open span means the walker and the shell disagree about what is quoted, so nothing is asserted.
+  _mqm=$(_cp8b_mask_walk "$_mqi") || { printf '%s' "$1"; return 1; }
+  # Nothing masked => nothing to gate and nothing to gain; hand back the ORIGINAL so the common case
+  # is byte-identical to today and cannot be perturbed by the join above.
+  [ "$_mqm" != "$_mqi" ] || { printf '%s' "$1"; return 1; }
+  _cp8b_mask_gate_ok "$_mqm" || { printf '%s' "$1"; return 1; }
+  printf '%s' "$_mqm"
+  return 0
+}
+
+# === GUARD-TRAILER-IN-MESSAGE-FP — THE CARRIER NEWLINE JOIN (design §3, §10) ========================
+# THE DEFECT: `_cp8b_segments` is quote-BLIND, so the kit's own printed trailer block (`Kit-Skill:
+# skills/build`) pasted into an inline multi-line `git commit -m "…"` became its own segment and was
+# denied as a control-plane write. THE CURE is refuse-on-doubt, not a parser (D-240813-3): on a command
+# LED by a message carrier the kit tells an agent to use, a newline INSIDE a quoted span becomes a space.
+# Unquoted newlines, `;`, `&&`, `|` still split and each piece is judged on its own as today.
+# `_cp8b_mask_walk` is single-line and the read-lane mask depends on that, so this has its OWN walk.
+# _cp8b_lead_is_board_create "<seg>": 0 iff the leading tokens are exactly `sh scripts/board.sh create`
+# (design §3: bash-led, bare/absolute path and env-prefixed spellings all decline). The CALLER owns the
+# cwd condition — the relative script is attacker-authored code anywhere but the repo root (delta C1).
+_cp8b_lead_is_board_create() {
+  _blg=0; case "$-" in
+    *f*) _blg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split of the segment; globbing disabled above
+  set -- $1
+  _blr=1
+  [ "${1:-}" = sh ] && [ "${2:-}" = scripts/board.sh ] && [ "${3:-}" = create ] && _blr=0
+  [ "$_blg" = 1 ] || set +f
+  return "$_blr"
+}
+# _cp8b_carrier_lead "<cmd>": 0 iff the FIRST line's leading tokens are `git commit`, `gh pr
+# create|edit|comment`, or `sh scripts/board.sh create` at the confident repo root (the SEED, since the
+# lead is the first command). NOT `git merge|tag|notes`, `gh issue|release` (design §8 L11).
+_cp8b_carrier_lead() {
+  _clg=0; case "$-" in
+    *f*) _clg=1 ;;
+    esac
+  set -f
+  _cll=${1%%"$_cp8b_nl"*}
+  # shellcheck disable=SC2086  # deliberate word-split of the first line; globbing disabled above
+  set -- $_cll
+  _clr=1
+  case "${1:-} ${2:-}" in
+    'git commit') _clr=0 ;;
+    'gh pr')
+      case "${3:-}" in
+        create|edit|comment) _clr=0 ;;
+      esac ;;
+  esac
+  [ "$_clg" = 1 ] || set +f
+  [ "$_clr" = 0 ] && return 0
+  # R5: the seed-root test below is a BELT. The board.sh segment is re-judged at the root by
+  # `_cp8b_tad_is_board_create` once the walk has the live cwd; this only keeps the JOIN off a non-root cwd.
+  [ -z "${_CP8B_SEED_EFF:-}" ] && [ "${_CP8B_SEED_UNKNOWN:-0}" = 0 ] && _cp8b_lead_is_board_create "$_cll"
+}
+# _cp8b_carrier_walk "<cmd>": the join. Tracks ONLY the open quote kind. Exits 1 (prints nothing) on any
+# doubt: `$`, backtick, `<<`, CR, a backslash before `"` `'` or `\`, an odd count of either quote, a span
+# open at the end, ANY `#` outside a span (vet C1: the shell ends a comment at the newline and a quote
+# byte inside it is inert, so a "span" after a `#` is really executed lines), or ANY `>` outside a span
+# (design §12 S1: a newline inside a quoted redirect TARGET became a space, `"x\n/../skills/…"` -> `"x /../…"`), or
+# ANY unquoted `;` `&` `|` or newline (design §13 H1: the join serves a SINGLE-COMMAND carrier only, so it can never
+# rewrite a quoted newline in a LATER command — `… && cp /tmp/e ".claude/skills/x\ny"`; the `>` rule is the belt). Inside a span a newline
+# becomes a space; outside, bytes are copied unchanged. On a decline it prints the REASON (the tip's
+# source, `_cp8b_carrier_why`) instead of the joined command, and `_cp8b_carrier_join` discards it.
+_cp8b_carrier_walk() {
+  printf '%s\n' "$1" | LC_ALL=C awk -v Q="$_cp8b_sq" '
+    { if (NR > 1) { if (q == "") why = (why == "") ? "an unquoted newline" : why; out = out (q == "" ? "\n" : " ") }
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1); d = substr($0, i + 1, 1)
+        if (c == "$" || c == "`") why = (why == "") ? "a $ or backtick" : why
+        if (c == "<" && d == "<") why = (why == "") ? "a heredoc (<<)" : why
+        if (c == "\r" || (c == "\\" && (d == "\"" || d == Q || d == "\\"))) why = (why == "") ? "a CR or a backslash before a quote" : why
+        if (c == "\"") nd++
+        if (c == Q) ns++
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "#") why = (why == "") ? "a # outside quotes" : why
+        if (c == ">") why = (why == "") ? "a > redirect outside quotes" : why
+        if (c == ";" || c == "&" || c == "|") why = (why == "") ? "a ; & or | outside quotes" : why
+        if (c == "\"" || c == Q) q = c
+      }
+      out = out $0 }
+    END { if (why == "" && (q != "" || nd % 2 || ns % 2)) why = "an odd number of " Q " or \" quotes (an apostrophe counts)"
+          if (why != "") { printf "%s", why; exit 1 }
+          printf "%s", out }'
+}
+# _cp8b_carrier_join "<cmd>": PRINTS the joined command, or the INPUT UNCHANGED when it declines. Exit
+# status is informational only (the `_cp8b_mask_quoted` contract), so a decline and a no-op look alike.
+_cp8b_carrier_join() {
+  case "$1" in
+    *"$_cp8b_nl"*) : ;;
+    *) printf '%s' "$1"; return 1 ;;
+  esac
+  _cp8b_carrier_lead "$1" || { printf '%s' "$1"; return 1; }
+  _cjo=$(_cp8b_carrier_walk "$1") || { printf '%s' "$1"; return 1; }
+  printf '%s' "$_cjo"
+}
+# _cp8b_carrier_why "<cmd>": for the deny tip (design §3 UX, §8 L2/L10). Prints the construct that made a
+# carrier-led MULTI-LINE command decline the join, or nothing when the command is not that shape.
+_cp8b_carrier_why() {
+  case "$1" in
+    *"$_cp8b_nl"*) : ;;
+    *) return 0 ;;
+  esac
+  _cp8b_carrier_lead "$1" || return 0
+  _cjw=$(_cp8b_carrier_walk "$1") && return 0
+  printf '%s' "$_cjw"
+}
+
+# _cp8b_unparseable "<seg>": 0 iff the segment carries a construct the guard CANNOT resolve to the bytes
+# the shell will actually execute: $VAR, $(...), `...`, <(...). The guard reads PRE-shell-parse bytes;
+# the tool acts POST-parse. Such a segment is NEVER relaxed - and, for a git WRITE subcommand, is denied
+# OUTRIGHT (see _cp8b_git_write_denied). That is the attack this closes:
+#     git archive -o $(echo conformance/verify.sh) HEAD
+# would otherwise slip BOTH the target-bind (target unresolvable) AND the co-occurrence floor
+# (`git archive` is not a mutation verb). A bare '(' is NOT unparseable - a subshell's lead token is
+# unrecognized and already fails closed - so conventional-commit subjects like "fix(guard): ..." parse.
+_cp8b_unparseable() {
+  _gmq unparseable "$1" -q '[$`]' && return 0
+  _gmq unparseable "$1" -q '<(' && return 0
+  return 1
+}
+
+# _cp8b_lead "<seg>": the leading verb, plainly. An env-assignment prefix (`GIT_EXTERNAL_DIFF=rm git
+# diff`) yields a token containing '=', which matches no verb set -> unknown -> fail closed.
+_cp8b_lead() {
+  printf '%s' "$1" | sed -E 's/^[[:space:]]*\\?[[:space:]]*//; s/[[:space:]].*$//'
+}
+
+# _cp8b_dequote "<tok>": strip quote/escape bytes; for --flag=value / of=value forms, yield the VALUE.
+# Safe in THIS DIRECTION ONLY: stripping normalizes TOWARD the real path, so --output="conformance/x"
+# -> conformance/x -> matches -> DENY. It is NOT general shell parsing; $VAR and $(...) are
+# unrecoverable, which is exactly why _cp8b_unparseable REFUSES them rather than parsing them badly.
+# (CP-8a's review broke a target-parse whose failure direction was OPEN. Here unparseability is caught
+# first and routed to deny, so what remains is a byte-match on a de-quoted literal whose worst case is
+# an over-match -> over-DENY -> closed.)
+_cp8b_dequote() {
+  printf '%s' "$1" | sed -e "s/'//g" -e 's/"//g' -e 's/\\//g'
+}
+
+# _cp8b_dequote_lead "<seg>": the segment with ONLY its LEAD TOKEN de-quoted, every other byte
+# untouched. T7's cure ("the lead is judged de-quoted") applied where a recogniser needs the whole
+# segment but the lexicon lookup inside it keys on the lead: whole-segment `_cp8b_dequote` cannot be
+# used there because it would also strip quotes out of the operands the recogniser inspects.
+# NORMALIZES TOWARD the real verb, so its only failure direction is an over-match -> over-DENY.
+_cp8b_dequote_lead() {
+  _dqs=$1
+  _dqs=${_dqs#"${_dqs%%[![:space:]]*}"}          # drop leading whitespace
+  case "$_dqs" in
+    *[[:space:]]*) _dql=${_dqs%%[[:space:]]*}; _dqr=${_dqs#"$_dql"} ;;
+    *)             _dql=$_dqs;                 _dqr='' ;;
+  esac
+  printf '%s%s' "$(_cp8b_dequote "$_dql")" "$_dqr"
+}
+
+# _cp8b_tok_is_cp "<tok>": 0 iff the token, de-quoted and stripped of a flag= prefix, is a control-plane
+# target.
+_cp8b_tok_is_cp() {
+  _tt=$(_cp8b_dequote "$1")
+  case "$_tt" in
+    *=*) _tt=${_tt#*=} ;;
+    esac
+  [ -n "$_tt" ] || return 1
+  is_control_plane_target "$_tt"
+}
+
+# _cp8b_cp_target_in "<mode>" "<seg>": 0 iff a control-plane TARGET appears among the segment's argument
+# tokens.
+#   mode=all  - EVERY non-flag token is a target: rm/rmdir/shred/truncate/chmod/chown/tee/patch/dd/sed;
+#               mv/rsync (whose SOURCE is destroyed too - which is what catches `mv conformance /tmp`);
+#               and ln (which creates a WRITABLE ALIAS to its source - see the dispatch rationale below).
+#   mode=last - only the LAST non-flag token is a target: cp/install, which copy CONTENT, so their source
+#               is merely READ. This is what makes `cp conformance/verify.sh /tmp/b.sh` (copying OUT)
+#               legitimate. A destination-naming flag (-t/--target-directory) is bound explicitly below,
+#               in EITHER mode, because it inverts the positional heuristic.
+# Globbing is disabled around the word-split so `rm *.sh` cannot expand against the real filesystem.
+# _cp8b_cp_doubt "<seg>": 0 iff a cp/install segment is one whose LAST token cannot be trusted as the destination:
+# a whitespace-preceded `#` (design §11) or an odd count of `"` or `'` (design §12 A, a split quoted span).
+_cp8b_cp_doubt() {
+  case "$1" in
+    *[[:space:]]'#'*) return 0 ;;
+  esac
+  _cdq=$(printf '%s' "$1" | tr -dc '"' | wc -c | tr -d ' ')
+  [ -n "$_cdq" ] || return 0   # design §13 L2: an empty count would abort the arithmetic; doubt fails closed
+  [ "$((_cdq % 2))" = 0 ] || return 0
+  _cdq=$(printf '%s' "$1" | tr -dc "$_cp8b_sq" | wc -c | tr -d ' ')
+  [ -n "$_cdq" ] || return 0
+  [ "$((_cdq % 2))" = 0 ] || return 0
+  return 1
+}
+_cp8b_cp_target_in() {
+  _m=$1
+  # GUARD-TRAILER-IN-MESSAGE-FP, design §11: `last` (cp/install) takes the LAST token as the destination, so a
+  # trailing `# word` made `word` the destination and `cp /tmp/e skills/build/SKILL.md # y` was ALLOWED. On a
+  # whitespace-preceded `#` (quoted or not: refuse on doubt, no comment parse) judge EVERY operand. Adds denies only.
+  # design §12 A: an ODD quote count is the same doubt — the segment is a FRAGMENT of a split quoted span
+  # (`cp /tmp/e <cp-path>" x --title "gh pr"` ends in a junk word), so the last token is not the destination.
+  if [ "$_m" = last ] && _cp8b_cp_doubt "$2"; then _m=all; fi
+  _pg=0; case "$-" in
+    *f*) _pg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-splitting; globbing disabled above
+  set -- $2
+  _cl_v=${1:-}; [ $# -gt 0 ] && shift          # drop the leading verb (kept for the GSR C9 link check)
+  _hit=1; _last=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      # A destination-naming flag INVERTS the positional heuristic: `cp -t <dir> <src>` and
+      # `--target-directory=<dir>` make <dir> the destination even though it is not the last token.
+      # Bind it explicitly (any mode) - otherwise the "last token" rule checks the SOURCE and misses
+      # the real write target. This is the same flag-binding as `git worktree add -b`. install/ln share
+      # -t/--target-directory. A bare `-t` without a value is a malformed command -> nothing to bind.
+      -t|--target-directory)
+        if [ $# -ge 2 ]; then
+          _dt=$(_cp8b_dequote "$2")
+          [ -n "$_dt" ] && { is_control_plane_target "$_dt" || _cp8b_via_link_cp "$_dt" "$_cl_v"; } && { _hit=0; break; }
+          shift
+        fi
+        shift; continue ;;
+      # Joined short form (`-tconformance`) and abbreviated/`=`-joined long forms (`--target-di=…`,
+      # `--target-directory=…`). GNU getopt honors a joined short-option value and any UNAMBIGUOUS long
+      # prefix, so a partial match here is not paranoia - it is the exact evasion the security review
+      # demonstrated. For cp/ln/install, `--target-d…` is unambiguous (no other `--target-*` option), so
+      # matching the family closes the hole without a per-tool option table.
+      # CAVEAT (verb-set-coupled): this `--target-d*` match is safe only because NO verb currently routed
+      # here (cp/install/mv/rsync/rm/rmdir/shred/truncate/chmod/chown/tee/patch/dd/sed/ln) carries a
+      # distinct `--target-d*` option. If a future verb with one is added to these groups, revisit.
+      -t?*)
+        _dt=$(_cp8b_dequote "${1#-t}")
+        _dt=${_dt#=}
+        [ -n "$_dt" ] && { is_control_plane_target "$_dt" || _cp8b_via_link_cp "$_dt" "$_cl_v"; } && { _hit=0; break; }
+        shift; continue ;;
+      --target-d*=*)
+        _dt=$(_cp8b_dequote "${1#*=}")
+        [ -n "$_dt" ] && { is_control_plane_target "$_dt" || _cp8b_via_link_cp "$_dt" "$_cl_v"; } && { _hit=0; break; }
+        shift; continue ;;
+      --target-d*)
+        if [ $# -ge 2 ]; then
+          _dt=$(_cp8b_dequote "$2")
+          [ -n "$_dt" ] && { is_control_plane_target "$_dt" || _cp8b_via_link_cp "$_dt" "$_cl_v"; } && { _hit=0; break; }
+          shift
+        fi
+        shift; continue ;;
+      -*) shift; continue ;;     # any other flag is not a path target
+    esac
+    _d=$(_cp8b_dequote "$1")
+    case "$_d" in
+      *=*) _d=${_d#*=} ;;
+      esac
+    if [ -n "$_d" ]; then
+      _last=$_d
+      if [ "$_m" = all ] && { is_control_plane_target "$_d" || _cp8b_via_link_cp "$_d" "$_cl_v"; }; then _hit=0; break; fi   # GSR C9
+    fi
+    shift
+  done
+  if [ "$_m" = last ] && [ "$_hit" = 1 ] && [ -n "$_last" ] && { is_control_plane_target "$_last" || _cp8b_via_link_cp "$_last" "$_cl_v"; }; then
+    _hit=0
+  fi
+  [ "$_pg" = 1 ] || set +f
+  return $_hit
+}
+
+# _cp8b_optval_exp "<value token>" "<mode>": 0 iff a global option's value holds an UNQUOTED `$` or backtick (SWAS-227): the shell
+# word-splits it, so the value can carry its own subcommand. Mode u reads the RAW token's quoting (a `$` inside "..." or '...' is
+# quoted; a backslash escapes the next byte); mode c is for the quote-collapsed view, where quotedness is gone: any `$`/backtick counts.
+# SWAS-232: rc stays 0 (doubt) / 1 (none); the state the token ENDS in is reported in _ox_open: empty (closed), `"` or `'` (inside that
+# quote), or `\` (an unquoted trailing backslash, which joins the shell word to the next token). An optional third argument is the state
+# carried in from the previous token (`"`/`'` starts inside that quote; `\` starts unquoted, the backslash having consumed the
+# whitespace). Mode c always leaves _ox_open empty. Mode u is to be called ONLY through _cp8b_optval_span (cell SWAS232-B1).
+_cp8b_optval_exp() {
+  _ox_a=$1; _ox_q=${3:-}; _ox_open=''
+  [ "$_ox_q" = '\' ] && _ox_q=''
+  while [ -n "$_ox_a" ]; do
+    _ox_c=${_ox_a%"${_ox_a#?}"}; _ox_a=${_ox_a#?}
+    if [ -n "$_ox_q" ]; then
+      [ "$_ox_c" = "$_ox_q" ] && _ox_q=''
+      [ "$_ox_c" = '\' ] && [ "$_ox_q" = '"' ] && _ox_a=${_ox_a#?}
+      continue
+    fi
+    case "$_ox_c" in
+      '$'|'`') return 0 ;;
+      "'"|'"') [ "$2" = u ] && _ox_q=$_ox_c ;;
+      '\')
+        if [ "$2" = u ]; then
+          [ -n "$_ox_a" ] || { _ox_open='\'; return 1; }
+          _ox_a=${_ox_a#?}
+        fi ;;
+    esac
+  done
+  _ox_open=$_ox_q
+  return 1
+}
+
+# _cp8b_optval_span "<first value token>" [<the tokens after it>...]: the ONLY mode-u entry (SWAS-232). The segment is split on
+# whitespace, which cuts ONE shell word in two when a quote is left open (or a backslash escapes the whitespace). While the word is
+# open this scans the NEXT token only, from the carried state, so each byte is scanned once. rc 0 = doubt: an unquoted `$`/backtick, or a
+# word still open after the last token. rc 1 = none; _ox_n is the number of extra tokens the value took. It never shifts the caller's arguments.
+_cp8b_optval_span() {
+  _os_t=$1; shift; _ox_n=0; _os_s=''
+  while :; do
+    _cp8b_optval_exp "$_os_t" u "$_os_s" && return 0
+    [ -n "$_ox_open" ] || return 1
+    [ "$_ox_open" = '\' ] && [ "${_gsw:-0}" = 1 ] && return 0
+    [ $# -gt 0 ] || return 0
+    _os_s=$_ox_open; _os_t=$1; shift; _ox_n=$((_ox_n + 1))
+  done
+}
+
+# _cp8b_git_sub "<seg>" [u|c]: the git subcommand, after skipping GLOBAL options. Empty if unresolvable
+# (an unknown global option, or with a mode: a global option value holding an unquoted expansion, see _cp8b_optval_exp)
+# -> the caller fails closed. A subcommand is a token in COMMAND POSITION:
+# you cannot quote your way into `git commit` actually being `git diff`, which is why binding to the
+# SUBCOMMAND is sound where CP-8a's review proved binding to the TARGET was not.
+_cp8b_git_sub() {
+  _gm=${2:-}
+  _pg=0; case "$-" in
+    *f*) _pg=1 ;;
+    esac
+  # SWAS-232: the split below collapses whitespace RUNS, so a backslash followed by 2+ whitespace bytes in the raw text ends the shell word
+  # after the escaped byte; the span cannot tell that from a join, so it reads a trailing-backslash carry as doubt when this is set.
+  _gsw=0
+  case "$1" in
+    *'\'[[:space:]][[:space:]]*) _gsw=1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  [ $# -gt 0 ] && shift          # drop `git`
+  _gs=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|-C|--git-dir|--work-tree|--exec-path|--namespace)
+        [ $# -ge 2 ] || break
+        if [ "$_gm" = u ]; then
+          shift; _gv=$1; shift
+          _cp8b_optval_span "$_gv" "$@" && break
+          shift $_ox_n; continue
+        fi
+        if [ -n "$_gm" ] && _cp8b_optval_exp "$2" "$_gm"; then break; fi
+        shift 2; continue ;;
+      --git-dir=*|--work-tree=*|--exec-path=*|--namespace=*)
+        if [ "$_gm" = u ]; then
+          _gv=$1; shift
+          _cp8b_optval_span "$_gv" "$@" && break
+          shift $_ox_n; continue
+        fi
+        if [ -n "$_gm" ] && _cp8b_optval_exp "$1" "$_gm"; then break; fi
+        shift; continue ;;
+      -p|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs)
+        shift; continue ;;
+      -*) _gs=''; break ;;       # an unknown global option -> unresolvable -> fail closed
+      *)  _gs=$1; break ;;
+    esac
+  done
+  [ "$_pg" = 1 ] || set +f
+  printf '%s' "$_gs"
+}
+
+# _cp8b_git_target_is_cp "<sub>" "<seg>": 0 iff the git WRITE subcommand's own destination is a
+# control-plane target. Each subcommand names its destination differently - that is the whole point of
+# target-binding, and why a flat regex could never do this.
+_cp8b_git_target_is_cp() {
+  _gsub=$1
+  _pg=0; case "$-" in
+    *f*) _pg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $2
+  _hit=1; _seen=0
+  case "$_gsub" in
+    archive)
+      # `git archive` writes a file ONLY via -o / --output; without it, it streams to stdout.
+      # Separated (`-o x`), `=`-joined (`-o=x`, `--output=x`), and short-JOINED (`-ox`) forms all bind.
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -o|--output)
+            if [ $# -ge 2 ] && _cp8b_tok_is_cp "$2"; then _hit=0; break; fi ;;
+          --output=*)
+            if _cp8b_tok_is_cp "$1"; then _hit=0; break; fi ;;
+          -o?*)
+            _ov=$(_cp8b_dequote "${1#-o}"); _ov=${_ov#=}
+            [ -n "$_ov" ] && is_control_plane_target "$_ov" && { _hit=0; break; } ;;
+        esac
+        shift
+      done ;;
+    bundle|worktree)
+      # `git bundle create <file> <rev>` · `git worktree add [-b <branch>] <path> [<commit>]`.
+      # Scan EVERY non-flag token after the marker, not just the first: a flag that takes a VALUE
+      # (`git worktree add -b br conformance/wt`) consumes the first slot, so a "first non-flag token"
+      # heuristic checks `br` and never sees the real path. Over-scanning can only ADD denies.
+      # Only `create`/`add` write into a new path; bundle verify/list and worktree list/prune do not.
+      # (The orchestrator uses `git worktree add /tmp/…` on every fan-out, so this MUST stay allowed
+      # outside the control plane — corpus family D locks that.)
+      while [ $# -gt 0 ]; do
+        if [ "$_seen" = 1 ]; then
+          case "$1" in
+            -*) : ;;
+            *) if _cp8b_tok_is_cp "$1"; then _hit=0; break; fi ;;
+          esac
+        fi
+        case "$1" in
+          create|add) _seen=1 ;;
+          esac
+        shift
+      done ;;
+    init|clone|checkout|restore)
+      # init: [<dir>] · clone: <src> <dir> · checkout/restore: pathspecs (they OVERWRITE the worktree).
+      # Any non-flag token naming a control-plane path is a write target. `git checkout -b fix/x` has
+      # no such token -> allowed (the A4 false positive).
+      [ $# -gt 0 ] && shift      # drop `git`
+      [ $# -gt 0 ] && shift      # drop the subcommand
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -*) : ;;
+          *) if _cp8b_tok_is_cp "$1"; then _hit=0; break; fi ;;
+        esac
+        shift
+      done ;;
+  esac
+  [ "$_pg" = 1 ] || set +f
+  return $_hit
+}
+
+# A "word" after `git` is a token that does not start with `-`, or that holds `$` or a backtick (an unquoted `-$x` word-splits into a
+# flag plus a word). With no word git prints and exits (--version, --help, --exec-path, a bare git), so nothing is judged.
+#
+# _cp8b_git_sub_doubt "<view>" "<sub>": 0 (and prints the reason) iff the subcommand cannot be identified (SWAS-227, fail closed as
+# _cp8b_git_sub promises): (a) empty because of an unknown global option, with a word after git (above); (b) spelled as a shell expansion.
+_cp8b_git_sub_doubt() {
+  case "$2" in
+    '')
+      _hw_g=0; case "$-" in
+        *f*) _hw_g=1 ;;
+        esac
+      set -f
+      # shellcheck disable=SC2086
+      set -- $1
+      [ $# -gt 0 ] && shift
+      _hw_r=1
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -*'$'*|-*'`'*) _hw_r=0; break ;;
+          -*) : ;;
+          *) _hw_r=0; break ;;
+        esac
+        shift
+      done
+      [ "$_hw_g" = 1 ] || set +f
+      [ "$_hw_r" = 0 ] || return 1
+      printf '13: git with a global option the guard does not know before the subcommand, or an unquoted $ or backtick in a global option value (quote the value), cannot be judged (the subcommand is hidden) - denied (fail-closed). Drop the option, or use its environment form (GIT_OPTIONAL_LOCKS=0, GIT_ADVICE=0, GIT_NO_LAZY_FETCH=1, GIT_ATTR_SOURCE=<rev>); for -P use --no-pager; for --help <cmd> use git help <cmd>. (escape card R23 git-pathspec)'
+      return 0 ;;
+    *'$'*|*'`'*|*'{'*|*'*'*|*'?'*|*'['*)
+      printf '13: git with a subcommand spelled as a shell expansion ($, a backtick, a brace or a glob) cannot be judged - denied (fail-closed). Spell the subcommand literally. (escape card R23 git-pathspec)'
+      return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_git_write_denied "<seg>": PREDICATE - returns 0 (TRUE, "deny this") and prints the reason, or 1
+# (allow). Note the inverted convention vs. the guard_check_* API: this is an internal predicate, named
+# so at the call site.
+#
+# `-o` is --output (a WRITE) for `git archive` and --only (a READ) for `git commit`. That ambiguity is
+# why the flat rule could not resolve it, and why `git commit -m "... --output ..."` was a false
+# positive (CP-8a's recorded residual). Subcommand-binding resolves it.
+_cp8b_git_write_denied() {
+  _ws=$1
+  # GSR C7: a glob or magic pathspec is judged on the NORMALISED view (wrappers, assignments, quoting and quoted `-c`/`-C` values peeled)
+  _wv=$(_cp8b_git_view "$_ws") || _guard_fault git-view
+  if [ -n "$_wv" ]; then
+    # SWAS-227: a git led by a wrapper has lost its quoting in the view (mode c: any $ or backtick in a global option value counts);
+    # a git-led segment is judged on its RAW tokens below, where the quoting is still there
+    _wm=c; [ "$(_cp8b_lead "$_ws")" = git ] && _wm=''
+    _wvs=$(_cp8b_git_sub "$_wv" "$_wm")
+    _cp8b_git_sub_doubt "$_wv" "$_wvs" && return 0
+    case "$_wvs" in
+      checkout|restore|rm|stash|reset)
+        _cp8b_git_pathspec_doubt "$_wv" "$_wvs" && return 0 ;;
+    esac
+  fi
+  [ "$(_cp8b_lead "$_ws")" = git ] || return 1
+  _wsub=$(_cp8b_git_sub "$_ws" u)
+  [ -n "$_wsub" ] || { _cp8b_git_sub_doubt "$_ws" '' && return 0; }
+  # the view collapses a quoted pathspec holding whitespace to one word, so the RAW segment is judged too (the two results are ORed)
+  case "$_wsub" in
+    checkout|restore|rm|stash|reset)
+      _cp8b_git_pathspec_doubt "$_ws" "$_wsub" && return 0 ;;
+  esac
+  case "$_wsub" in
+    archive|bundle|worktree|init|clone|checkout|restore) : ;;
+    diff|log|show|format-patch)
+      # The diff machinery honors --output=<file>: an arbitrary file WRITE/TRUNCATE with NO shell
+      # redirect, which slips every redirect guard. Denied OUTRIGHT - NO target is parsed, because a
+      # quoted / escaped / substituted target evades a byte match while git writes the real path (a live
+      # bypass caught in CP-8a re-review). Unchanged from CP-8a; only its SCOPE narrows, from "any git"
+      # to "the subcommands that actually honor the flag".
+      # Match --output (space/=/joined) AND -o (space, or JOINED value `-oconformance`). This is an
+      # OUTRIGHT deny with no target parsed, so a joined value cannot smuggle a write past it.
+      if _gmq git-output-write "$_ws" -Eq '(^|[[:space:]])(--output([=[:space:]]|$)|-o([[:space:]]|$|[^[:space:]]))'; then
+        printf '13: git %s --output/-o writes an arbitrary file via the diff machinery (defeats the shell-redirect guards) - human-gated. Redirect to a non-control-plane path instead (git diff > /tmp/x). (escape card R31 git-output)' "$_wsub"
+        return 0
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
+  # A write subcommand. Unparseable target => we CANNOT prove it lands outside the control plane => DENY
+  # OUTRIGHT (fail-closed). See _cp8b_unparseable for why this specific clause is the attack surface.
+  if _cp8b_unparseable "$_ws"; then
+    printf '13: git %s with an unresolvable (variable/substituted) target cannot be proven to land outside the control plane - denied (fail-closed). Use a literal path. (escape card R4 redir-nonliteral)' "$_wsub"
+    return 0
+  fi
+  if _cp8b_git_target_is_cp "$_wsub" "$_ws"; then
+    printf '13: git %s would write into the control plane (guard / CI gates / conformance) - denied (control-plane integrity). Next: make this change in a dev clone (escape card R30 cp-write).' "$_wsub"
+    return 0
+  fi
+  return 1
+}
+
+# _cp8b_scan_denied "<seg>": PREDICATE - today's CO-OCCURRENCE rule, applied to ONE segment. This is the
+# fail-closed floor for every segment whose lead is an interpreter, a wrapper, or simply unrecognized.
+# Extended in exactly one direction - it now also matches a BARE control-plane directory token - which
+# can only ADD denies (monotone).
+# _cp8b_redirect_hits_cp "<segment>": does any REDIRECT TARGET in this segment land on a control-plane
+# path? Derived from is_control_plane_path / is_control_plane_target — the SINGLE SOURCE OF TRUTH —
+# rather than a second, hand-maintained inventory.
+#
+# WHY: the redirect arm used to carry its own regex alternation listing control-plane paths. It drifted
+# from the classifier by construction, and the drift was measured: `echo evil > scripts/dora.sh`,
+# `> scripts/agent-scorecard.sh`, `> scripts/new-adapter.sh`, `> scripts/postmortem.sh`,
+# `> scripts/sparkwright`, `> scripts/fixtures/*` and three more were ALLOWED while classifying
+# control-plane at the gate. Adding names closed nine and left nine — "a named set with no
+# family-completeness lock rots by construction". Deriving the answer cannot drift.
+#
+# Targets are extracted after `>`, `>>` or the CLOBBER `>|` (GUARD-CLOBBER-REDIRECT-INVISIBLE — the
+# operator's `|` byte is consumed WITH it by the `|\{0,1\}` in the extraction, so the target is the
+# token AFTER it; without this half the token would be a bare `|`, which fails the positive allowlist
+# and rc-2s EVERY `>|`, absolute and `~`-rooted targets included — an over-deny the `K-CLOB allow `
+# cells pin against and the M-CLOB2 mutant kills). Any fd digit and surrounding whitespace stripped, and
+# quotes removed so `> "conformance/x.sh"` is seen. Case folding is inherited from the classifier.
+# _redir_targets "<segment>": GUARD-CP-WRITE-ROUTES Cure 2 (Route 2) — the SHARED redirect-target
+# EXTRACTION + POSITIVE literal-path allowlist disqualifier, called by BOTH redirect bail sites
+# (_cp8b_redirect_hits_cp and _cp8b_tad_redir_cp) so the extraction and the disqualifier cannot drift.
+# Each caller keeps its OWN classification loop (composed-vs-plain); this helper only produces the
+# candidate literal targets and signals a disqualifying non-literal.
+#
+# Prints each SAFE (allowlist-clean) target on its own line. Return code:
+#   0 = clean — every extracted target is a plain literal (or an fd-dup, which is excluded);
+#   3 = a NON-LITERAL target was seen — the caller MUST bail to the deny side (fail-closed): the
+#       guard cannot prove an unresolvable $(…)/$VAR/glob/backslash target is not control-plane.
+#       (It was 2 until SWAS-583. 2 is now reserved for a FAULT, which `_guard_fault` exits with, so
+#       a fault inside this function can never be read as a legitimate "non-literal" answer.)
+# THE DISQUALIFIER IS A POSITIVE ALLOWLIST, not a bad-byte denylist: a target is recognized safe ONLY
+# if every byte is in `[A-Za-z0-9._/@:+=,-]`; anything else ($ backtick * ? [ { ~ \ space etc.)
+# disqualifies. A denylist lost twice here — `$`/backtick failed open on globs, an 8-byte set failed
+# open on backslash (`hooks\/pre-push`). The allowlist closes the class definitively.
+# fd-dups (`2>&1`, `>&2`, `N>&M`) extract to `&N` tokens, and an `&`-led token is EXCLUDED from the
+# scan — otherwise a naive allowlist would spuriously disqualify legitimate fd-dups (over-deny).
+# DISCLOSED RESIDUAL, not masked (security seat C1, MED): the `&`-exclusion is BROADER than true
+# fd-dups. bash's `>&<word>` combined-redirect with a NON-NUMERIC word writes a FILE, but its
+# `&<word>` token is `&`-led and so is dropped here too — meaning `_redir_targets` NEVER scans a
+# combined-redirect target. A combined-redirect to a control-plane target is therefore not caught by
+# THIS arm; it is only ever denied when another arm (the pathhit substring / token walk) independently
+# catches the literal, so a spelling that evades those would slip through as an ALLOWED CP-write. This
+# is PRE-EXISTING (the old extraction produced the same `&`-led token) and OUTSIDE the two routes this
+# slice closes; the functional cure is boarded as its own deny-side slice,
+# GUARD-REDIRECT-FD-DUP-COMBINED-BYPASS. Named here so the `&`-exclusion cannot read as complete.
+# The split runs under `set -f` (globbing off) with the caller's `-f` state restored, so a `*` target
+# is judged as raw text before any pathname expansion.
+_redir_targets() {
+  case "$1" in
+    *'>'*) : ;;
+    *) return 0 ;;
+    esac
+  # design §12 B: the extraction below keeps only the FIRST word of a target, so a QUOTED target that holds
+  # whitespace or a newline (`> "x /../skills/build/SKILL.md"`) resolved to the wrong path (`x`). Such a target is
+  # unresolvable; a control-plane token anywhere in it fails closed (rc 3). Covers `>>`, `>|`, `&>` and `n>`.
+  # design §13 M1: ANY quote byte in a target WORD (`>x" /../skills/…"`, `> ".claude/"hooks/…`, `>& "…"`) is the same doubt:
+  # the awk below prints each target word that carried a quote, de-quoted (backslashes dropped too), and a control-plane
+  # path in it returns rc 3. It reads the word to its first unquoted blank, which is no more than a refuse-on-doubt scan.
+  _rq=$(printf '%s' "$1" | tr '\n' ' ' | LC_ALL=C awk -v Q="$_cp8b_sq" '{
+    n = length($0); oq = ""
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      # design §16 R1: outside a span a backslash CONSUMES the next byte (`\x27` is a literal quote, not a span opener), and
+      # inside "…" it consumes `\"` and `\\`; without this an escaped quote opened a phantom span and the real `>` was skipped.
+      if (oq == "" && c == "\\") { i++; continue }
+      if (oq == "\"" && c == "\\") { i++; continue }
+      if (oq != "") { if (c == oq) oq = ""; continue }
+      if (c == "\"" || c == Q) { oq = c; continue }
+      if (c != ">") continue
+      j = i + 1
+      while (substr($0, j, 1) ~ /[|>&]/) j++
+      while (substr($0, j, 1) == " " || substr($0, j, 1) == "\t") j++
+      w = ""; hasq = 0; q = ""
+      for (; j <= n; j++) {
+        c = substr($0, j, 1)
+        if (c == "\\" && q != Q) { j++; w = w substr($0, j, 1); continue }
+        if (q == "") { if (c == " " || c == "\t") break; if (c == "\"" || c == Q) { q = c; hasq = 1; continue } }
+        else if (c == q) { q = ""; continue }
+        w = w c
+      }
+      if (hasq) print w
+      i = j
+    }
+  }') || _guard_fault redir-target-scan
+  if [ -n "$_rq" ] && _cp8b_pathhit "$_rq"; then return 3; fi
+  # BELT (design §16 R1): the quote-blind view from fcf126b4 as a second opinion, so a mis-tracked span in the awk above cannot
+  # hide a quoted-with-whitespace target. rc 0 (a match) and rc 1 (none) are both answers; a fault inside the matcher is not.
+  _rq2t=$(printf '%s' "$1" | tr '\n' ' ') || _guard_fault redir-target-view
+  _guard_vanished redir-target-view "$1" "$_rq2t"
+  _rq2rc=0
+  _rq2=$(_gmo redir-target-space "$_rq2t" LC_ALL=C -Eo ">[|>]?[[:space:]]*(\"[^\"]*[[:space:]][^\"]*\"|'[^']*[[:space:]][^']*')") || _rq2rc=$?
+  [ "$_rq2rc" -le 1 ] || _guard_fault redir-target-space
+  if [ -n "$_rq2" ] && _cp8b_pathhit "$_rq2"; then return 3; fi
+  _rt=$(printf '%s' "$1" | tr '\n' ' ' | sed -e 's/[0-9]*>>*|\{0,1\}/\n/g' | sed -e '1d' \
+        -e 's/^[[:space:]]*//' -e 's/[[:space:]].*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//') || _guard_fault redir-target-list
+  [ -n "$_rt" ] || return 0
+  _rtc=0
+  _rtg=0; case "$-" in
+    *f*) _rtg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $_rt
+  while [ $# -gt 0 ]; do
+    _rtk=$1; shift
+    [ -n "$_rtk" ] || continue
+    case "$_rtk" in
+      # GUARD-DENY-TRIO M1: a post-`&` token that is ALL-DIGITS (`>&1`, `N>&M`) or `-` (`>&-`) is a
+      # true fd-dup/close — not a filesystem target — and stays excluded (the 14 relief forms). A
+      # NON-NUMERIC word (`>&conformance/verify.sh`, `>&hooks/pre-pus*`, `>&$VAR`) is bash's combined-
+      # redirect FILE write: strip the `&` and let it fall through to the literal/allowlist classifier
+      # below, so a literal CP target denies and a glob/$VAR target fails closed (rc 3). This narrows the
+      # previously-broad `&`-exclusion (disclosed residual C1) without disturbing any fd-dup form.
+      '&'*)
+        _rtd=${_rtk#'&'}
+        case "$_rtd" in
+          ''|-) continue ;;                             # >&-  / bare & — close/dup, never a file target
+          *[!0-9]*) _rtk=$_rtd ;;                        # >&<non-numeric word> — a combined-redirect write
+          *) continue ;;                                # >&N (all-digits) — fd-dup, never a file target
+        esac ;;
+    esac
+    case "$_rtk" in
+      # GUARD-READONLY-FP-RELIEF Arm G(ii) — a `~`-ROOTED target is a LITERAL for this classifier.
+      # `~` was outside the allowlist, so every out-of-repo scratch append (`printf x >> ~/notes.txt`)
+      # disqualified and the Cure-2 launder arm denied it. Unlike `$VAR`, a `~` target shows every
+      # byte after the home root LITERALLY, so it is control-plane-CHECKABLE — and it is checked:
+      # `is_control_plane_target` classifies the `~/…` spelling directly (measured), so
+      # `> ~/proj/.claude/settings.json` still denies via the callers' own CP test.
+      # ***THE `$VAR` FORM IS DELIBERATELY NOT HERE*** (security vet H1): with the DIRECTORY in the
+      # variable, the visible suffix (`pre-push`, `settings.json`, `reviewer.agent.md`) does not
+      # self-classify, so relieving it would partially revert the Cure-2 closure — a deny-side
+      # weakening inside a false-positive slice. The `$SCRATCH` idiom is answered by a TIP instead.
+      # Declines (fall through to rc 3, fail-closed): a `..` byte anywhere in the suffix (it climbs
+      # out of $HOME, so the target is no longer shown literally); any non-literal byte after the `~`
+      # (a glob/backslash/substitution); and — the design's "cannot SEGMENT-MATCH a control-plane
+      # path" condition — any `~` target that trips `_cp8b_pathhit`.
+      # ⚠️ THE `_cp8b_pathhit` DISQUALIFIER IS LOAD-BEARING AND WAS FOUND BY A FLOOR REGRESSION, not
+      # by design. `is_control_plane_target` ALONE is not enough: `GUARD-CLAUDE-HOME-INSTRUMENTATION-FP`
+      # relieved `.claude/plans/*` and `.claude/projects/*` from the CLASSIFIER (a path-route relief),
+      # while agent-autonomy.sh pins `echo x >> ~/.claude/plans/x.md` DENY on the COMMAND route as a
+      # deliberate retained false positive. With only the classifier consulted, this arm would have
+      # silently flipped that pinned decision — a deny-side change belonging to that slice, not this
+      # one. `_cp8b_pathhit` is the segment matcher, it still hits the whole `.claude` family, and it
+      # keeps every one of those legs green (measured). Widening this arm past `_cp8b_pathhit` is a
+      # deny-side decision and needs its own slice.
+      # REVIEW I3 (2026-08-19): a HOME-ROOT DOTFILE (`~/.gitconfig`, `~/.config/git/config` — where
+      # core.hooksPath ALSO lives — `~/.zshrc`, `~/.ssh/authorized_keys`) moved DENY->ALLOW here,
+      # undisclosed: these are not repo control-plane so `_cp8b_pathhit` misses them, but a write to
+      # them is a real out-of-repo escalation (`~/.config/git/config` reopens exactly the guard-disable
+      # vector Arm F defends). Decline any `~/`-suffix whose FIRST byte after the home root is `.`
+      # (the `/.*` glob on the `~`-stripped suffix). The three legit relief legs (`~/notes.txt`,
+      # `~/scratch/out.txt`, `~/logs/verify.log`) do not start with `/.`, so they stay allowed.
+      '~'|'~/'*)
+        case "${_rtk#\~}" in
+          *..*|*[!A-Za-z0-9._/@:+=,-]*|/.*) _rtc=3 ;;
+          *) if _cp8b_pathhit "$_rtk"; then _rtc=3; else printf '%s\n' "$_rtk"; fi ;;
+        esac ;;
+      *[!A-Za-z0-9._/@:+=,-]*) _rtc=3 ;;                # NOT a plain literal -> disqualify (fail-closed)
+      *) printf '%s\n' "$_rtk" ;;
+    esac
+  done
+  [ "$_rtg" = 1 ] || set +f
+  return $_rtc
+}
+
+_cp8b_redirect_hits_cp() {
+  _rh=$1
+  case "$_rh" in
+    *'>'*) : ;;
+    *) return 1 ;;
+    esac
+  _rt=$(_redir_targets "$_rh") || return 0   # rc 3 => a non-literal target, any other rc a fault => fail closed (K-R1b)
+  [ -n "$_rt" ] || return 1
+  _rg=0; case "$-" in
+    *f*) _rg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $_rt
+  while [ $# -gt 0 ]; do
+    if [ -n "$1" ] && { is_control_plane_path "$1" || is_control_plane_target "$1"; }; then
+      [ "$_rg" = 1 ] || set +f
+      return 0
+    fi
+    shift
+  done
+  [ "$_rg" = 1 ] || set +f
+  return 1
+}
+
+# _cp8b_pathhit "<segment>": 0 iff a control-plane path appears anywhere in the segment TEXT (the
+# string-level basis). SINGLE SOURCE OF TRUTH — called by both the old verb-arm (_cp8b_scan_denied)
+# and the new resolved-target arm (_cp8b_target_arm_denied), so the regex cannot drift between them.
+# The regex is byte-identical to the inline form _cp8b_scan_denied carried before the target-arm fold
+# (GUARD-BASENAME-AFTER-CD-BYPASS), so the old arm's verdict is unchanged. It is REQUIRED for the lifted
+# gate: the P0 case `python3 -c "open('hooks/pre-push','w')"` hides the path inside interpreter syntax
+# the token split cannot see, but this substring grep does.
+# GUARD-HOOKSPATH-CASE-BYPASS (seat MEDIUM, characterized): the alternation is split into the same
+# TWO TIERS `is_control_plane_path` already established (:64-98) — reused here, not reinvented, so
+# the fold rationale cannot drift between the two matchers. TIER 1 (kit-owned, unambiguous names —
+# `.claude`, CODEOWNERS, `.git`, hooks/pre-push, the enumerated `.kit/*.conf` + named scripts, the
+# scanner-ignore files, and `agents/*.agent.md`, which is already unconditional in
+# `is_control_plane_path`'s own Tier 1) folds on EVERY platform: no adopter coincidentally names a
+# different thing `.CLAUDE` or `HOOKS/PRE-PUSH`. TIER 2 (the generic directory prefixes `skills/`,
+# `conformance/`, `adapters/`) folds ONLY when `_fs_case_insensitive` — folding it unconditionally
+# would reintroduce the EXACT false-positive `is_control_plane_path`'s own A2 fix measured and closed
+# (`src/Adapters/Repo.cs`, `Skills/Onboarding.cs` are legitimate adopter code on a case-sensitive
+# filesystem). `_fs_case_insensitive` is sound here for the SAME reason it is sound for
+# `is_control_plane_path`: these are repo-relative prefixes, always judged against the tree the guard
+# itself sits on — not an arbitrary absolute path that could live on a different mounted volume (the
+# reason a filesystem probe was REJECTED for the `.env` secret arm, design §3 resolution (B)).
+# GUARD-PATH-ENUMERATION-INCOMPLETE S1 — THE `.claude` LEG IS LEFT-ANCHORED, AND THE ANCHOR CLASS IS
+# PINNED. The leg used to be `\.claude(/|…)` with NO left anchor, so it matched `foo.claude/` and
+# `v2.claude/` — the same `<x>.claude/...` false positive the path globs carried. Relieving it on the
+# path route ALONE would have been worse than leaving it: the redirect/cmd route would keep denying an
+# ordinary adopter file while the acceptance criterion greened on the path route (route-split relief).
+# ⚠️ THE ANCHOR IS `(^|[^A-Za-z0-9._-])`, NOT `(^|/)`. Do NOT transplant the path-glob phrasing "at the
+# start or after a /" into this regex: it matches COMMAND TEXT, not a path. `(^|/)` would drop the
+# quoted (`".claude/x"`), post-space (`verb .claude/x`) and post-`=` (`--out=.claude/x`) spellings out
+# of pathhit entirely — and for the interpreter form `python3 -c "open('.claude/settings.json','w')"`
+# pathhit is the ONLY arm that fires (the token walk cannot see a path inside the parentheses), so
+# `(^|/)` would re-open that P0 class outright. The class excludes every byte that can end a FILENAME
+# (letters, digits, `.`, `_`, `-`), so `foo.claude/` and `v2.claude/` relieve while start-of-string,
+# post-`/`, post-space, post-quote, post-`=`, post-`:` all still deny. Corner-spelling DENY fixtures and
+# sibling ALLOW fixtures both live in conformance/agent-autonomy.sh; this narrowing is a deny
+# RELAXATION and carries its own fixtures and its own monotonicity run, per the standing rule.
+# AGENTS.md and REQUIRED-CHECKS.md use the CODEOWNERS-style anchor `(^|[^a-zA-Z.])`: an unanchored
+# `agents\.md` would substring-match `subagents.md`.
+# ⚠️ `.gitattributes` IS LEFT-ANCHORED WITH THE PINNED CLASS, NOT LEFT BARE. It shipped as a plain
+# substring in the first cut of this slice, copied from the `.gitleaksignore` precedent — and that was
+# an UNDECLARED deviation from the design, which specifies segment-anchored membership. It produced a
+# measured ROUTE SPLIT: `foo.gitattributes` and `docs/my.gitattributes` ALLOWED at the Write/Edit path
+# route (the globs `​.gitattributes|*/.gitattributes` are already segment-exact) while DENYING here under
+# any unrecognized lead verb. The precedent did not transfer: nothing is plausibly named
+# `foo.gitleaksignore`, but `<tool>.gitattributes` is an ordinary generated-file spelling. Anchoring
+# aligns this leg with the globs it is supposed to mirror; the class is the same one the `.claude` leg
+# pins, so start-of-string, post-`/`, post-space, post-quote, post-`=` and post-`:` all still deny.
+# ⚠️ INHERITED-ANCHOR FACE, DECLARED (M3): the CODEOWNERS class `(^|[^a-zA-Z.])` admits `-`, so
+# `SUB-AGENTS.md` DENIES here while the path route ALLOWS it (the glob `agents.md|*/agents.md` is
+# segment-exact). That asymmetry is inherited from the CODEOWNERS convention this leg copies, not
+# introduced by it, and it is fail-SAFE in the direction it errs. It is stated rather than fixed
+# because narrowing the shared CODEOWNERS anchor class is a change to an existing deny with its own
+# fixtures and its own monotonicity run — not a tidy-up to ride along here.
+_CP8B_PATHHIT_T1='((^|[^A-Za-z0-9._-])\.claude(/|[[:space:]]|$)|\.github/workflows|/CODEOWNERS|(^|[^a-zA-Z.])CODEOWNERS|(^|[^a-zA-Z.])AGENTS\.md|(^|[^a-zA-Z.])REQUIRED-CHECKS\.md|(^|[^a-zA-Z.])WAIVER-REGISTER\.md|(^|[^a-zA-Z.])CLAUDE\.md|(^|[^a-zA-Z.])DEVELOPMENT-STANDARDS\.md|(^|[^a-zA-Z.])DEVELOPMENT-PROCESS\.md|(^|[^A-Za-z0-9._-])\.gitattributes|\.git(/|[[:space:]]|$)|hooks/pre-push|scripts/kit-guard|scripts/tracker-conf\.sh|scripts/tracker-jira\.sh|scripts/tracker-read\.sh|scripts/board\.sh|docs/governance/\.meta-control-last|docs/governance/meta-control-log\.md|\.kit/budget\.conf|\.kit/roster\.conf|\.kit/model-map\.conf|\.kit/model-tiers\.conf|\.kit/dials\.conf|\.kit/ratification-seats\.conf|\.kit/control-plane\.conf|scripts/model-tier\.sh|scripts/orchestrator-run\.sh|agents/[^[:space:]]*\.agent\.md|scripts/release-tag\.sh|scripts/promotion-verify\.sh|scripts/escalate\.sh|\.gitleaks\.toml|\.gitleaksignore|\.publish-identifiers|\.semgrepignore|\.trivyignore|\.checkov\.yaml|\.checkov\.yml|\.kit/tracker\.conf|\.kit/boundary-optout\.conf|\.kit/ci-pre-approval\.conf|(^|[^A-Za-z0-9._-])docs/governance/(DECISIONS|promotion-contract|promotion-log)\.md|(^|[^A-Za-z0-9._-])templates/(PROJECT-README-TEMPLATE|PROJECT-CLAUDE-TEMPLATE|RUNBOOK-TEMPLATE|REQUIRED-CHECKS-TEMPLATE|SECURITY-TEMPLATE|DECISIONS-TEMPLATE|WAIVER-REGISTER|BACKLOG-TEMPLATE|JIRA-SETUP-TEMPLATE|TRACKER-SETUP-TEMPLATE|THREAT-MODEL-TEMPLATE|PRIVACY-REVIEW-TEMPLATE|AI-SYSTEM-CARD-TEMPLATE|AI-POLICY-TEMPLATE|AI-TRANSPARENCY-SIGNOFF-TEMPLATE|A11Y-SIGNOFF-TEMPLATE|BIA-TEMPLATE|UAT-SIGNOFF-TEMPLATE|POSTMORTEM-TEMPLATE|REVIEW-RECORD-TEMPLATE|PLAN-RECORD-TEMPLATE|FEATURE-REQUEST-TEMPLATE|TASK-CONTEXT-CONTRACT-TEMPLATE|OPPORTUNITY-BRIEF-TEMPLATE|SHAPING-DOC-TEMPLATE|KIT-FEEDBACK-TEMPLATE|AI-ARTIFACT-LINEAGE-TEMPLATE|EVAL-PLAN-TEMPLATE|TEST-PLAN-TEMPLATE|FIELD-REPORT-TEMPLATE|RESTORE-DRILL-TEMPLATE)\.md|(^|[^A-Za-z0-9._-])templates/MODEL-MAP-TEMPLATE\.conf)'
+_CP8B_PATHHIT_T1_LC='((^|[^A-Za-z0-9._-])\.claude(/|[[:space:]]|$)|\.github/workflows|/codeowners|(^|[^a-z.])codeowners|(^|[^a-z.])agents\.md|(^|[^a-z.])required-checks\.md|(^|[^a-z.])waiver-register\.md|(^|[^a-z.])claude\.md|(^|[^a-z.])development-standards\.md|(^|[^a-z.])development-process\.md|(^|[^A-Za-z0-9._-])\.gitattributes|\.git(/|[[:space:]]|$)|hooks/pre-push|scripts/kit-guard|scripts/tracker-conf\.sh|scripts/tracker-jira\.sh|scripts/tracker-read\.sh|scripts/board\.sh|docs/governance/\.meta-control-last|docs/governance/meta-control-log\.md|\.kit/budget\.conf|\.kit/roster\.conf|\.kit/model-map\.conf|\.kit/model-tiers\.conf|\.kit/dials\.conf|\.kit/ratification-seats\.conf|\.kit/control-plane\.conf|scripts/model-tier\.sh|scripts/orchestrator-run\.sh|agents/[^[:space:]]*\.agent\.md|scripts/release-tag\.sh|scripts/promotion-verify\.sh|scripts/escalate\.sh|\.gitleaks\.toml|\.gitleaksignore|\.publish-identifiers|\.semgrepignore|\.trivyignore|\.checkov\.yaml|\.checkov\.yml|\.kit/tracker\.conf|\.kit/boundary-optout\.conf|\.kit/ci-pre-approval\.conf|(^|[^A-Za-z0-9._-])docs/governance/(decisions|promotion-contract|promotion-log)\.md|(^|[^A-Za-z0-9._-])templates/(project-readme-template|project-claude-template|runbook-template|required-checks-template|security-template|decisions-template|waiver-register|backlog-template|jira-setup-template|tracker-setup-template|threat-model-template|privacy-review-template|ai-system-card-template|ai-policy-template|ai-transparency-signoff-template|a11y-signoff-template|bia-template|uat-signoff-template|postmortem-template|review-record-template|plan-record-template|feature-request-template|task-context-contract-template|opportunity-brief-template|shaping-doc-template|kit-feedback-template|ai-artifact-lineage-template|eval-plan-template|test-plan-template|field-report-template|restore-drill-template)\.md|(^|[^A-Za-z0-9._-])templates/model-map-template\.conf)'
+# TIER 2 gains `scripts/` and `profiles/` — the redirect-route half of the directory families added to
+# `_cpp_match`. They land HERE and never in T1, for the identical reason: T1 folds on every platform,
+# and an unconditionally-folded `scripts/` would reinstate the measured case-sensitive FP class on the
+# cmd route one argument position to the left of where `_cpp_match` closed it.
+# ⚠️ THE TWO NEW LEGS ARE LEFT-ANCHORED; the three older ones are not. This is deliberate and it is
+# NOT a drive-by symmetry to "finish": these families are SEGMENT properties, and a bare substring
+# `scripts/` would deny `myscripts/x.sh` — an ordinary adopter directory that merely ends in the family
+# name, i.e. the `my.claude/` false positive rebuilt in a new matcher. The anchor admits `/` (so a real
+# `frontend/scripts/build.js` segment still denies, as the design's consequences disclose) and every
+# quote/space/`=` lead-in, while excluding filename-tail bytes. Anchoring the three EXISTING legs would
+# be a deny RELAXATION on skills/conformance/adapters, which needs its own fixtures and its own
+# monotonicity run — it is a separate change, not a tidy-up, and it is not made here.
+_CP8B_PATHHIT_T2='(skills/[^[:space:]]*|conformance/[^[:space:]]*|adapters/[^[:space:]]*|(^|[^A-Za-z0-9._-])scripts/[^[:space:]]*|(^|[^A-Za-z0-9._-])profiles/[^[:space:]]*)'
+_cp8b_pathhit() {
+  _gmq control-plane-path "$1" -Eq "${_CP8B_PATHHIT_T1}|${_CP8B_PATHHIT_T2}" && return 0
+  # Arm 1 above is byte-identical to the pre-fold regex and returns first (the `_under_temp`
+  # add-only shape at :309-328) — this can only ever ADD a pathhit. HOT PATH: guard the `tr` fork on an
+  # UPPERCASE byte only (the SPELLED class `*[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*`, not the range `*[A-Z]*`:
+  # bash 3.2 on macOS collates a range by locale, so under UTF-8 an all-lowercase command matched it and
+  # took the fold route; the spelled class is the same bytes in every shell and locale, SWAS-715), mirroring `is_control_plane_path:93` — `tr 'A-Z' 'a-z'` cannot
+  # change a string that has no uppercase byte, so an all-lowercase command is its own fold and needs
+  # no `tr`. It still needs `_CP8B_PATHHIT_T1_LC`, though: `_T1` does not match the lowercase spelling
+  # of an uppercase-named leg (`CODEOWNERS`, `AGENTS.md`, `REQUIRED-CHECKS.md`, the governance
+  # `decisions.md`, the lowercase template names), so skipping `_LC` here left an all-lowercase
+  # interpreter write to them ALLOWed. The all-lowercase route therefore costs exactly ONE `grep` and
+  # no `tr`. (`*[A-Za-z]*` — ANY letter — was wrong: it forked `tr` on nearly every command.)
+  case "$1" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) : ;;
+    *)
+      _gmq control-plane-path "$1" -Eq "$_CP8B_PATHHIT_T1_LC" && return 0
+      return 1 ;;
+    esac
+  _phl=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault pathhit-fold
+  _guard_vanished pathhit-fold "$1" "$_phl"
+  _gmq control-plane-path "$_phl" -Eq "$_CP8B_PATHHIT_T1_LC" && return 0
+  _fs_case_insensitive && _gmq control-plane-path "$_phl" -Eq "$_CP8B_PATHHIT_T2"
+}
+
+_cp8b_scan_denied() {
+  _ss=$1
+  _pathhit=1
+  if _cp8b_pathhit "$_ss"; then
+    _pathhit=0
+  else
+    # bare control-plane DIRECTORY token (the D1 gap): `bash -c "mv conformance /tmp"`.
+    _pg=0; case "$-" in
+      *f*) _pg=1 ;;
+      esac
+    set -f
+    # shellcheck disable=SC2086
+    set -- $_ss
+    while [ $# -gt 0 ]; do
+      if _cp8b_tok_is_cp "$1"; then _pathhit=0; break; fi
+      shift
+    done
+    [ "$_pg" = 1 ] || set +f
+  fi
+  [ "$_pathhit" = 0 ] || return 1
+  # A2 (case) — the REDIRECT arm is a matcher of its own and was still byte-literal. Measured before
+  # this fold: `echo evil > .claude/settings.json` DENY but `> .Claude/settings.json` ALLOW; `> CODEOWNERS`
+  # DENY but `> codeowners` ALLOW — the sharper one, because A2 ADDED `codeowners` to the classifier, so
+  # the class said control-plane while the guard still permitted the redirect write. Fold the scanned
+  # segment once here (the alternation below is authored lowercase to match), rather than duplicating
+  # case variants into an already-dense regex. `_ssl` is used ONLY for these greps; every message and
+  # every other decision still reads the original `$_ss`.
+  _ssl=$_ss
+  case "$_ss" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _ssl=$(printf '%s' "$_ss" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault scan-fold
+      _guard_vanished scan-fold "$_ss" "$_ssl" ;;
+    esac
+  # VERBS FOLD TOO. On a case-insensitive filesystem `/bin/RM` resolves to `/bin/rm`, so a byte-literal
+  # verb match is the same defect as a byte-literal PATH match, one argument position to the left.
+  # Measured before this fold: `rm -rf conformance` DENY but `RM -rf conformance` ALLOW; likewise
+  # `MV conformance /tmp/x`, which relocates every gate in the repo — the exact command the
+  # is_control_plane_target comment exists to deny. `_ssl` is already computed above.
+  if _gmq control-plane-verb "$_ssl" -Eq '(^|[^[:alnum:]_])(rm|rmdir|mv|cp|truncate|shred|chmod|chown|dd|sed|tee|ln|install|patch)[[:space:]]' \
+     || _gmq control-plane-verb "$_ssl" -Eq '(^|[^[:alnum:]_])git[[:space:]]+(checkout|restore)([[:space:]]|$)' \
+     || _cp8b_redirect_hits_cp "$_ss"; then
+    return 0
+  fi
+  return 1
+}
+
+# _cp8b_deny_reason "<seg>": print the control-plane deny reason, NAMING the offending segment. Every
+# non-git-write deny arm calls this so the block never denies with a BLANK reason (a regression the
+# security + code reviews both caught: `main` always printed the `13: … KIT_GUARD_SELFEDIT=1 …` guidance,
+# and an empty reason leaves a blocked agent with no explanation and no override hint - in an ERGONOMICS
+# slice). The segment name closes the CP-8a section-1.2 UX gap (a denied COMPOUND gave no signal about
+# WHICH part offended). Truncated so a pathological segment cannot flood the reason channel.
+# _cp8b_message_tip: DRIFT-2. When the RAW command is a git/gh message-carrying invocation, a
+# control-plane deny is most often a MULTILINE MESSAGE BODY being segmented on its newlines and scanned as
+# code — the message DATA mis-read as a command. The guard does NOT relax the decision (a quote-aware
+# segmenter would fail OPEN: it could miss a real `; rm -rf` split); instead it NAMES the safe escape, which
+# passes the body from a FILE and cannot execute. This is ADDITIVE to the reason text only — it changes no
+# deny/allow verdict, and it is harmless on a genuine attack (the command is still denied; the tip helps no
+# bypass). Reads $_cp8b_raw, set at the top of _cp8b_control_plane_denied (its only caller of this arm).
+# GUARD-READONLY-FP-RELIEF (the (c′) tip-loss fix + the §3 kept-denied tips). TWO ARGUMENTS now:
+#   $1 = the RAW command   — the right key for whole-command shapes (a message body, a heredoc, a
+#                            loop head, a quoted alternation) that SPAN segments
+#   $2 = the OFFENDING SEGMENT — the right key for lead-verb shapes. Keying these on the RAW was a
+#                            measured defect: `cd x && sed -n … <cp>` lost the head/tail escape hint
+#                            because the raw lead was `cd`, i.e. the tip disappeared exactly when a
+#                            compound made the deny hardest to read. Defaults to $1 for old callers.
+# Every arm here is ADDITIVE TO REASON TEXT ONLY — no verdict moves, and naming an escape helps no
+# bypass (the command is still denied). The first matching arm returns, so the arms stay exclusive.
+_cp8b_message_tip() {
+  _mt_raw=$1; _mt_seg=${2:-$1}
+  # GUARD-TRAILER-IN-MESSAGE-FP (design §3 UX): name WHY a carrier-led multi-line message was not joined, then
+  # fall through to the cure below. Additive to the reason text only; no verdict moves.
+  _mt_why=$(_cp8b_carrier_why "$_mt_raw")
+  # SWAS-301a: ONE row pointer for the whole message family. The NOTE carries it when it prints (it can print with no TIP after
+  # it: a `board.sh create` carrier); otherwise the TIP below does.
+  _mt_ptr=' (escape card R33 message-body)'
+  if [ -n "$_mt_why" ]; then
+    printf ' NOTE: this multi-line message was not treated as data because it contains %s.%s' "$_mt_why" "$_mt_ptr"
+    _mt_ptr=''
+  fi
+  case "$_mt_raw" in
+    *"git commit"*|*"git merge"*|*"git tag"*|*"git notes"*|*"gh pr"*|*"gh issue"*|*"gh release"*)
+      printf ' TIP: a multi-line commit/PR message body is scanned as data and can trip this; pass it from a FILE instead of an inline -m/--body — `git commit -F <file>` or `gh pr create --body-file <file>` (the file content is never executed).%s' "$_mt_ptr"
+      return ;;
+  esac
+  # Arm E's DECLINE cases land here: the heredoc body was NOT excluded (unquoted delimiter, `<<-`,
+  # >1 heredoc, an ambiguous terminator) so its lines were scanned as code. Name the cure.
+  case "$_mt_raw" in
+    *'<<'*)
+      printf ' TIP: a heredoc BODY is scanned as data-mistaken-for-code unless it is inert. Use a quoted heredoc delimiter (`<<'"'"'EOF'"'"'` or `<<"EOF"`, terminator on its own line, no `<<-`), or pass the content from a file — an unquoted or tab-stripped delimiter cannot be bounded safely, so it stays scanned.%s' "$_mt_ptr"
+      return ;;
+  esac
+  # §3 kept-denied, keyed on the RAW LEAD because the offending segment is a FRAGMENT of the
+  # construct (a quoted `|` over-splits; a loop BODY is its own segment).
+  _mt_rl=$(_cp8b_lead "$_mt_raw")
+  case "$_mt_rl" in
+    grep|egrep|fgrep|rg)
+      case "$_mt_raw" in
+        *'|'*)
+          printf ' TIP: a quoted alternation/pipe is scanned as a command SEPARATOR (segmentation is deliberately quote-blind — a quote-aware split fails OPEN on a real `; rm -rf`). Use one pattern per invocation, `grep -e A -e B`, or the Grep tool. (escape card R1 quoted-alternation)'
+          return ;;
+      esac ;;
+    for|while|until)
+      printf ' TIP: a loop over control-plane paths is scanned per segment and the loop HEAD carries the whole deny (relieving it segment-locally would allow a mass-delete body). Use the Read/Grep tool, or one invocation per file. (escape card R5 loop-head)'
+      return ;;
+  esac
+  # DRIFT-2b: a read-oriented sed/awk/… on a control-plane path is denied because these tools carry write/exec
+  # escapes (`sed s///e`/`w`, `awk system()`); NAME the escape-free paths. Detect the LEAD VERB (not a
+  # substring — a message body mentioning "sed" must not trigger this). Names BOTH read and edit exits, so it
+  # is accurate whether the operator meant `sed -n` (read) or `sed -i` (edit) — no program sub-parse.
+  # GUARD-READONLY-FP-RELIEF: keyed on the OFFENDING SEGMENT's lead, not the raw lead (the (c′) fix).
+  _mt_lead=$(_cp8b_lead "$_mt_seg")
+  case "$_mt_lead" in
+    # GUARD-READ-LANE-2 F-e — `find` gets its own clause, because the shared one below names the
+    # sed/awk grammars and would have sent a `find` user to a form that cannot express their query.
+    # The escape it names is the ALLOWLIST ITSELF: what declined was a primary the guard does not carry.
+    find)
+      printf ' TIP: find is denied on control-plane paths (it carries write and exec escapes — `-delete`, `-exec`, `-fprint`) EXCEPT when EVERY primary is on a declared read-only ALLOWLIST (`-name -iname -path -ipath -regex -iregex -type -maxdepth -mindepth -mtime -mmin -newer -size -empty -print -print0 -prune -depth -L -H -P -xdev -o -a -not ! ( )`), with no redirect and no unresolved expansion — so what declined here is usually a primary NOT on that list (`-ls`/`-printf` are off it deliberately) — but an operand can decline too: an unresolved expansion (`-name "$P"`), a redirect or segmenter byte, or a `-`-led operand that is not numeric. Re-spell with an allowlisted primary and a literal operand, or use the Glob/Grep tool. (escape card F-e)'
+      return ;;
+    sed|awk|sort|uniq|less|more|xxd)
+      printf ' TIP: %s is denied on control-plane paths (write/exec escapes) EXCEPT in one exact read grammar — `sed -n <n>[,<m>|,$]p <path>` and `awk <NR-comparison>|{print} [-F<sep>] <path>`, no other flag, one script/program token, no redirect. For a plain READ use that form, head/tail/cat, or the Read tool; to EDIT a control-plane file use the Edit/Write tool in a dev-clone (never via shell). (escape card F-b)' "$_mt_lead"
+      # a non-literal address (`$` in the segment) is row R2 as well
+      case "$_mt_seg" in
+        *'$'*) printf ' (escape card R2 sed-address)' ;;
+      esac
+      return ;;
+    python|python3|node|ruby|perl|source|.)
+      printf ' TIP: an interpreter'"'"'s arguments are treated as code, never as data, so a control-plane path inside them cannot be cleared. Use the Read tool, or run the program from a file that names no control-plane path. (escape card R10 interpreter-args)'
+      return ;;
+    sh|bash|dash|zsh|ksh)
+      case " $_mt_seg " in
+        *' -c '*)
+          printf ' TIP: an interpreter'"'"'s arguments are treated as code, never as data, so a control-plane path inside them cannot be cleared. Use the Read tool, or run the program from a file that names no control-plane path. (escape card R10 interpreter-args)'
+          return ;;
+      esac ;;
+    *=*)
+      # K-3a: the old half of this tip recommended exactly the shape face 2 now denies ("Set the
+      # variable with `export` as a separate statement"). A guard must never teach a shape it refuses.
+      printf ' TIP: an UNVETTED `NAME=value` prefix is not peeled before the scan (the vetted-name allowlist is deliberately closed — widening it per false positive is enumeration creep). Use a vetted name, or set the variable in its own tool call (an `export` earlier on the same line closes the read lane). (escape card R32 unvetted-prefix)'
+      return ;;
+  esac
+  # SWAS-301a: two fragments no lead above names, each given its row so that no refusal is left without a pointer.
+  # (1) The quote-orphaned fragment (F-c). Segmentation is quote-blind, so a quoted `|`, `;` or `&&` inside a pattern splits the
+  #     command and leaves a segment that begins or ends in a stray quote (or a quoted word where a verb should be).
+  # Both arms fire on a READ-SHAPED segment only: a write refusal already carries its own row (R30), and a second, conflicting
+  # pointer there would send the agent two ways (review I1).
+  if _cp8b_seg_read_shaped "$_mt_seg" "$_mt_raw"; then
+    if _cp8b_fh_strip_prefix "$_mt_seg" >/dev/null 2>&1; then
+      printf ' TIP: this segment starts or ends in a quote the quote-blind splitter orphaned (a quoted |, ; or && inside a pattern splits the command, so the fragment cannot be judged). Use one pattern per invocation (`grep -e A -e B`), unquote the leading word, or use the Read/Grep tool. (escape card R1 quoted-alternation)'
+      return
+    fi
+    # (2) A `$` expansion or command substitution ($(...) or backticks) inside the segment: its body is code, never data.
+    if _cp8b_unparseable "$_mt_seg"; then
+      printf ' TIP: a `$` expansion or command substitution in the segment is code the guard cannot read, so a control-plane path in it cannot be cleared. Run the program from a file that names no control-plane path, directly or through data it reads, or use the Read tool. (escape card R10 interpreter-args)'
+      return
+    fi
+  fi
+}
+# _cp8b_trigger_tip "<trigger>" "<segment>": the target-arm sites that had NO tip at all.
+_cp8b_trigger_tip() {
+  case "$1" in
+    xargs-git|xargs-filefed)
+      printf ' TIP: xargs turns data the guard cannot read into the arguments of a write verb, so give the verb an EXPLICIT operand list instead: `git add -u` or `git add <paths>`, `find … -delete`, or one invocation per file. (escape card R24 xargs-expansion)' ;;
+    redir-nonliteral)
+      printf ' TIP: the redirect TARGET is not a plain literal (a `$VAR`, glob, substitution or backslash), so the guard cannot tell whether it names a protected path — and it refuses to guess. Spell the redirect target literally (`> /tmp/out.txt`), use a `~/`-rooted path, or use the Write tool. (escape card R4 redir-nonliteral)' ;;
+  esac
+}
+# GUARD-READ-LANE-2 F-h — THE KILL SWITCH IS NOT AN ANSWER TO A READ.
+# Every control-plane deny used to end `Set KIT_GUARD_SELFEDIT=1 for deliberate human maintenance.`
+# (SWAS-301a: that sentence is gone from every refusal. `_cp8b_write_route_hint`, formerly `_cp8b_selfedit_hint`, prints
+# `escape card R30 cp-write` under EXACTLY the condition it printed the sentence under, so this history still explains why the
+# condition is what it is; read "the sentence" below as "the write-route pointer".)
+# For the kept-denied READ faces (§3 F-c unvetted `NAME=value`, F-d interpreter `-c`, F-f loop heads,
+# and the quote-orphaned fragment an over-split leaves behind) that sentence is actively harmful advice:
+# the operator wanted to LOOK at a file, and the guard's answer is "disarm me, globally, for the whole
+# session." That is training an escape-hatch reflex for the one class of denial where a free escape
+# already exists (the Read/Grep tool, one pattern per invocation, `export` as a separate statement) —
+# and those escapes are already named in the tip. So the sentence is dropped when the OFFENDING SEGMENT
+# is read-shaped, and kept when it is not. This moves NO VERDICT: it is reason TEXT only, at the two
+# sites that carry a segment. `_cp8b_selfedit_hint` is keyed on the SEGMENT via `_cp8b_lead` — the same
+# key `_cp8b_message_tip` uses after the (c′) fix — so the sentence and the tip can never disagree about
+# which token they are talking about.
+# (SWAS-301a: no refusal carries the sentence any more. The arms with no offending segment at all - the Write/Edit tool arms,
+# the git-write arm, the empty-reason fallbacks - print the R30 pointer, and `git config core.hooksPath` the stop pointer.)
+# ⚠️ `echo`/`printf` are EXCLUDED even though both sit in `_CP8B_READ_VERBS`. They are EMITTERS, not
+# readers: their argument is text they PRODUCE, so `printf evil > pre-push` is a write and
+# `echo "cp e <cp>" | sh` is the code-generation laundering face the T1 pipe rule exists for. Keying
+# those on "the lead is in the read lexicon" would hand the kill-switch advertisement exactly to the
+# shapes that are trying to write. The two piped-interpreter halves split on this byte and both are
+# pinned in agent-autonomy.sh.
+# ⚠️⚠️ `sed`/`awk`/`find`/`file` ARE DUAL-MODE AND THE LEAD ALONE CANNOT DECIDE. The first cut of this
+# helper read the design's "…or `sed`/`awk`/`find`" as a lead test and dropped the sentence from
+# `sed -i s/a/b/ <cp>` — a WRITE, and the acceptance cell caught it. These four verbs are in the
+# read-shaped families for the read spelling ONLY; the write spelling of each (`sed -i`, `sed …w <cp>`,
+# `awk '{print > "<cp>"}'`, `find … -delete/-exec`, `file -C -m <cp>` — the seat's finding 4) is exactly
+# the case the kill switch IS for. So they are gated by a per-verb READ-FLAG ALLOWLIST plus a
+# write-escape byte test, and ANY unrecognised flag DECLINES. The failure direction is deliberate and is
+# the safe one: declining KEEPS the sentence, i.e. falls back to today's message. A denylist of write
+# flags would fail the other way — open — on the next flag someone adds.
+# FOLD-FORWARD, DISCHARGED: T6 and T7 built the verdict-bearing grammar recognisers
+# (`_cp8b_seg_is_sed_n`, `_cp8b_seg_is_awk_range`, `_cp8b_seg_is_find_ro`) and this table's sed/awk/find
+# copies were folded onto them, so there is nothing left for those three to drift from. What survives
+# here is the `file` face and the write lexicon/flags below, which no recogniser owns.
+_CP8B_FH_INTERP='python python3 perl ruby node sh bash dash zsh'
+# (T4's `_CP8B_FH_FIND_RO` forward copy lived here and is GONE — T7 folded this face onto
+# `_cp8b_seg_is_find_ro`'s `msg` tier, whose allowlist is the one at `_CP8B_FIND_RO_PRIMARIES`.)
+# The WRITE lexicon this face declines on. REUSED, not re-derived: it is the CP verb arm's own mutation
+# set (`mv|rsync|ln|rm|rmdir|shred|truncate|chmod|chown|tee|patch|dd|sed` + `cp|install`, :2657/:2659),
+# which exists there as a `case` pattern and not as a variable — so it is transcribed here and the two
+# must be kept in step. Adding a verb THERE without adding it here costs a lost sentence, never a lost
+# deny. `sed` is the only member that is also a dual-mode READ verb, which is why the scan below exempts
+# it in LEAD position only (`sed -n …` stays readable; `… | sed …` in any later position does not).
+_CP8B_FH_WRITE_VERBS='mv rsync ln rm rmdir shred truncate chmod chown tee patch dd sed cp install'
+# Write FLAGS: in-place editing and find's exec/delete primaries. `-i` shadows `file -i`'s entry in the
+# read-flag allowlist below — a disclosed over-KEEP (`file -i <cp>` now keeps the sentence), taken
+# deliberately because a `-i` denylist entry that carved out one verb would be the fail-open shape.
+_CP8B_FH_WRITE_FLAGS='-i --in-place -exec -execdir -delete -ok -okdir'
+# M3 — the save/set/restore `set -f` idiom, factored to one pair. NOT re-entrant, and since review
+# round 2 that is ASSERTED rather than merely documented: `on` refuses when the save slot is already
+# occupied (a nested on..off would clobber the outer caller's saved flag and leak `set -f`, or worse
+# restore it early). Every caller handles the refusal by DECLINING in its own safe direction — which
+# for this face means KEEPING the kill-switch sentence. `off` empties the slot so the next caller
+# finds it free; the slot is a three-state (`''` free · `0` saved-clear · `1` saved-set).
+_cp8b_setf_on()  { [ -z "${_cp8b_setf_prev:-}" ] || return 1
+                   _cp8b_setf_prev=0; case "$-" in
+                     *f*) _cp8b_setf_prev=1 ;;
+                     esac; set -f; }
+_cp8b_setf_off() { [ "${_cp8b_setf_prev:-0}" = 1 ] || set +f; _cp8b_setf_prev=''; }
+# _cp8b_fh_write_escape "<s>": 0 iff <s> carries ANY write escape — a redirect byte, awk's `system(`/
+# `getline`, an in-place/exec flag, or a mutation VERB in any token position. Tokens are de-quoted and
+# BASENAMED first, so `/bin/rm` and `"rm"` are the same token as `rm`; that is what makes the test hold
+# on a program passed to an interpreter as one quoted `-c` argument as well as on a bare segment.
+_cp8b_fh_write_escape() {
+  case "$1" in
+    *'>'*|*'system'*|*'getline'*) return 0 ;;
+    esac
+  _cp8b_setf_on || return 0            # slot busy -> decline -> "write escape" -> the sentence stays
+  _fwf=1
+  # shellcheck disable=SC2086  # word-splitting the segment into tokens IS the walk
+  set -- $1
+  for _fwt in "$@"; do
+    _fwd=$(_cp8b_dequote "$_fwt"); _fwd=${_fwd##*/}
+    if [ "$_fwf" = 1 ]; then
+      _fwf=0
+      [ "$_fwd" = sed ] && continue      # dual-mode in LEAD position only — see the note above
+    fi
+    if _cp8b_in_list "$_fwd" "$_CP8B_FH_WRITE_VERBS" || _cp8b_in_list "$_fwd" "$_CP8B_FH_WRITE_FLAGS"
+    then _cp8b_setf_off; return 0; fi
+  done
+  _cp8b_setf_off
+  return 1
+}
+# _cp8b_fh_strip_prefix "<seg>": <seg> with leading `NAME=value` tokens and a leading quote-orphaned
+# token removed. Prints the remainder, which may be EMPTY (the bare-prefix / bare-orphan face), and
+# EXITS 0 only if it actually stripped something — the caller must not infer that from a string compare,
+# because the remainder is re-joined on single spaces and would differ from a segment that merely
+# carried a leading or doubled space.
+_cp8b_fh_strip_prefix() {
+  _cp8b_setf_on || { printf '%s' "$1"; return 1; }   # slot busy -> "stripped nothing", caller re-decides
+  _spn=0
+  # shellcheck disable=SC2086  # tokenising the segment IS the walk
+  set -- $1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      [A-Za-z_]*=*)   _spn=$((_spn + 1)); shift ;;
+      "'"*|'"'*|*"'"|*'"') _spn=$((_spn + 1)); shift ;;
+      *) break ;;
+    esac
+  done
+  _cp8b_setf_off
+  printf '%s' "$*"
+  [ "$_spn" -gt 0 ]
+}
+# _cp8b_fh_flags_ok "<seg>" "<allowed-flags>": 0 iff every `-`-led token after the lead is allowed.
+# `-F:` / `-Fx` normalise to `-F` (awk's separator carries its value in the token).
+_cp8b_fh_flags_ok() {
+  _ffa=$2
+  _cp8b_setf_on || return 1            # slot busy -> decline -> not read-shaped
+  # shellcheck disable=SC2086  # word-splitting the segment into tokens IS the walk
+  set -- $1
+  shift 2>/dev/null || { _cp8b_setf_off; return 0; }
+  for _fft in "$@"; do
+    case "$_fft" in
+      -F?*) _fft=-F ;;
+      -*) : ;;
+      *) continue ;;
+    esac
+    _cp8b_in_list "$_fft" "$_ffa" || { _cp8b_setf_off; return 1; }
+  done
+  _cp8b_setf_off
+  return 0
+}
+# _cp8b_fh_first_operand "<seg>": the first non-flag token after the lead, with ONE matching surrounding
+# quote pair stripped (both or none). Empty when there is none.
+_cp8b_fh_first_operand() {
+  _cp8b_setf_on || return 0            # slot busy -> print nothing -> the script grammar declines
+  # shellcheck disable=SC2086  # tokenising the segment IS the walk
+  set -- $1
+  shift 2>/dev/null || { _cp8b_setf_off; return 0; }
+  for _fot in "$@"; do
+    case "$_fot" in
+      -*) continue ;;
+      esac
+    case "$_fot" in
+      "'"*"'") _fot=${_fot#\'}; _fot=${_fot%\'} ;;
+      '"'*'"') _fot=${_fot#\"}; _fot=${_fot%\"} ;;
+    esac
+    printf '%s' "$_fot"
+    break
+  done
+  _cp8b_setf_off
+  return 0
+}
+# ⚠️⚠️ REVIEW ROUND 2 — A LOOP BODY IS A SEQUENCE OF COMMANDS, NOT ONE STRING. Round 1 judged the loop
+# by running `_cp8b_fh_write_escape` over the WHOLE raw command, and that test counts a mutation verb in
+# ANY token position. In a loop that is wrong in the over-KEEP direction: the body's own read verb takes
+# a write verb as an OPERAND all the time, so `for f in <cp>*; do grep rm $f; done` and
+# `for f in <cp>*; do sed -n 1p $f; done` — pure reads — were answered with "Set KIT_GUARD_SELFEDIT=1",
+# the exact training this face exists to stop. So the raw is SPLIT into sub-segments and each is judged
+# on its own LEAD, with the escape bytes/flags still tested anywhere inside it.
+# THE WRAPPER LEXICON. `env`/`sudo`/`nice`/`xargs`/`sh -c` and friends do not run themselves — the verb
+# is behind them, sometimes inside one quoted argument. For those leads the ANY-POSITION test is exactly
+# right and is what is applied, so `do sudo rm $f; done` and `do sh -c "rm $f"; done` still KEEP.
+_CP8B_FH_WRAP='env sudo doas nice ionice nohup command time timeout stdbuf setsid chroot su xargs busybox'
+# The heads and inert keywords a split can leave as a sub-segment lead. They run nothing themselves.
+_CP8B_FH_INERT='for while until if case select read : true false'
+# _cp8b_fh_split_body "<raw>": the raw command as sub-segments, one per line. Splits on the separator
+# TOKENS `;` `|` `&&` `||` `&` and on the shell words `do done then else elif fi { } ( )`, and on a
+# trailing `;` glued to a token (`done`, `$f;`). Tokenising happens under `set -f` in this function's
+# own on..off, and the whole thing is called from a `$( )` subshell so nothing leaks to the caller.
+_cp8b_fh_split_body() {
+  _cp8b_setf_on || return 1            # slot busy -> print nothing -> the caller reads that as an escape
+  _fbc=''
+  # shellcheck disable=SC2086  # splitting the raw into tokens IS the walk
+  set -- $1
+  for _fbt in "$@"; do
+    _fbs=0
+    case "$_fbt" in
+      *';') _fbt=${_fbt%';'}; _fbs=1 ;;
+      esac
+    case "$_fbt" in
+      ''|';'|'|'|'&&'|'||'|'&'|';;'|do|done|then|else|elif|fi|esac|'{'|'}'|'('|')') _fbt=''; _fbs=1 ;;
+    esac
+    [ -z "$_fbt" ] || _fbc="${_fbc:+$_fbc }$_fbt"
+    if [ "$_fbs" = 1 ]; then
+      [ -z "$_fbc" ] || printf '%s\n' "$_fbc"
+      _fbc=''
+    fi
+  done
+  [ -z "$_fbc" ] || printf '%s\n' "$_fbc"
+  _cp8b_setf_off
+  return 0
+}
+# _cp8b_fh_seg_write "<sub-segment>": 0 iff THIS sub-segment carries a write escape. The order is the
+# fail-closed one — escape bytes, then write FLAGS anywhere, then the LEAD (after the `NAME=value` /
+# quote-orphan peel) decides the verb question. An UNKNOWN lead is a write (`$RM $f` keeps the
+# sentence); a known READ verb is not, which is the operand relief this round is about.
+_cp8b_fh_seg_write() {
+  _fsw=$1
+  [ -n "$_fsw" ] || return 1
+  case "$_fsw" in
+    *'>'*|*'system'*|*'getline'*) return 0 ;;
+    esac
+  _cp8b_setf_on || return 0
+  # shellcheck disable=SC2086  # tokenising the sub-segment IS the walk
+  set -- $_fsw
+  for _fst in "$@"; do
+    _fsd=$(_cp8b_dequote "$_fst"); _fsd=${_fsd##*/}
+    if _cp8b_in_list "$_fsd" "$_CP8B_FH_WRITE_FLAGS"; then _cp8b_setf_off; return 0; fi
+  done
+  _cp8b_setf_off
+  _fsr=$(_cp8b_fh_strip_prefix "$_fsw") || :
+  [ -n "$_fsr" ] || return 1           # a bare prefix / bare orphan runs nothing
+  _fsl=$(_cp8b_lead "$_fsr"); _fsl=$(_cp8b_dequote "$_fsl"); _fsl=${_fsl##*/}
+  [ -n "$_fsl" ] || return 1
+  _cp8b_in_list "$_fsl" "$_CP8B_FH_INERT" && return 1
+  # The dual-mode verbs answer with their OWN grammar — the same one the top-level face uses, so a
+  # `sed -n 1p $f` body reads and a `sed -n 's/x/y/w <cp>' $f` body writes.
+  case "$_fsl" in
+    sed|awk|find|file) _cp8b_seg_read_shaped "$_fsr" && return 1
+                       return 0 ;;
+  esac
+  _cp8b_in_list "$_fsl" "$_CP8B_FH_WRITE_VERBS" && return 0
+  if _cp8b_in_list "$_fsl" "$_CP8B_FH_WRAP" || _cp8b_in_list "$_fsl" "$_CP8B_FH_INTERP"; then
+    _cp8b_fh_write_escape "$_fsr" && return 0
+    return 1
+  fi
+  _cp8b_in_list "$_fsl" "$_CP8B_READ_VERBS" && return 1
+  # K-3a face 1: the tier-2/3 verbs left `_CP8B_READ_VERBS` for VERDICT purposes only. This site asks
+  # the weaker MESSAGE question, so it consults both lists and no reason text moves with the tier.
+  _cp8b_in_list "$_fsl" "$_CP8B_READ_VERBS_TIERED" && return 1
+  return 0                             # unknown lead -> fail closed -> the sentence stays
+}
+# _cp8b_fh_body_escape "<raw>": 0 iff ANY sub-segment of <raw> carries a write escape. An empty split
+# (the `set -f` slot was busy, or the raw tokenised to nothing) counts as an escape — the safe way.
+_cp8b_fh_body_escape() {
+  _fbo=$(_cp8b_fh_split_body "$1")
+  [ -n "$_fbo" ] || return 0
+  while [ -n "$_fbo" ]; do
+    case "$_fbo" in
+      *"$_cp8b_nl"*) _fbl=${_fbo%%"$_cp8b_nl"*}; _fbo=${_fbo#*"$_cp8b_nl"} ;;
+      *) _fbl=$_fbo; _fbo='' ;;
+    esac
+    _cp8b_fh_seg_write "$_fbl" && return 0
+  done
+  return 1
+}
+# ⚠️⚠️⚠️ THE LEAD NEVER DECIDES — REVIEW ROUND 1. The first cut applied the write-escape test ONLY to
+# `sed|awk|find|file` and answered every other shape on its LEADING TOKEN. Three families of WRITE lost
+# the kill-switch sentence, all measured DENY-without-it on the T4 build:
+#   (a) any other read-verb lead plus a redirect — `cat /tmp/a > <cp>`, `jq . /tmp/a > <cp>`, `ls > <cp>`;
+#   (b) an unvetted `NAME=value` prefix or a quote-orphaned first token, both of which returned
+#       read-shaped BEFORE the verb behind them was ever looked at — `FOO=1 rm -rf <cp>`, `"x" cp … <cp>`;
+#   (c) a loop HEAD, unconditionally — including `for f in .claude/hooks/*; do rm $f; done`, whose own
+#       tip is warning about the very body that deletes the control plane.
+# So the decision is now taken on the WHOLE SEGMENT, in this order, and every unknown DECLINES (declining
+# KEEPS the sentence — the safe direction, unchanged):
+#   1. a write escape ANYWHERE in the segment (redirect · system(/getline · in-place/exec flag ·
+#      mutation verb in any token position) disqualifies FIRST, before any lead is consulted;
+#   2. a `NAME=value` / quote-orphan prefix is STRIPPED and the REMAINDER must earn read-shaped on its
+#      own (recursing once) — an empty remainder, or a single operand token with no verb at all, is the
+#      genuine bare-prefix / bare-orphan face (R7 / R3) and stays read-shaped;
+#   3. a loop head is read-shaped only if the RAW command — head AND body — carries no write escape.
+# STILL MESSAGE-ONLY: `_cp8b_seg_read_shaped` has exactly one caller, `_cp8b_selfedit_hint`. No verdict
+# moves; the `--delta` leg is the standing proof of that.
+# FOLD: T6 + T7 DONE — the sed/awk/find arms below now CALL `_cp8b_seg_is_sed_n` /
+# `_cp8b_seg_is_awk_range` / `_cp8b_seg_is_find_ro` in their `msg` tier; every forward-copied grammar
+# is deleted (`_CP8B_FH_FIND_RO` with it) and K-COUPLE-SED / K-COUPLE-FIND pin that they stay gone.
+# `file` is the ONE arm still on the T4 flag-allowlist shape, deliberately: F-e's siblings gave it no
+# verdict-bearing recogniser to fold onto (the seat's finding-4 residual ALLOWS today), so there is no
+# second tier for it to drift from. This marker is the grep handle the fold briefs use.
+_cp8b_seg_read_shaped() {
+  _srs=$(_cp8b_lead "$1")
+  [ -n "$_srs" ] || return 1
+  # 1. WHOLE-SEGMENT write escape. Not a dual-mode special case any more: a `>` is a redirect or an
+  # awk/print write target whatever the lead is, `system(`/`getline` are awk's exec and read-from-command
+  # escapes, and a mutation verb in ANY token position is a write however it got there.
+  _cp8b_fh_write_escape "$1" && return 1
+  case "$_srs" in
+    echo|printf) return 1 ;;                 # emitters — see the ⚠️ above
+    # 3. F-f: a loop HEAD carries the whole deny, so it is judged on the whole RAW command. The head
+    # alone is inert by construction; what the tip is warning about lives in the BODY.
+    # $2 is the RAW command, passed explicitly by each caller. It is NOT read off a global: the two
+    # reason sites keep the raw in DIFFERENT variables (`_cp8b_raw` in the verb arm, `_tad_raw` in the
+    # resolved-target arm), and reading one of them here made `for f in .claude/hooks/*; do rm $f; done`
+    # — which denies from the resolved-target arm — fall back to the inert HEAD and drop the sentence.
+    # No raw at all -> DECLINE: a body we cannot see is not a body we may certify.
+    # ROUND 2: per SUB-SEGMENT, not over the whole raw string — see the ⚠️⚠️ block above.
+    for|while|until) [ -n "${2:-}" ] || return 1
+                     _cp8b_fh_body_escape "$2" && return 1
+                     return 0 ;;
+  esac
+  # 2. F-c / the quote-blind over-split: strip the prefix and re-decide on what is actually being run.
+  _srsr=$(_cp8b_fh_strip_prefix "$1"); _srsc=$?
+  if [ "$_srsc" = 0 ]; then
+    [ -n "$_srsr" ] || return 0            # a BARE prefix / BARE orphan runs nothing — R7's real face
+    case "$_srsr" in
+      *[[:space:]]*) ;;      # more than one token -> re-decide below
+      *) return 0 ;;                        # a lone operand token, no verb — R3's real face
+    esac
+    _cp8b_seg_read_shaped "$_srsr" "${2:-}"
+    return
+  fi
+  case "$_srs" in
+    # T6 FOLD (design §3-F-b): the sed/awk grammars T4 forward-copied here are GONE — these two arms
+    # now CALL the recognisers, in their `msg` tier. One grammar, two tiers: the allow tier
+    # (_cp8b_tad_is_read) and this message tier cannot drift apart, because there is nothing left to
+    # drift. K-COUPLE-SED pins the call behaviourally (stub the shared script test and BOTH tiers must
+    # decline); the tier difference is documented at the recogniser, not re-decided here.
+    sed)  _cp8b_seg_is_sed_n "$1" msg; return ;;
+    awk)  _cp8b_seg_is_awk_range "$1" msg; return ;;
+    find) _cp8b_seg_is_find_ro "$1" msg; return ;;
+    file) _cp8b_fh_flags_ok "$1" '-b -h -i -L'; return ;;   # `-C -m` COMPILES a magic file (seat f.4)
+  esac
+  _cp8b_in_list "$_srs" "$_CP8B_READ_VERBS" && return 0
+  # K-3a face 1: same MESSAGE-tier note as `_cp8b_fh_seg_write` — the tier-2/3 verbs stay read-SHAPED
+  # here, so the kill-switch sentence keeps the exact presence it had before this row.
+  _cp8b_in_list "$_srs" "$_CP8B_READ_VERBS_TIERED" && return 0
+  # F-d: an interpreter is read-shaped ONLY with a `-c`/`-e` token — a bare `sh x.sh` / `python x.py`
+  # runs a FILE and is not the "I meant to read this" shape this face is about.
+  _cp8b_in_list "$_srs" "$_CP8B_FH_INTERP" || return 1
+  case " $1 " in
+    *' -c '*|*' -e '*) return 0 ;;
+    esac
+  return 1
+}
+# Prints the sentence WITH its leading space, or nothing. Callers no longer carry the literal.
+# $2 is the RAW command (each caller passes its own copy — see the loop leg above).
+#
+# SWAS-301a: this was `_cp8b_selfedit_hint`, which printed `Set KIT_GUARD_SELFEDIT=1 ...` for a write-shaped segment. It now
+# prints the escape-card retry for the same shapes, under EXACTLY the same condition (the segment is not read-shaped), so
+# the write route and the log's `read_shaped` bit keep today's split. Suppressed when `_CP8B_G_NOTE` is set: a clone
+# deny that 278a's grammar declined carries `escape card R29 dev-clone-grammar` in that note instead, and R30 would
+# send the agent back to the clone it is already in. `guard_log_deny` reads the pointer text below to derive `read_shaped`.
+_cp8b_write_route_hint() {
+  _cp8b_seg_read_shaped "$1" "${2:-}" && return 0
+  [ -z "${_CP8B_G_NOTE:-}" ] || return 0
+  printf ' Next: make this change in a dev clone (escape card R30 cp-write).'
+}
+# SWAS-309: the refusal reason for the adopter's root waiver register. A waiver row is a PERSON's act, so for
+# this leaf alone the generic "make this change in a dev clone" cure is the wrong one, and a dev clone that
+# adds a row is the same forged waiver. Prints the FULL reason: $2 (the original reason) unchanged, unless
+# $2 is a write-route refusal (it carries `escape card R30 cp-write`) AND the target or segment in $1 names
+# `waiver-register.md` (case-folded); then the "Next: make this change in a dev clone (escape card R30
+# cp-write)." sentence is replaced by the person-writes sentence, which ends with the escape-card id so the
+# deny log still classifies it. A `templates/waiver-register.md` mention is the kit's own template, not the
+# register, so it is peeled first; a prefix ending in `templates/` (e.g. `mytemplates/WAIVER-REGISTER.md`)
+# is denied but gets no hint (message only). Keyed whole-command: a command that names the register and is
+# R30-denied for another segment still gets the hint (disclosed). REASON TEXT ONLY: no verdict moves. Plain
+# POSIX sh (no heredoc, no one-line case, no IFS). Called at every refusal site that can fire on this leaf:
+# the shell route (both call sites of `_cp8b_control_plane_denied` / `_cp8b_target_arm_denied`, which carry
+# the git-write reason too) and the three path-route reasons in `guard_check_path` (literal, resolved,
+# hardlink-named).
+_cp8b_waiver_hint() {
+  _wrh_s=$1
+  _wrh_r=$2
+  case "$_wrh_r" in
+    *'escape card R30 cp-write'*) ;;
+    *) printf '%s' "$_wrh_r"; return 0 ;;
+  esac
+  case "$_wrh_s" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*)
+      _wrh_s=$(printf '%s' "$_wrh_s" | LC_ALL=C tr 'A-Z' 'a-z') || { printf '%s' "$_wrh_r"; return 0; } ;;
+  esac
+  while :; do
+    case "$_wrh_s" in
+      *templates/waiver-register.md*)
+        _wrh_s=${_wrh_s%%templates/waiver-register.md*}${_wrh_s#*templates/waiver-register.md} ;;
+      *) break ;;
+    esac
+  done
+  case "$_wrh_s" in
+    *waiver-register.md*) ;;
+    *) printf '%s' "$_wrh_r"; return 0 ;;
+  esac
+  _wrh_sent=' Next: make this change in a dev clone (escape card R30 cp-write).'
+  _wrh_pre=$_wrh_r
+  _wrh_post=''
+  case "$_wrh_r" in
+    *"$_wrh_sent"*)
+      _wrh_pre=${_wrh_r%%"$_wrh_sent"*}
+      _wrh_post=${_wrh_r#*"$_wrh_sent"} ;;
+  esac
+  printf '%s%s%s' "$_wrh_pre" ' The waiver register is filled by a person, not the agent: propose the row in the conversation (gate, owner, ratified-by, opened, expires, plan) and ask the person to paste it into WAIVER-REGISTER.md. If the file does not exist yet, the person creates it: cp templates/WAIVER-REGISTER.md WAIVER-REGISTER.md. A dev clone is not a route either: a clone that adds a row is the same forged waiver. (escape card R30 cp-write)' "$_wrh_post"
+  return 0
+}
+_cp8b_deny_reason() {
+  _dr=$(printf '%s' "$1" | cut -c1-160)
+  printf '13: mutating the guard / its config / CI gates via shell is denied (control-plane integrity) - offending segment: [%s].%s%s%s' "$_dr" "$(_cp8b_message_tip "${_cp8b_raw:-}" "$1")" "$(_cp8b_write_route_hint "$1" "${_cp8b_raw:-}")" "${_cp8b_gsr_tip:-}"
+}
+
+# _cp8b_next_seg: pop the first newline-delimited segment off $_walk into $_seg, leaving the remainder in
+# $_walk. Returns 0 while a segment remains, 1 when exhausted. This is PURE PARAMETER EXPANSION - it never
+# touches IFS (a global IFS reassignment is the bash.lang.security.ifs-tampering finding, and it also risks
+# leaking a modified IFS into the ~40 destructive-matrix rules that run AFTER this block). And it is NOT a
+# `cmd | while read` pipe, which would run the body in a SUBSHELL and silently lose the caller's `return`
+# (CP-1 shipped exactly that bug, green the whole time). The caller seeds $_walk from _cp8b_segments.
+_cp8b_nl='
+'
+_cp8b_next_seg() {
+  [ -n "$_walk" ] || return 1
+  case "$_walk" in
+    *"$_cp8b_nl"*) _seg=${_walk%%"$_cp8b_nl"*}; _walk=${_walk#*"$_cp8b_nl"} ;;
+    *)             _seg=$_walk; _walk='' ;;
+  esac
+  return 0
+}
+
+# ================================================================================================
+# GUARD-READ-LANE-2 T1 — the PIPE-INTO-INTERPRETER rule (design §5). ADD-ONLY: both halves can only
+# turn an ALLOW into a DENY, never the reverse, so every existing DENY fixture stays green by
+# construction (the same monotone shape as the target arm below).
+#
+# THE MEASURED HOLE (design §1). A quoted-delimiter heredoc body is treated as inert DATA by Arm E,
+# and a read-verb-led segment's arguments are treated as inert DATA at :1791. Neither CP arm ever
+# looked at what a downstream INTERPRETER does with that data, so three control-plane writes measured
+# ALLOW on a clean tree:
+#   W11  `sh <<'EOF'` ⏎ `cp /tmp/e .claude/hooks/guard-core.sh` ⏎ `EOF`   (Arm E's body exclusion)
+#   W15  the same body piped into `sh`                                     (Arm E again)
+#   W16  `echo "cp e .claude/hooks/guard-core.sh" | sh`                    (the read-verb data rule)
+# The flat destructive matrix still sees the raw bytes, so the escape is specific to the denials that
+# live ONLY in the CP arms — `cp`/`sed -i`/`tee`/`>` onto a control-plane target. A start-line consumer
+# gate alone would have shipped W11 DENY and left W15/W16 open one byte over, which is why half 2 is
+# framed on the PIPELINE SHAPE (data flowing into something that executes it) rather than on the
+# heredoc that happened to carry it.
+#
+# HONEST SCOPE (review F5 — the first cut of this comment claimed "a CLASS, not a heredoc patch", and
+# that overstated it). Half 2's SHAPE is general, but its recognition of "an interpreter" is a
+# LEXICON: a hand-maintained list of names, extended below with basenaming, dequoting, exec-prefix
+# peeling and an `xargs` command-word re-test.
+# THERE ARE TWO RESIDUALS HERE, NOT ONE, and review round 3 found the first cut of this list had
+# FILED AN EXAMPLE UNDER THE WRONG ONE, so state the boundary between them precisely.
+# ⚠️ ROUND 6 CORRECTED THIS PARAGRAPH'S CLAIM, AND THE CORRECTION IS THE POINT. The round-5 text said
+# "AFTER ROUND 5 ONLY (i) REMAINS" and, below, that "a flag missing from the tables costs a needless
+# DENY at worst, never an ALLOW". BOTH SENTENCES WERE FALSE WHEN WRITTEN. Round 5's cure for an
+# unknown flag looked exactly ONE token past that flag's value, and a second token walked straight
+# past it: nine spellings measured ALLOW on d0fda7f2 with the W16 guard-core write aboard, including
+# `| sudo --role r --type t sh`, `| xargs -q 1 -q 1 sh`, `| sudo -R dir -R dir sh` and
+# `| env --block-signal INT sudo sh`. This is the THIRD time a round of this comment has claimed a
+# residual closed and been wrong within one review, so the rule now is: NO SENTENCE HERE MAY CLAIM
+# MORE THAN A CELL IN agent-autonomy.sh PINS. What holds is stated below, bound by bound.
+# The residual (i) below is a real ceiling — a bigger list is its only cure, not a fix to the peel:
+#   (i)  THE LEXICON CEILING — the WRAPPER/BINARY NAME is one this code does not know. `busybox sh`,
+#        `./sh`, a renamed or copied shell, and `| some-wrapper --opt val sh` all live HERE: the peel
+#        never even looks at `some-wrapper`'s flags, because `some-wrapper` is not on the peel list,
+#        so the lead stops on `some-wrapper`, matches no interpreter, and the verdict is untouched.
+#        That ALLOW is the ceiling, NOT an under-peel — the earlier cut of this comment cited it as a
+#        peel-fidelity case, which mis-described where the hole is and pointed the cure at the wrong
+#        code. Both were measured on 86f15acb: `| some-wrapper --opt val sh` and `| some-wrapper sh`
+#        ALLOW identically, which is the tell — the flags make no difference.
+#   (ii) THE PEEL'S OWN FIDELITY — the name IS known and the peel still lands on the wrong word. This
+#        is the one that keeps biting, and it has now been WRONG THREE TIMES: round 1 missed path
+#        spellings and exec prefixes; round 2 found the flag peel ate its own command word
+#        (`| xargs -- sh`), never peeled a leading `NAME=value` (`| A=1 sh`), never dequoted the lead
+#        (`| 'sh'`); round 3 found a known prefix's own long flag in its SEPARATED-value spelling
+#        under-peeled onto the value (`| sudo --user root sh`, `| xargs --max-args 1 sh`) and that a
+#        `$` introducing a quote defeated the dequote (`| $'sh'`, `| $"sh"`, `| sh$""`). Every one was
+#        a fail-OPEN and every one was found by REVIEW, not by the check.
+#        round 4 found `env -S` (the SHORT twin of the `--split-string` over-peel round 3 had already
+#        excluded, in both its separated and its joined spellings) and one more missing xargs long.
+#        Rounds 5 and 6 built TWO RULES here, because the peel fails in two opposite directions.
+#        EACH RULE'S SCOPE IS STATED AS EXACTLY WHAT ITS CELLS PIN, AND NO WIDER:
+#          · OVER-peel — the lead lands on NOTHING (`| sudo -s`, `| xargs -I sh -c`, `| su`). Covered
+#            by FAIL-CLOSED ON EXHAUSTION (round 5): a known wrapper peeled down to an empty segment
+#            reports `sh`. SCOPE: over-peel TO EMPTY only. An over-peel that lands on a WORD is not
+#            covered — see residual (ii) below.
+#          · UNDER-peel — an UNKNOWN flag of a KNOWN wrapper peels one token and the lead lands on the
+#            VALUE (`| sudo --role sysadm_r sh` reported `sysadm_r`; `| sudo -R dir sh` reported
+#            `dir`). Round 5 cured only the ONE-token spelling by taking both readings across that
+#            token; round 6 measured that a second unknown flag defeats any fixed look-ahead and
+#            replaced it with the TAINTED-SEGMENT SCAN. SCOPE, precisely: once an unknown flag of a
+#            KNOWN wrapper has been peeled, every remaining token OF THAT SEGMENT is matched against
+#            the interpreter lexicon MINUS `.`, `source` and `eval` (those three stay lead-only, so
+#            `| xargs -q 1 grep -rl pat .` and `| env --block-signal INT grep -c .` stay ALLOW). It is
+#            bounded to that one segment, it runs ONLY on a tainted segment, and it says nothing about
+#            an unknown WRAPPER — that is residual (i) and is untouched.
+#            ⚠️ THE ROUND-4 TEXT HERE PREDICTED THE WRONG CURE (it filed these under "exhaustion
+#            catches them") and the ROUND-5 TEXT DECLARED THE CLASS CLOSED while nine spellings were
+#            still ALLOW. Both errors are left visible on purpose: reason about this peel from
+#            measured leads (`_cp8b_interp_lead` printed directly), never from what it ought to do.
+#        So the hand-maintained `_ilvl`/`_ilv` tables are an ACCURACY aid: a value-taking flag missing
+#        from them now costs an over-DENY on a tainted segment that happens to carry an interpreter
+#        NAME as data, and otherwise costs nothing. That is a claim about TAINTED segments only — it
+#        was stated in round 5 as an unconditional "never an ALLOW" and that was false.
+# WHAT REMAINS OPEN AFTER ROUND 6, stated as the complete list (anything not here is not claimed).
+# EVERY MEMBER IS A PINNED CELL in agent-autonomy.sh's "H R6 RESIDUAL" block, so this list cannot go
+# stale silently the way rounds 4 and 5's lists did — a residual closing flips its own cell RED:
+#   (a) THE LEXICON CEILING, residual (i) above — an UNKNOWN WRAPPER or an unknown BINARY name:
+#       `| some-wrapper sh`, `| some-wrapper --opt val sh`, `| script -c sh`, `| ssh host sh`,
+#       `| docker run img sh`, `| nsenter … sh`, `| busybox sh`, `| ./sh`, a renamed or copied shell.
+#       The peel never engages, nothing is tainted, and the verdict is untouched. Measured ALLOW.
+#   (b) OVER-PEEL ONTO A WORD — `| timeout 5 5 sh` eats one `5`, stops on the other, reports lead `5`.
+#       Exhaustion cannot reach it (the lead is not empty) and no unknown flag was peeled, so nothing
+#       is tainted either. Measured ALLOW. Narrow: it needs a second bare operand `timeout` rejects.
+#   (c) THE PRICED OVER-DENIES, in the safe direction, pinned: `| sudo -R sh cat` (an unknown flag
+#       whose VALUE is spelled `sh`) and a CLASS — any tainted segment carrying an interpreter name,
+#       or a version-glob match such as `perl5.txt`, as DATA. `| sudo -R dir grep -l python x` was its
+#       first example; round 7 measured `| sudo -R dir grep -c node x`, `| sudo -R dir cat ruby` and
+#       `| sudo -R dir cat perl5.txt` as the same thing (base-ALLOW on d0fda7f2, DENY now), and pins
+#       `perl5.txt` plus its ALLOW twin `perl.txt` as "H R7" cells. Round 6's text here called the
+#       grep-pattern collision "the ONLY one this round costs"; that was FALSE and is corrected. The
+#       retry is unchanged: drop the unknown flag — `| sudo grep -l python x` is untainted and ALLOW.
+#   (d) THE `.`/`source`/`eval` NON-LEAD SKIP — those three are held OUT of the taint lexicon (they
+#       stay LEAD-only, so `| xargs -q 1 grep -rl pat .` survives), which means a tainted segment
+#       carrying one as a NON-lead token is not scanned for it. Measured ALLOW:
+#       `| sudo --role r source /dev/stdin`, `| env --block-signal INT source /dev/stdin`,
+#       `| xargs --foo a . /dev/stdin`. NOT EXPLOITABLE, and the pinned DENY cells are the argument:
+#       all three are shell BUILTINS, so a wrapper `exec()`s them and they fail ENOENT, and every form
+#       that really executes stdin puts a shell — or the builtin itself — in the LEAD, where all three
+#       deny (`| source /dev/stdin`, `| . /dev/stdin`, `| sudo -u root source /dev/stdin`, and
+#       `| sudo --role r source /dev/stdin sh`, where the trailing `sh` IS in the taint lexicon).
+# Residual (i)/(a) is DISCLOSED, not closed: the class of defect it belongs to is closed elsewhere, by
+# the flat matrix and by the CP arms' own target binding; this rule narrows the specific laundering
+# route where the CP token rides in as data.
+#
+# Half 1 — the CONSUMER gate — lives inside _cp8b_strip_heredocs below (it is a decision about whether
+# to strip). Half 2 — the piped-interpreter re-scan — is here and is called first by BOTH CP arms.
+# Both are DISQUALIFICATION-shaped (D-240813-3): a lead this code does not positively recognise leaves
+# today's verdict untouched.
+
+# _cp8b_hd_consumer "<heredoc start line>": 0 iff the line's wrapper-peeled lead is a CONTENT CONSUMER
+# — a verb that treats the body as text it will print, filter or carry as a message. A shell, an
+# interpreter, `git apply`, or any unknown verb MAY EXECUTE the body, so for those the body must stay
+# scanned as code. Unknown lead -> 1 -> decline the strip -> pre-#567 behaviour (one retry for a real
+# false positive: pass the body from a file, `--input <file>` / `-F <file>`).
+_CP8B_HD_CONSUMERS='cat jq grep wc head tail diff'
+_cp8b_hd_consumer() {
+  # ***THE CONSUMER MUST BE THE WHOLE COMMAND — a SEPARATOR BEFORE THE `<<` DECLINES.*** (Security seat,
+  # GUARD-READ-LANE-3, C1 blocking + C2 pre-existing; both reproduced live.) Every test below reads the
+  # LEAD of the start line, but a start line may hold SEVERAL commands: in
+  # `<recognised consumer> ; python3 /dev/stdin <<'EOF'` the lead is the harmless consumer while the
+  # command that actually READS THE BODY is the one after the separator. The body was then ruled inert
+  # and an interpreter executed it unscanned — a write onto guard-core.sh itself, measured ALLOW.
+  #   C1 (this slice's regression): the consumer was F-j's kit query — DENY on 5d26fbfa, ALLOW on the
+  #      first build of this branch, in both the `;` and the `&&` + `sh /dev/stdin` spellings.
+  #   C2 (PRE-EXISTING, open on main since the lane-2 consumer gate shipped): the very same shape with
+  #      a lane-2 lead — `cat /tmp/note; python3 /dev/stdin <<'EOF'` — measured ALLOW on the PRISTINE
+  #      core and on the branch. It is closed HERE rather than deferred: it is one `case` away, it is
+  #      the identical root cause, and leaving it would ship a slice whose own fix documents the hole
+  #      beside it. The cell is an ALLOW->DENY movement and is declared as such in EXPECTED_DELTA.
+  # THIS RUNS FIRST, ahead of all three accept paths (the lane-2 consumer list, F-j's kit query, and the
+  # git/gh message carriers), because ALL THREE read only the lead and all three are therefore vulnerable
+  # to it — C1 came in through the second, C2 through the first. One decline covers the class.
+  # `${1%%'<<'*}` is the text before the FIRST `<<`; the four post-`<<` declines in `_cp8b_strip_heredocs`
+  # (separator AFTER the operator, `<<-`, unquoted delimiter, CP redirect target) are untouched and each
+  # still binds its own leg. Disclosed over-deny, the safe direction: a genuine `cd x && cat <<'EOF'`
+  # declines too and keeps its body scanned. Mutant M-Fj2 removes this case and must flip W7 to ALLOW.
+  case "${1%%'<<'*}" in
+    *';'*|*'&'*|*'|'*) return 1 ;;
+    esac
+  _hdp=$(_cp8b_strip_wrappers "$1")
+  _hdv=$(_cp8b_lead "$_hdp")
+  _cp8b_in_list "$_hdv" "$_CP8B_HD_CONSUMERS" && return 0
+  # GUARD-READ-LANE-3 F-j (design §2 R7) — a segment the kit-QUERY arm already recognises is a content
+  # consumer too. The entry contract's own act 1 pipes its path listing into
+  # `promotion-readiness.sh --class --changed /dev/stdin <<'EOF'`, whose lead is `sh`; the gate declined,
+  # so the pathhit arm read the inert body and denied the kit's own documented first step.
+  # THE TEXT BEFORE THE `<<` IS WHAT IS JUDGED, and it must be: `_cp8b_tad_is_kit_query` declines on any
+  # `<` byte, so handing it the whole start line would decline every heredoc by construction — a
+  # vacuously-safe no-op. `${1%%'<<'*}` is the consumer command with the redirect operator removed.
+  # THIS WIDENS ONLY THE CONSUMER GATE. The four lines after this call in `_cp8b_strip_heredocs` are
+  # untouched and each still binds: a separator after the `<<` (`… <<'EOF' | sh`), `<<-`, an UNQUOTED
+  # delimiter, and a control-plane redirect target all still refuse the strip. The table membership is
+  # the enforcement, exactly as in Arm A — an unlisted script (`sh conformance/verify.sh --class …`)
+  # yields the empty token set, declines, and keeps its body scanned. Celled F-j W1…W6.
+  _cp8b_tad_is_kit_query "${1%%'<<'*}" && return 0
+  _hdv2=$(printf '%s' "$_hdp" | sed -E 's/^[[:space:]]*//' | awk '{print $2}')
+  case "$_hdv $_hdv2" in
+    'git commit'|'git tag'|'gh pr'|'gh issue') return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_pipe_segments "<cmd>": _cp8b_segments, byte-for-byte, EXCEPT that a segment introduced by a
+# `|` is prefixed with a sentinel so the caller can tell a PIPE-FED segment from a `;`/`&&`/`&`-fed
+# one. Kept as a near-copy on purpose: it must consider exactly the same bytes to be separators
+# (including the `>&`/`&>` redirect protection from GUARD-DENY-TRIO M1, and the `>|` clobber
+# protection via `_cp8b_etx` (0x03) from GUARD-CLOBBER-REDIRECT-INVISIBLE), or a redirect operator
+# would read as a pipe here and not there. Nothing is ever rejoined (the CP-8a rule).
+# THE `>|` PROTECTION HERE HAD TO BE TAKEN IN BOTH: `f4-couple` locks this function byte-identical to
+# `_cp8b_segments` outside the masked `|` arm, so `>|` could not be taught to one alone.
+# ⚠️ THE DESIGN PRICED A RELAXATION HERE, AND IT IS REAL — FOUR OF THEM, EACH ENUMERATED. The first
+# build reported it as never spent; that report was wrong, and the correction is recorded rather than
+# quietly dropped. The design's subject was `echo x >| sh`, which is ALLOW on BOTH cores and always
+# was: the piped-interpreter deny is armed by a control-plane pathhit or a fetcher lead, and a bare
+# `echo` has neither, so the cell could not have shown a relaxation whether or not one existed.
+# WITH a control-plane token the price is plain. On the pristine core `>|` is not an operator, so the
+# `|`->`;` pass splits there and the bytes after it become a PIPE-FED segment — a pipe the user never
+# wrote. `cat conformance/verify.sh >| sh` therefore read as "a control-plane file piped into an
+# interpreter" and DENIED; teaching both segmenters `>|` withdraws the forgery and it ALLOWs, which is
+# what bash does (a clobber into a file named `sh`). The same forgery inside a search pattern is why
+# `grep a>|b <cp>` and `git log --grep="a>|b" -- <cp>` also move. All four are correct verdicts: no
+# control-plane file is written, nothing is executed, and the two greps only read. The boundary holds —
+# add a REAL pipe (`cat <cp> >| sh | sh`) and the deny is still there, on both cores.
+# "16 movers, zero allow-ward" was a CELL-BOUNDED statement about the cells that existed, not a
+# statement about the guard. The four movers are cells now, each with its own EXPECTED_DELTA entry.
+_cp8b_stx=$(printf '\002')
+_cp8b_pipe_segments() {
+  _cp8b_joinlines "$1" \
+    | sed -e "s/>|/>$_cp8b_etx/g" \
+          -e 's/&&/;/g' -e 's/||/;/g' -e "s/|/;$_cp8b_stx/g" \
+          -e "s/>&/>$_cp8b_soh/g" -e "s/&>/$_cp8b_soh>/g" \
+          -e 's/&/;/g' \
+          -e "s/$_cp8b_soh/\&/g" \
+          -e "s/$_cp8b_etx/|/g" \
+    | tr ';\n' '\n\n'
+}
+
+# _cp8b_drop_tok "<s>": drop the leading whitespace-delimited token and the whitespace after it.
+_cp8b_drop_tok() { printf '%s' "$1" | sed -E 's/^[[:space:]]*[^[:space:]]+[[:space:]]*//'; }
+
+# _cp8b_lead_word "<s>": the leading token, DE-QUOTED. Review round 2, finding 3 (HIGH, fail-OPEN):
+# the lead was basenamed but never dequoted, so `| 'sh'`, `| "sh"`, `| '/bin/sh'`, `| "/bin/sh"` and
+# `| s\h` — the same interpreter to the shell as `| sh` — all measured ALLOW.
+# THE BACKSLASH/QUOTE DECISION, stated because the round-2 brief left it open: strip the bytes
+# (normalize TOWARD the program name) rather than treat any quoted/escaped lead as an unknown
+# interpreter and DENY. Stripping is safe in THIS DIRECTION ONLY, the same argument _cp8b_dequote
+# already carries. The fail-CLOSED alternative was REJECTED on measurement: it flips `| 'cat'`,
+# `| "sort"` and `| ca\t` — ordinary read pipelines, ALLOW today — into denials, an unpriced
+# read-lane loss on a read-RELIEF row. All three are pinned ALLOW in agent-autonomy.sh, so NO
+# over-deny is priced by this finding's cure.
+# ROUND 3, finding 2 (HIGH, fail-OPEN): a `$` immediately before the quote defeated the dequote.
+# `$'sh'`, `$"sh"` and `sh$""` all run the SAME shell (ANSI-C / locale quoting, and an empty `$""`
+# concatenated onto the name), but the dequote left the `$` behind, so the lead was `$sh` / `sh` with
+# a stray byte and matched no name — each measured ALLOW on 86f15acb. Strip the `$` only where it
+# INTRODUCES a quote, never a bare `$VAR` (which stays unparseable and is refused upstream). Same
+# direction-of-safety argument as the dequote itself: it normalizes TOWARD the program name.
+_cp8b_lead_word() {
+  _lwt=$(_cp8b_lead "$1")
+  _lwt=$(printf '%s' "$_lwt" | sed -e "s/\$'/'/g" -e 's/\$"/"/g')
+  _cp8b_dequote "$_lwt"
+}
+
+# _cp8b_strip_assigns "<s>": drop LEADING `NAME=value` assignment tokens. Review round 2, finding 2
+# (HIGH, fail-OPEN): `| A=1 sh`, `| PATH=/x sh`, `| FOO=bar /bin/sh` all run a shell, and the peel's
+# `*=*` arm sat INSIDE the flag loop — reachable only AFTER a known prefix — so a LEADING assignment
+# was never peeled and each measured ALLOW. Assignments are also legal after a prefix (`env A=1 sh`,
+# `sudo A=1 sh`), so this runs before the prefix loop AND after each peeled prefix. Only a real shell
+# identifier counts, so `--foo=bar` and `of=/dev/x` are NOT eaten here.
+_cp8b_strip_assigns() {
+  _sac=$1
+  while :; do
+    _saw=$(_cp8b_lead "$_sac")
+    case "$_saw" in
+      [A-Za-z_]*=*) : ;;
+      *) break ;;
+    esac
+    case "${_saw%%=*}" in
+      *[!A-Za-z0-9_]*) break ;;
+      esac
+    _sac=$(_cp8b_drop_tok "$_sac")
+  done
+  printf '%s' "$_sac"
+}
+
+# _cp8b_interp_lead "<seg>": print the BASENAMED command word the segment will actually run, after
+# peeling the prefixes that merely *arrange to run* something else. Review F1 (HIGH, fail-open): the
+# first cut matched only BARE EXACT LOWERCASE names off `_cp8b_lead`, so every ordinary spelling of
+# the same shell walked straight through the recogniser and W16's write measured ALLOW again with one
+# extra byte — `| /bin/sh`, `| sudo sh`, `| exec sh`, `| nohup sh`, `| timeout 5 /bin/bash`,
+# `| /usr/bin/env sh`, `| bash5`, `| python3.11`.
+#
+# THE PEEL IS DELIBERATELY MINIMAL, and that is the round-2 correction. "This is a DENY trigger, so
+# an over-peel can only widen a DENY" is FALSE for the peel itself: over-peeling lands the lead on a
+# BENIGN word or on NOTHING, and both fail OPEN. Round 1's single `-[uUgnpILPdEsak]|--*)` arm dropped
+# a following value for EVERY `--long` and for no-arg short flags, so `| xargs -- sh`,
+# `| xargs --null sh`, `| xargs --max-args=1 sh`, `| command -p sh` and `| time -p sh` each ate their
+# OWN COMMAND WORD and measured ALLOW. Hence: peel only KNOWN prefixes, only THEIR known value-taking
+# flags, exactly ONE token for an unknown `--long`, and `--` ends flag peeling for that prefix.
+#
+# FOUR PEELS, in this order:
+#   (a) ASSIGNMENTS (`_cp8b_strip_assigns`) — a leading `NAME=value` run, before the prefix loop and
+#       again after each peeled prefix, since `env A=1 sh` and `sudo A=1 sh` are both legal.
+#   (b) EXEC PREFIXES and their own flags/operands — `sudo -u x`, `env -i`, `env A=1`, `nohup`,
+#       `nice -n 5`, `timeout 5`, `command`, `exec`, `time`, and (round 5) the peers `su doas setsid
+#       stdbuf ionice chrt taskset flock unshare chroot`. `_cp8b_strip_wrappers` was not reused as
+#       the whole answer: it is deliberately CONSERVATIVE (bare `env` only, `timeout` only with a pure
+#       duration) because it feeds the kit-exec ALLOW path, where an over-peel would open a hole. Here
+#       the direction is inverted — this recogniser is a DENY trigger, so an over-peel can only widen
+#       a DENY. It is called on the wrapper-stripped string first and then peels FURTHER on its own
+#       terms; the two must not be merged, or the permissive rule below would leak into the ALLOW arm.
+#       VALUE-TAKING SHORT FLAGS ARE PER PREFIX, because the same letter means different things:
+#         xargs `-n -I -L -P -d -E -s -a` · sudo `-u -U -g -C -h -p -r -t` · nice `-n` ·
+#         env `-u -C` (NOT `-S` — round 4; see the over-peel note below) · exec `-a` ·
+#         timeout `-k -s` plus the bare duration operand · command and
+#         time and nohup take NONE — `command -p/-v/-V` and `time -p` are NO-ARG, and treating them
+#         as value-taking is exactly the round-1 hole.
+#       VALUE-TAKING LONG FLAGS ARE PER PREFIX TOO (`_ilvl`, round 3): the GNU long spelling of the
+#       same option takes a SEPARATED value, so `--user root` / `--max-args 1` / `--unset X` /
+#       `--adjustment 5` / `--signal 9` must peel BOTH tokens. Only the BARE `--name` form is on the
+#       list; `--name=value` is already one token, and an unknown `--long` still peels ONE token and
+#       never a following value. `--` peels itself and ENDS flag peeling for that prefix.
+#   (c) `xargs`: peel its flags (`-0 -r -t -p`, and `-n N` / `-I x` / `-L N` / `-P N` / `-d x` /
+#       `-E x` / `-s N` in both separated and combined spellings) and RE-TEST the command word that
+#       follows through (a). Review F2 (MED, fail-closed regression): `xargs` sat on the interpreter
+#       list as a bare name, so it denied regardless of what it ran — `… | xargs cat`, `… | xargs
+#       wc -l`, `… | xargs grep -c .` were ALLOW on the parent and DENY after T1, an unpriced read-lane
+#       loss on a read-RELIEF row. With NO command word `xargs` is NOT an interpreter: its default
+#       command is `echo`.
+#   (d) DEQUOTE (`_cp8b_lead_word`) and then BASENAME (`${w##*/}`), in that order, so a quoted or
+#       path spelling is judged by the program it names — `| '/bin/sh'` is `sh`.
+# `env` needs no case of its own in (c) — it is an exec prefix, so (b) already re-tests its command
+# word, which is why `| env cat` is ALLOW and `| env sh -c x` is DENY.
+_cp8b_interp_lead() {
+  _ilc=$(_cp8b_strip_wrappers "$1")
+  _ili=0
+  _ilpk=0
+  _iltn=0
+  while [ "$_ili" -lt 6 ]; do
+    _ili=$((_ili + 1))
+    _ilc=$(_cp8b_strip_assigns "$_ilc")
+    _ilw=$(_cp8b_lead_word "$_ilc")
+    [ -n "$_ilw" ] || break
+    _ilp=${_ilw##*/}
+    case "$_ilp" in
+      sudo|exec|command|env|nohup|nice|timeout|time|xargs|\
+      su|doas|setsid|stdbuf|ionice|chrt|taskset|flock|unshare|chroot)
+        _ilpk=1; _ilc=$(_cp8b_drop_tok "$_ilc") ;;
+      *) break ;;
+    esac
+    # The value-taking SHORT flags of THIS prefix, its value-taking LONG flags, and whether it takes
+    # a bare operand.
+    # THE KNOWN OVER-PEELS, stated rather than hidden — an over-peel here fails OPEN (see the header):
+    #   · `| xargs -I sh -c` treats `sh` as -I's replacement string and lands the lead on `-c`, then
+    #     on NOTHING — so ROUND 5's exhaustion rule now DENIES it (measured; it was ALLOW on
+    #     f8954369). `| timeout 5 5 sh` eats one `5` and stops on the other, so its lead is `5`, not
+    #     empty, and it STILL MEASURES ALLOW — exhaustion cannot reach an over-peel that lands on a
+    #     word. It is the last member of the old residual (ii) still open, and it is narrow: it needs
+    #     a second bare operand `timeout` itself would reject.
+    #   · `--replace` and `--eof` take an OPTIONAL argument in GNU xargs, so listing them as
+    #     value-taking over-peels the argument-LESS spelling (`| xargs --replace sh -c x`). Priced as
+    #     the lesser risk: the argument-BEARING spelling is the one that carries a shell.
+    #   · `env --split-string` is DELIBERATELY ABSENT from `_ilvl`, and this is a measured correction
+    #     to the round-3 brief, which listed it. Its "value" is not an option argument but THE COMMAND
+    #     LINE ITSELF (`env -S 'sh -c x'` RUNS a shell), so peeling it eats the very word the
+    #     recogniser exists to find: adding it flipped `| env --split-string sh` from DENY on
+    #     86f15acb to ALLOW. The rule stands — a DENY trigger peels LESS by default.
+    #     ROUND 4 finished the same thought on the SHORT twin: `-S` sat in env's `_ilv` and over-peeled
+    #     identically (`| env -S sh`, `| env -S /bin/sh` measured ALLOW on 758fafc5), so `S` is off the
+    #     list. The JOINED spellings needed the extra `-S?*` arm below, because peeling `-Ssh` as one
+    #     opaque flag token also lands the lead on nothing; the arm keeps the tail as the command word.
+    # `_ilo`: the prefix's BARE OPERAND, 0 = none · 1 = one NUMERIC operand (`timeout 5`, `chrt 1`,
+    # `taskset 1`) · 2 = one operand of ANY shape (`flock /tmp/l`, `chroot /`, `su root`), peeled once.
+    # Round 5: the new peers below carry `_ilv=''`/`_ilvl=''` because no value-taking flag of theirs is
+    # KNOWN here — an unknown flag now peels one token and, if that exhausts the segment, the
+    # exhaustion rule at the bottom denies. Guessing a value-taking flag would fail OPEN; not guessing
+    # fails CLOSED, so the empty list is the safe default and stays until a manual is read.
+    _ilo=0
+    case "$_ilp" in
+      xargs)   _ilv='nILPdEsa'
+               _ilvl='--max-args --max-lines --max-procs --delimiter --replace --arg-file --eof --max-chars --process-slot-var' ;;
+      sudo)    _ilv='uUgChprt'
+               _ilvl='--user --group --other-user --prompt --host --chdir --chroot --close-from' ;;
+      env)     _ilv='uC';  _ilvl='--unset --chdir' ;;   # NOT --split-string / -S: see below
+      exec)    _ilv='a';   _ilvl='' ;;
+      nice)    _ilv='n';   _ilvl='--adjustment' ;;
+      timeout) _ilv='ks';  _ilvl='--signal --kill-after'; _ilo=1 ;;
+      chrt|taskset) _ilv=''; _ilvl=''; _ilo=1 ;;        # priority / affinity-mask operand
+      flock|chroot|su) _ilv=''; _ilvl=''; _ilo=2 ;;     # lockfile / new-root / target-user operand
+      *)       _ilv='';    _ilvl='' ;;           # command, time, nohup and the round-5 peers
+    esac
+    # Peel the prefix's OWN flags and operands until a real command word is in front.
+    _ildd=0
+    while [ "$_ildd" -eq 0 ]; do
+      _ilc=$(_cp8b_strip_assigns "$_ilc")
+      _ilf=$(_cp8b_lead "$_ilc")
+      if [ "$_ilp" = su ]; then
+        # `su -c '<string>'` is `env -S`'s twin, one level up: the value is not an option argument but
+        # A SHELL COMMAND LINE — `su` hands it to the target user's shell. So the segment RUNS a shell
+        # whatever the value spells, and neither peeling the value (over-peel, lands on nothing) nor
+        # stopping on it (under-peel, lands on `sh`'s arguments) is right. Answer the question directly:
+        # `-c` present -> this segment is a shell.
+        case "$_ilf" in
+          -c|--command|-c?*|--command=*) _ilc='sh'; _ildd=1; continue ;;
+        esac
+      fi
+      case "$_ilf" in
+        '') break ;;
+        --)    _ilc=$(_cp8b_drop_tok "$_ilc"); _ildd=1 ;;   # end of flags: the next token is the command
+        --*)   # A long flag THIS prefix is known to take a SEPARATED value for peels flag+value;
+               # anything else (unknown long, or the `--name=value` form, already one token) peels
+               # ONE token. Round 3, finding 1: without `_ilvl` the peel stopped ON the value, so
+               # `| xargs --max-args 1 sh`, `| sudo --user root sh`, `| env --unset X sh` and
+               # `| nice --adjustment 5 sh` measured ALLOW on 86f15acb.
+               # ROUND 5, the residual-(ii) class. An UNKNOWN long is AMBIGUOUS: peel one token and
+               # the lead lands on the command word if the flag is valueless, or on the VALUE if it
+               # is not. `| sudo --role sysadm_r sh` measured ALLOW on f8954369 for exactly that
+               # reason — lead `sysadm_r`. The exhaustion rule does NOT reach it (peeling one token
+               # UNDER-peels; it never lands on nothing), and peeling two would deny the pinned read
+               # `| xargs --null cat`.
+               # ROUND 6 REPLACED ROUND 5'S CURE HERE. Round 5 took BOTH READINGS across exactly one
+               # token past the flag's value; a SECOND unknown flag pushed the shell out of that
+               # window and nine spellings measured ALLOW on d0fda7f2 (`| sudo --role r --type t sh`,
+               # `| xargs -q 1 -q 1 sh`, `| env --block-signal INT sudo sh`, …). The lesson is that
+               # the ambiguity is NOT one token wide: once the peel has GUESSED at an unknown flag,
+               # its idea of where the command word sits has no reliable relation to the real one, so
+               # any fixed look-ahead can be pushed past by adding tokens. So do not look ahead at
+               # all here — peel one token and MARK THE SEGMENT TAINTED. The whole-segment scan at the
+               # bottom is what resolves the ambiguity, and it subsumes round 5's two readings
+               # exactly (the alternate token it inspected is always inside the scanned remainder),
+               # which is why that code is GONE rather than kept as a fast path: two mechanisms for
+               # one property makes both mutants vacuous.
+               if _cp8b_in_list "$_ilf" "$_ilvl"; then
+                 _ilc=$(_cp8b_drop_tok "$(_cp8b_drop_tok "$_ilc")")
+               else
+                 _ilc=$(_cp8b_drop_tok "$_ilc"); _iltn=1
+               fi ;;
+        -S?*)  # `env -Ssh` / `env -S'sh'`: the JOINED spelling of --split-string. The tail is not an
+               # option value but the COMMAND LINE, so peeling the whole token as one opaque flag
+               # lands the lead on NOTHING and fails OPEN (round 4). Keep the tail, drop the `-S`,
+               # and stop peeling — the next lead word IS the command word. Any other prefix's
+               # `-S<something>` keeps the old opaque peel.
+               if [ "$_ilp" = env ]; then
+                 _ilc="${_ilf#-S} $(_cp8b_drop_tok "$_ilc")"; _ildd=1
+               else _ilc=$(_cp8b_drop_tok "$_ilc"); fi ;;
+        -?)    # A lone short flag: value separated, or none. A letter NOT in `_ilv` is the exact
+               # SHORT twin of the unknown long above — `| sudo -R dir sh` and `| xargs -q 1 sh`
+               # measured ALLOW with the long cure alone, and `| sudo -R dir -R dir sh` /
+               # `| xargs -q 1 -q 1 sh` measured ALLOW with round 5's — so it takes the same round-6
+               # treatment: peel one token, TAINT the segment, let the whole-segment scan decide. A
+               # letter that IS in `_ilv` is not ambiguous: the manual says it takes the value, so no
+               # guess is made and no taint is earned.
+               _ilkn=0
+               case "$_ilv" in
+                 *"${_ilf#-}"*) [ -n "$_ilv" ] && _ilkn=1 ;;
+                 esac
+               if [ "$_ilkn" -eq 1 ]; then
+                 _ilc=$(_cp8b_drop_tok "$(_cp8b_drop_tok "$_ilc")")
+               else
+                 _ilc=$(_cp8b_drop_tok "$_ilc"); _iltn=1
+               fi ;;
+        -*)    _ilc=$(_cp8b_drop_tok "$_ilc") ;;   # combined/valueless: -i, -0, -n1, -I{}, -tv
+        *[!0-9smhd]*) if [ "$_ilo" -eq 2 ]; then   # `flock /tmp/l sh`, `chroot / sh`, `su root -c x`
+                        _ilo=0; _ilc=$(_cp8b_drop_tok "$_ilc")
+                      else break; fi ;;            # otherwise: a real command word — stop peeling
+        *[0-9]*) if [ "$_ilo" -ge 1 ]; then        # the bare numeric operand: `timeout 5`, `chrt 1`
+                   _ilo=0; _ilc=$(_cp8b_drop_tok "$_ilc")
+                 else break; fi ;;
+        *) break ;;                                # a bare word of [smhd] letters — `sh` itself
+      esac
+    done
+  done
+  _ilc=$(_cp8b_strip_assigns "$_ilc")
+  _ilw=$(_cp8b_lead_word "$_ilc")
+  # FAIL CLOSED ON EXHAUSTION (round 5, the structural ruling). Landing on NOTHING after a KNOWN
+  # wrapper was peeled is the peel's characteristic failure, and it fails OPEN in every spelling: the
+  # over-peels (`sudo -s`, `xargs -I sh -c`) and the under-known value-taking longs (`sudo --role
+  # sysadm_r sh`, `env --block-signal INT sh`) BOTH end here, with an empty lead that matches no
+  # interpreter. Report `sh` instead. The justification is that the two readings of an exhausted
+  # segment are (a) the wrapper ran with no command word — `sudo -s`, `sudo -i`, `su`, `su root` — in
+  # which case it IS a shell, and (b) the peel ate the command word, in which case the word it ate is
+  # unknown and may be one. Both are shell-or-unknown, so `sh` is the honest answer to both.
+  # WHY THIS COSTS THE READ LANE NOTHING: a real read pipeline always leaves a command word standing
+  # (`| sudo -u root cat`, `| xargs --max-args 1 cat`, `| flock /tmp/l cat`) — it has to, or nothing
+  # would read. Exhaustion is not a shape reads take. Measured: no ALLOW cell in agent-autonomy.sh
+  # moved. The REJECTED alternative was an UNCONDITIONAL any-token scan of every segment, which
+  # denies `| xargs grep -rl pat .` on the `.` entry in the lexicon — a real read-lane loss. Round 6
+  # took the conditional form of that scan instead; see below. Mutant M-H13 turns this back into
+  # "not an interpreter".
+  if [ -z "$_ilw" ] && [ "$_ilpk" -eq 1 ]; then printf 'sh'; return 0; fi
+  # THE TAINTED-SEGMENT SCAN (round 6). Reached only when the peel GUESSED — i.e. some unknown flag
+  # of a KNOWN wrapper was peeled as one opaque token (`_iltn=1`). At that point the lead this
+  # function is about to report is not trustworthy at any fixed distance, so scan every REMAINING
+  # token of THIS segment (dequoted, basenamed) and report the first interpreter found.
+  # THREE BOUNDS, each one paid for by a pinned cell, so this is not the rejected any-token scan:
+  #   · CONDITIONAL — an untainted segment is never scanned, so `| xargs grep -rl pat .`,
+  #     `| xargs grep -l python`, `| env cat sh` and `| sudo -u root cat` keep today's ALLOW by
+  #     construction, not by luck.
+  #   · SEGMENT-BOUNDED — only this pipe segment's own remainder, never the whole command line.
+  #   · LEXICON MINUS `.`, `source`, `eval` — those three stay LEAD-ONLY. `.` is the commonest
+  #     directory argument there is (`| xargs -q 1 grep -rl pat .` and `| env --block-signal INT
+  #     grep -c .` are pinned ALLOW on exactly this exclusion); `source` and `eval` are ordinary
+  #     words that appear in filenames and grep patterns. As LEADS all three still deny.
+  # THE PRICE, disclosed and pinned: a tainted segment carrying an interpreter NAME as data now
+  # denies — `| sudo -R dir grep -l python x` was ALLOW on d0fda7f2 and is DENY here. Once the peel
+  # has guessed, this rule cannot tell a grep pattern from a program. The retry is to drop the
+  # unknown flag; `| sudo grep -l python x` is untainted and stays ALLOW (pinned beside it).
+  # Mutant M-H16 disables the taint MARKING; M-H15 disables this SCAN.
+  if [ "$_iltn" -eq 1 ]; then
+    _ilts=$_ilc
+    while [ -n "$(_cp8b_lead "$_ilts")" ]; do
+      _iltw=$(_cp8b_lead_word "$_ilts"); _iltw=${_iltw##*/}
+      case "$_iltw" in
+        .|source|eval) : ;;
+        *) if _cp8b_is_interp "$_iltw"; then printf '%s' "$_iltw"; return 0; fi ;;
+      esac
+      _ilts=$(_cp8b_drop_tok "$_ilts")
+    done
+  fi
+  printf '%s' "${_ilw##*/}"
+}
+
+# _cp8b_piped_interp "<cmd>": PREDICATE — 0 iff some PIPE-FED segment RUNS a shell or interpreter.
+# Those are the consumers that turn upstream DATA into CODE. `.`/`source` are on the list because both
+# read a file as script. A read verb downstream (`… | head`, `… | grep`, `… | sort`, `… | sed -n 1p`,
+# `… | tee /tmp/x`) is NOT, so the ordinary read pipeline keeps today's verdict.
+#
+# THE POLARITY IS DELIBERATE and must stay POSITIVE (a recogniser of interpreters), not the inverse (a
+# recogniser of safe consumers). Inverting it would deny every unlisted pipe consumer — `sort`, `tee`,
+# `column`, every project's own filter — a far wider version of exactly the F2 regression this round
+# is repairing. The cost of the positive form is the disclosed lexicon ceiling in the block comment
+# above (`busybox sh`, `./sh`, a renamed shell, an unknown wrapper): NOT recognised, unchanged today.
+# Round 5 note: the peel it calls now fails CLOSED (an exhausted segment reports `sh`), so the
+# polarity argument still holds — the positive recogniser is still the thing that can say "no".
+# Mutant M-H2 forces this to 1 and W16 flips back to ALLOW; M-H4 removes the basename and `| /bin/sh`
+# flips; M-H5 removes the xargs command-word re-test and `| xargs cat` flips back to a false DENY.
+#
+# _cp8b_is_interp "<word>": THE LEXICON, extracted (round 5) so the peel can consult it too — the
+# ambiguous-flag second reading below needs to ask "is this word an interpreter?" before the peel has
+# finished. One list, two callers; it must not be copied.
+_cp8b_is_interp() {
+  case "$1" in
+    sh|bash|dash|zsh|ksh|bash[0-9]*|sh[0-9]*|zsh[0-9]*|ksh[0-9]*|\
+    python|python[0-9]*|perl|perl[0-9]*|ruby|ruby[0-9]*|node|node[0-9]*|\
+    eval|source|.|osascript) return 0 ;;
+  esac
+  return 1
+}
+# _cp8b_xargs_runs_write "<word>": 0 iff the command word an `xargs` runs is `git`, a write verb or an interpreter
+# (design §13 M2). The verb list is the guard's own mutation set, so `xargs grep`/`xargs cat` keep their ALLOW.
+_CP8B_XARGS_WRITE='git rm mv cp ln tee sed chmod chown install rsync shred truncate dd patch'
+_cp8b_xargs_runs_write() {
+  _cp8b_in_list "$1" "$_CP8B_XARGS_WRITE" || _cp8b_is_interp "$1"
+}
+# _cp8b_xargs_seg_write "<seg>": design §16 R2. 0 iff the segment carries an `xargs` WORD (de-quoted, basename — so
+# `/usr/bin/xargs`, `'xargs'` and `command xargs` all count) and a LATER token (de-quoted, basename) is `git`, a write verb or an
+# interpreter, as resolved by `_cp8b_interp_lead` on the normalised segment (so `xargs grep -l python` stays a read).
+_cp8b_xargs_seg_write() {
+  case "$1" in
+    *x*a*r*g*s*) : ;;     # GSR C3: the letters in order are necessary for any spelling the skeleton below can recognise
+    *) return 1 ;;
+  esac
+  _xsg=0; case "$-" in
+    *f*) _xsg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  _xsr=1; _xss=0; _xsn=''
+  while [ $# -gt 0 ]; do
+    _xst=$1; shift
+    _xsb=${_xst#[\"\']}; _xsb=${_xsb%[\"\']}; _xsb=${_xsb##*/}
+    # GSR C3: quote-spliced / expanded spellings
+    case "$_xst" in
+      *'"'*|*"$_cp8b_sq"*|*'\'*|*'$'*|*'`'*)
+        _xsb=$(_cp8b_skeleton "$_xst") || _guard_fault xargs-skeleton
+        _xsb=${_xsb##*/} ;;
+    esac
+    if [ "$_xsb" = xargs ]; then _xss=1; _xst=xargs; fi      # normalise the word: `/usr/bin/xargs`, `'xargs'` -> `xargs`
+    _xsn="$_xsn $_xst"
+  done
+  [ "$_xsg" = 1 ] || set +f
+  [ "$_xss" = 1 ] || return 1
+  # the command word xargs RUNS comes from the existing wrapper peel (it knows xargs' own options), not from "any later token"
+  _xsl=$(_cp8b_interp_lead "$_xsn") || return 1
+  _xsl=${_xsl#[\"\']}; _xsl=${_xsl%[\"\']}; _xsl=${_xsl##*/}
+  _cp8b_xargs_runs_write "$_xsl"
+}
+_cp8b_pi_lead=''
+_cp8b_pi_xargs=0
+_cp8b_pi_nonlit=0
+_cp8b_piped_interp() {
+  case "$1" in
+    *'|'*) : ;;
+    *) return 1 ;;
+    esac
+  _cp8b_pi_xargs=0; _cp8b_pi_nonlit=0; _pip_cur=''
+  # An empty result here would end the loop at once and read as "no piped interpreter" (allow-ward), so a failed
+  # or vanished segmentation of a non-empty command is a fault (GUARD-QUOTED-EXEC-INTERMITTENT).
+  _piw=$(_cp8b_pipe_segments "$1") || _guard_fault pipe-segments
+  _guard_vanished pipe-segments "$1" "$_piw"
+  while [ -n "$_piw" ]; do
+    case "$_piw" in
+      *"$_cp8b_nl"*) _pis=${_piw%%"$_cp8b_nl"*}; _piw=${_piw#*"$_cp8b_nl"} ;;
+      *)             _pis=$_piw; _piw='' ;;
+    esac
+    _pip_last=$_pip_cur; _pip_cur=$_pis
+    case "$_pis" in
+      "$_cp8b_stx"*) _pis=${_pis#"$_cp8b_stx"} ;;
+      *) continue ;;
+      esac
+    _pil=$(_cp8b_interp_lead "$_pis")
+    if _cp8b_is_interp "$_pil"; then _cp8b_pi_lead=$_pil; return 0; fi
+    # design §12 D: `… | xargs git …` turns pipe-fed DATA into git arguments (`echo "git push origin⏎HEAD:main" | xargs git`),
+    # so an xargs whose command word is `git` joins this rule. Not added to the shared lexicon, which would make every
+    # `| git apply` an interpreter; the rule still denies only when an upstream segment carries a control-plane token.
+    # design §13 M2: keyed on the xargs WORD, not the substring, and extended from `git` to a WRITE verb.
+    # design §16 R2: keyed on the de-quoted BASENAME of an xargs word, and a write verb fed by NON-LITERAL upstream data
+    # (anything but echo/printf: `cat list | xargs rm`) is refused on doubt, since the data cannot be read.
+    if _cp8b_xargs_seg_write "$_pis"; then
+      _cp8b_pi_lead=xargs-write; _cp8b_pi_xargs=1
+      _pil2=$(_cp8b_lead "${_pip_last#"$_cp8b_stx"}"); _pil2=${_pil2#[\"\']}; _pil2=${_pil2%[\"\']}
+      case "${_pil2##*/}" in
+        echo|printf)
+          # GSR C6: an echo/printf holding an expansion or a glob is not literal data
+          case "$_pip_last" in
+            *'$'*|*'`'*|*[*?[{~]*) _cp8b_pi_nonlit=1 ;;
+          esac ;;
+        *) _cp8b_pi_nonlit=1 ;;
+      esac
+      return 0
+    fi
+  done
+  return 1
+}
+
+# _cp8b_pi_note: the second half of the piped-interpreter deny reason (review F3). The reason used to
+# name only the upstream READ segment, which reads as a false positive — the agent sees `echo "…"`
+# denied and no mention of the shell that made it dangerous. Name the interpreter.
+_cp8b_pi_note() {
+  printf ' That segment is piped into interpreter [%s], which would EXECUTE it, so the pipeline is judged RAW — no heredoc-body exclusion and no read-verb data exemption. To READ a control-plane file, drop the interpreter from the pipeline. (escape card R10 interpreter-args)' "$_cp8b_pi_lead"
+}
+
+# _cp8b_piped_interp_hit "<cmd>": 0 iff a piped interpreter is present AND some segment of the RAW
+# command path-hits a control-plane target. "Raw" is the whole point: no heredoc-body exclusion and no
+# read-verb data exemption, because the interpreter downstream is about to execute exactly those bytes.
+# The offending segment is left in $_cp8b_pi_seg for the caller's reason string.
+# DISCLOSED OVER-DENY, the safe direction: `cat .claude/hooks/guard-core.sh | sh -n` denies (one retry:
+# `sh -n <file>` directly, an already-recognised form). `grep x file | sh` carries no CP token and
+# stays ALLOW, exactly as today.
+_cp8b_pi_seg=''
+_cp8b_piped_interp_hit() {
+  _cp8b_piped_interp "$1" || return 1
+  _pihw=$(_cp8b_segments "$1") || _guard_fault pipe-interp-segments
+  _guard_vanished pipe-interp-segments "$1" "$_pihw"
+  while [ -n "$_pihw" ]; do
+    case "$_pihw" in
+      *"$_cp8b_nl"*) _cp8b_pi_seg=${_pihw%%"$_cp8b_nl"*}; _pihw=${_pihw#*"$_cp8b_nl"} ;;
+      *)             _cp8b_pi_seg=$_pihw; _pihw='' ;;
+    esac
+    # fork-free blank test
+    case $_cp8b_pi_seg in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    if _cp8b_tad_pathhit "$_cp8b_pi_seg"; then return 0; fi
+    # GUARD-READ-LANE-2 T7 — THE BARE-DIRECTORY HALF, and it is a MEASURED HOLE, not a tidy-up. T1 armed
+    # this rule on the PATHHIT trigger alone, but the target arm has three: a bare control-plane
+    # DIRECTORY NAME (`conformance`, `skills`) is a LITERAL-TOKEN hit, never a pathhit. So the whole
+    # laundering rule was unarmed for `<reader> <cp-dir> | sh`, and at 62681ba6 `ls conformance | sh`
+    # MEASURED ALLOW — no `find` involved, a pre-existing gap in every read verb. F-e would have
+    # inherited it (`find conformance -name '*.sh' | sh` flipped to ALLOW the moment find joined the read
+    # lane), which is how it was found. Closing it here rather than shipping the inheritance: the same
+    # trigger the target arm uses two lines apart, so the pipe rule is armed by the same CP evidence the
+    # deny is. Direction is ALLOW->DENY only. `_cp8b_tad_composed_tok` is deliberately NOT added — it is
+    # the fuzzier trigger and no measured route needs it; that stays a one-line ratified add.
+    if _cp8b_tad_literal_tok "$_cp8b_pi_seg"; then return 0; fi
+  done
+  return 1
+}
+
+# GUARD-READONLY-FP-RELIEF Arm E — QUOTED-heredoc body exclusion (cures register face N3).
+# A heredoc with a QUOTED delimiter (`<<'EOF'` / `<<"EOF"`) is INERT DATA by shell semantics: no
+# expansion, no execution. Today each body LINE becomes a segment and is scanned as code, which is
+# the false positive that bit one orchestrator session four times. This removes the body REGION from
+# the copy the two control-plane arms segment. The RAW command is untouched — every flat rule in
+# `guard_check_command` (recursive rm, push-to-main, secret reads, …) still sees every byte, and the
+# deny REASONS still print the raw/segment text.
+#
+# ***THE FAIL DIRECTION IS OVER-EXCLUSION*** (security vet M2): swallowing past a mis-found terminator
+# would let a REAL command escape the scan. So every ambiguity resolves to NOT-excluded, and each
+# decline below has a must-stay-DENY leg in agent-autonomy.sh that places a live mutator AFTER the
+# true terminator. Declines, in order:
+#   · a here-STRING (`<<<`) — different construct, not this arm
+#   · any CR byte — a CRLF terminator will not compare equal, so the whole command is ambiguous
+#   · anything other than EXACTLY ONE `<<` in the command (two heredocs = two body regions to bound;
+#     this decline is a conservative BELT — with the exact-terminator rule below, dropping it can
+#     only ever exclude the FIRST body, which is inert either way, so no fixture separates it. Stated,
+#     not claimed as coverage: the `_kx` precedent at C4 Arm 2, mutant dropped with rationale.)
+#   · `<<-` (tab-stripped terminators), an UNQUOTED delimiter, or a delimiter that is not a plain
+#     `[A-Za-z0-9_]+` word — the extraction below simply fails to match, and a failed match declines
+#   · a heredoc whose own redirect TARGET classifies control-plane or is non-literal
+#   · NO line after the start line that is EXACTLY the delimiter — never strip to the end
+#   · any earlier line that TRIMS to the delimiter but is not exactly it (whitespace ambiguity)
+# ***REVIEW C2 (2026-08-19), residual DIRECTION CORRECTED — the earlier claim was FALSIFIED.*** A
+# `<<'WORD'` sequence inside an ordinary quoted argument IS treated as a heredoc start, and the earlier
+# comment claimed "the direction of any residual error is a body that stays scanned — over-deny." That
+# was WRONG. `: "<<'X'"` followed by `sed -i s/return 1/return 0/ .claude/hooks/guard-core.sh` and a
+# line `X` made the first REAL command the heredoc body: it was stripped from the scanned copy and the
+# write to the guard's OWN source ALLOWED — an escape from ALL cp8b protection, measured ALLOW on the
+# branch, DENY on main. The failure direction is OVER-EXCLUSION, not over-deny. The in-body declines
+# (`<<-`, unquoted, whitespace-ambiguous) were never the gap; the ENTRY was. A REAL heredoc operator
+# never has a QUOTE byte before the `<<` on its start line (`cat <<'EOF'` — no quote precedes `<<`),
+# so declining when one does closes the argument-embedded shape. Disclosed OVER-DENY, the safe
+# direction: a genuine heredoc whose start line ALSO carries an earlier quoted string
+# (`echo "hi" && cat <<'EOF'`) declines too and its body stays scanned — accepted, since the fail
+# direction is over-deny and the common heredoc spelling leads with the redirect verb, unquoted.
+# Mutant M-E8 removes that line and reopens the hole.
+_cp8b_strip_heredocs() {
+  case "$1" in
+    *'<<'*) : ;;
+    *) printf '%s' "$1"; return ;;
+    esac
+  case "$1" in
+    *'<<<'*) printf '%s' "$1"; return ;;
+    esac
+  case "$1" in
+    *"$_cp8b_cr"*) printf '%s' "$1"; return ;;
+    esac
+  # rc 0 (a match) and rc 1 (none) are both answers; a fault inside the matcher is not (SWAS-583).
+  _hdc_rc=0; _hdo=$(_gmo heredoc-count "$1" -o '<<') || _hdc_rc=$?
+  [ "$_hdc_rc" -le 1 ] || _guard_fault heredoc-count
+  _hdc=0
+  if [ "$_hdc_rc" = 0 ] && [ -n "$_hdo" ]; then _hdc=$(printf '%s\n' "$_hdo" | wc -l | tr -d '[:space:]') || _guard_fault heredoc-count; fi
+  [ "$_hdc" = 1 ] || { printf '%s' "$1"; return; }
+  _hdl_rc=0; _hdn=$(_gmo heredoc-line "$1$_cp8b_nl" -n '<<') || _hdl_rc=$?
+  [ "$_hdl_rc" -le 1 ] || _guard_fault heredoc-line
+  _hdl=''
+  if [ "$_hdl_rc" = 0 ]; then _hdl=$(printf '%s\n' "$_hdn" | head -1 | cut -d: -f1) || _guard_fault heredoc-line; fi
+  [ -n "$_hdl" ] || { printf '%s' "$1"; return; }
+  _hds=$(printf '%s\n' "$1" | sed -n "${_hdl}p")
+  # REVIEW C2 — ENTRY guard: a quote byte BEFORE the `<<` on the start line means the `<<` is embedded
+  # in an argument, not a heredoc operator. Decline (never strip). `${_hds%%'<<'*}` is the text before
+  # the first `<<`; a `'` or `"` in it is the tell.
+  case "${_hds%%'<<'*}" in
+    *"'"*|*'"'*) printf '%s' "$1"; return ;;
+    esac
+  # GUARD-READ-LANE-2 T1, half 1 (design §5) — the CONSUMER gate. Arm E excluded a body on the
+  # DELIMITER's quoting alone and never on WHO CONSUMES it, so `sh <<'EOF'` + a `cp` onto the guard's
+  # own source measured ALLOW (W11). A quoted body is inert only while the consumer treats it as
+  # content; when a shell or interpreter reads it, it IS code. Two separately-mutatable lines:
+  #   (M-H1) the consumer must be on the content-consumer list; and
+  #   (M-H3) the consumer must be the WHOLE start line — a separator after the `<<` operator means
+  #          something ELSE downstream also sees the body (`cat <<'EOF' | sh`, `cat <<'EOF' ; true`),
+  #          which is the W15 shape one byte over from W11.
+  _cp8b_hd_consumer "$_hds" || { printf '%s' "$1"; return; }
+  case "${_hds#*'<<'}" in
+    *'|'*|*';'*|*'&'*) printf '%s' "$1"; return ;;
+    esac
+  # The two SEMANTIC guards, deliberately kept as their own lines so each is separately mutatable
+  # (the extraction below is intentionally permissive; these decide, not the regex).
+  case "$_hds" in
+    *'<<-'*) printf '%s' "$1"; return ;;
+    esac              # tab-stripped terminator (M2)
+  _gmq heredoc-delimiter "$_hds" -q "<<-\{0,1\}['\"]" || { printf '%s' "$1"; return; }  # QUOTED delimiter only
+  _hdw=$(printf '%s' "$_hds" | sed -n 's/.*<<-\{0,1\}["'"'"']*\([A-Za-z0-9_][A-Za-z0-9_]*\).*/\1/p')
+  [ -n "$_hdw" ] || { printf '%s' "$1"; return; }
+  if _cp8b_tad_redir_cp "$_hds"; then printf '%s' "$1"; return; fi
+  # SWAS-230 — a quoted body is inert only OUTSIDE an open `$(`: under bash 3.2 (macOS /bin/bash and
+  # /bin/sh) a `)` in the body closes a `$(` opened above and the rest of the body runs as code. So
+  # decline (body stays scanned) when a `$(` precedes the `<<` AND a body line holds a `)`. Presence,
+  # not balance: no quote-aware counting (D-240813-3). F1: the shell removes a backslash-newline
+  # BEFORE it finds `$(`, and this strip runs on raw text, so read the pre-`<<` text collapsed to
+  # nothing (the empty-join: the space-join leaves `$ (`); the precheck is fork-free.
+  _hdpre=${1%%'<<'*}
+  case "$_hdpre" in
+    *'\'"$_cp8b_nl"*)
+      _hdraw=$_hdpre
+      _hdpre=$(_cp8b_joinlines_empty "$_hdraw") || _guard_fault heredoc-joinlines-empty
+      _guard_vanished heredoc-joinlines-empty "$_hdraw" "$_hdpre" ;;   # SF2: a vanished substitution faults, never reads as "no $("
+    esac
+  _hdsub=0
+  case "$_hdpre" in
+    *'$('*) _hdsub=1 ;;
+    esac
+  _hdo=$(printf '%s\n' "$1" | awk -v start="$_hdl" -v w="$_hdw" -v hs="$_hdsub" '
+    NR <= start { pre = pre $0 "\n"; next }
+    !seen {
+      if ($0 == w) { seen = 1; next }
+      if (index($0, ")")) { par = 1 }
+      t = $0; gsub(/^[ \t]+/, "", t); gsub(/[ \t]+$/, "", t)
+      if (t == w) { amb = 1 }
+      next
+    }
+    { post = post $0 "\n" }
+    END { if (!seen || amb || (hs == 1 && par)) exit 3; printf "%s%s", pre, post }') || { printf '%s' "$1"; return; }
+  printf '%s' "$_hdo"
+}
+
+# === SWAS-184 GUARD-SUBSTITUTION-GIT-WRITE =========================================================
+# design: docs/architecture/2026-10-14-guard-substitution-git-write-design.md (amendment A1, rule A1-R; A3 moves the
+# plain-literal test to the lead word of each substitution and makes an interpreter name a script).
+# A command-substitution body rides inside its outer segment, so no per-segment arm judges it as a command. This block is a
+# COARSE DISQUALIFICATION, not a parser (`D-240813-3`): it never looks for a close, never tracks quotes, never extracts a
+# body. It takes the text after the FIRST opener, turns the shell's separators into stop tokens, splits on whitespace,
+# de-quotes, and runs word tests: a git word must be followed by one of nine measured reads, with no global option before
+# the subcommand. Over-denying is the accepted price; it can only turn an ALLOW into a DENY.
+_s84_win=''; _s84_n=0; _s84s=0; _s84k=0; _s84l=0; _s84e=0; _s84xa=0; _s84w=0; _s84i=0; _s84ir=0; _s84q=0; _s84pn=0; _s84pv=''
+
+# _cp8b_sub_window "<cmd>": SWAS-184 - the text after the FIRST opener (`$(` of any kind, `$((` included; a backtick; `<(`;
+# `>(`) in $_s84_win. rc 1 when there is none. A byte position, not a parse.
+_cp8b_sub_window() {
+  _s84_n=0; _s84_win=''
+  _s84a=${1%%'$('*}; _s84k2=${1%%'`'*}; _s84b=${1%%'<('*}; _s84c=${1%%'>('*}
+  # A funsub opens at `${` then any byte that cannot start a parameter expansion (a blank, a tab, a newline, `|`, a future byte).
+  _s84d=${1%%'${'[!A-Za-z0-9_#!@*?\$-]*}   # SWAS184-FUNSUB
+  _s84m=${#1}
+  if [ "${#_s84d}" -lt "$_s84m" ]; then _s84m=${#_s84d}; _s84_win=${1#"$_s84d"???}; _s84_n=1; fi
+  if [ "${#_s84a}" -lt "$_s84m" ]; then _s84m=${#_s84a}; _s84_win=${1#"$_s84a"??}; _s84_n=1; fi   # SWAS184-DOLLAR
+  if [ "${#_s84k2}" -lt "$_s84m" ]; then _s84m=${#_s84k2}; _s84_win=${1#"$_s84k2"?}; _s84_n=1; fi   # SWAS184-TICK
+  if [ "${#_s84b}" -lt "$_s84m" ]; then _s84m=${#_s84b}; _s84_win=${1#"$_s84b"??}; _s84_n=1; fi   # SWAS184-PROC
+  if [ "${#_s84c}" -lt "$_s84m" ]; then _s84m=${#_s84c}; _s84_win=${1#"$_s84c"??}; _s84_n=1; fi   # SWAS184-PROC
+  [ "$_s84_n" = 1 ]
+}
+
+# _cp8b_sub_longflag "<--name>": SWAS-184 - 0 iff <--name> is, or abbreviates, a diff-family flag that writes a file or
+# runs a configured program (git accepts any unambiguous prefix of a long option).
+_cp8b_sub_longflag() {
+  for _s84g in --output --ext-diff --textconv --upload-pack --receive-pack --exec; do
+    case $_s84g in
+      "$1"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# _cp8b_sub_lead "<marked window>": SWAS-184 (A3) - PREDICATE, 0 = deny. The window carries an `@@` marker at every opener. The
+# LEAD word of each substitution - the first word after the marker, past leading parens, quote-only tokens and NAME=value
+# assignments - must be a plain literal, else DENY: every spelling that hides a program name holds a byte outside the set
+# (quotes, backslash, $, braces, globs, a glued redirect). When the lead is a kept wrapper, EVERY token up to the next stop
+# is tested too. Later words of a body are not tested (prose lines of a heredoc body are not leads); the any-position word
+# test in _cp8b_sub_tok still reads them. This does not recognise git.
+_cp8b_sub_lead() {
+  _s84lf=0
+  case "$-" in
+    *f*) _s84lf=1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  _s84nx=0; _s84md=0; _s84lr=1
+  for _s84lt in "$@"; do
+    if [ "$_s84lt" = '@@' ]; then _s84nx=1; continue; fi
+    if [ "$_s84lt" = ';' ]; then _s84nx=0; _s84md=0; continue; fi
+    [ "$_s84nx" = 1 ] || [ "$_s84md" = 1 ] || continue
+    while :; do   # a subshell paren opens the body; the word after it is the lead (a loop, since semgrep cannot parse `(` in a bracket expression)
+      case $_s84lt in
+        '('*) _s84lt=${_s84lt#?} ;;
+        *) break ;;
+      esac
+    done
+    case $_s84lt in
+      *[!\"\']*) : ;;
+      *) continue ;;
+    esac
+    case $_s84lt in
+      [A-Za-z_]*=*)
+        case ${_s84lt%%=*} in
+          *[!A-Za-z0-9_]*) : ;;
+          *) continue ;;
+        esac ;;
+    esac
+    case $_s84lt in
+      *[!A-Za-z0-9._/+:,@%=-]*) _s84lr=0; break ;;   # SWAS184-LEAD
+    esac
+    if [ "$_s84nx" = 1 ]; then
+      _s84nx=0
+      case ${_s84lt##*/} in
+        env|command|nice|time|nohup|exec|timeout|sudo) _s84md=1 ;;
+      esac
+    fi
+  done
+  [ "$_s84lf" = 1 ] || set +f
+  return $_s84lr
+}
+
+# _cp8b_sub_stdin "<token>": SWAS-184 (A3, item 3) - PREDICATE, 0 = deny. Called for each token while an interpreter is armed
+# (_s84i = 1): before its run ends it must reach a script operand, a plain token holding / or . (that clears _s84i). Flags
+# and the target of an output redirect are skipped. An input redirect, a lone -, an inline-code flag in any position, a
+# non-plain token or a plain token with no / or . denies. A stop (or the window's end) with the interpreter still armed
+# denies in the caller, which closes the pipe, |& and sequence channels by construction.
+_cp8b_sub_stdin() {
+  if [ "$_s84ir" = 1 ]; then _s84ir=0; return 1; fi   # the word after an output redirect
+  case $1 in
+    '<'*|-) return 0 ;;
+    *'>') _s84ir=1; return 1 ;;
+    -c|-e|-E|-p|-s|--eval|--eval=*|--print|--print=*|-[ceEps]*|-[!-]*[ceEps]*) return 0 ;;   # SWAS184-STDINFLAG
+    *'>'*|-*) return 1 ;;
+    *[!A-Za-z0-9._/+:,@%=-]*) return 0 ;;
+    */*|*.*) _s84i=0; return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_sub_tok "<token>": SWAS-184 - PREDICATE, 0 = deny. One de-quoted window token, with the run state in globals
+# (_s84s: 1 expecting a git subcommand, 2 inside log/show/diff; _s84k: skip a flag value; _s84l/_s84e: an interpreter / env
+# just seen; _s84xa: an xargs earlier in the run). A `;` stop token ends the run.
+_cp8b_sub_tok() {
+  _s84t=$1; _s84w=0
+  case $_s84t in
+    ';') [ "$_s84i" = 1 ] && return 0; _s84s=0; _s84k=0; _s84l=0; _s84e=0; _s84xa=0; _s84q=0; _s84ir=0; _s84pn=0; _s84pv=''; return 1 ;;
+    GIT_*=*)   # SWAS184-GITENV
+      case ${_s84t%%=*} in
+        *[!A-Za-z0-9_]*) : ;;
+        *) return 0 ;;
+      esac ;;
+  esac
+  # a lookup (which, type, whereis as a run's first word; command -v) names an interpreter as data
+  case $_s84t in
+    which|type|whereis) [ "$_s84pn" = 0 ] && _s84q=1 ;;
+    -v|-V) [ "$_s84pv" = command ] && _s84q=1 ;;
+  esac
+  _s84pn=1; _s84pv=$_s84t
+  if [ "$_s84k" = 1 ]; then _s84k=0; return 1; fi
+  if [ "$_s84l" = 1 ]; then   # SWAS184-ADJ
+    _s84l=0
+    case $_s84t in
+      -c|-e|-E|-p|-s|--eval|--print|-[ceEps]*|-[!-]*[ceEps]*) return 0 ;;   # SWAS184-INTERP
+    esac
+  fi
+  if [ "$_s84i" = 1 ]; then   # an armed interpreter must reach a script operand
+    if _cp8b_sub_stdin "$_s84t"; then return 0; fi
+    return 1
+  fi
+  if [ "$_s84e" = 1 ]; then _s84e=0; if [ "$_s84t" = -S ]; then return 0; fi; fi   # SWAS184-ENVS
+  if [ "$_s84s" = 1 ]; then   # SWAS184-CFLAG
+    case $_s84t in
+      -C|--git-dir|--work-tree) _s84k=1; return 1 ;;   # SWAS184-KEEPC
+      --git-dir=*|--work-tree=*|--no-pager|-P|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs) return 1 ;;   # SWAS184-KEEP
+      -*) return 0 ;;   # SWAS184-GLOBALS
+    esac
+    _s84s=0
+    case $_s84t in
+      log|show|diff) _s84s=2; return 1 ;;
+      rev-list) _s84s=2; return 1 ;;   # SWAS184-RLFLAGS (accepts diff options; measured: only rev-list on this list writes via --output)
+      rev-parse|status|describe|merge-base|ls-files) return 1 ;;   # SWAS184-LIST
+      *) return 0 ;;   # SWAS184-ALLOW
+    esac
+  fi
+  if [ "$_s84s" = 2 ]; then
+    case $_s84t in
+      --) _s84s=0 ;;
+      -o*) return 0 ;;   # SWAS184-FLAGS
+      --?*) if _cp8b_sub_longflag "${_s84t%%=*}"; then return 0; fi ;;   # SWAS184-FLAGS
+    esac
+  fi
+  case $_s84t in
+    *'{'*)
+      case $_s84t in
+        *git*) return 0 ;;   # SWAS184-BRACE
+      esac ;;
+  esac
+  _s84bw=${_s84t%%'<'*}; _s84bw=${_s84bw%%'>'*}; _s84bw=${_s84bw##*/}   # a glued redirect does not hide the word (sh>out, git>x)
+  case $_s84bw in
+    eval) return 0 ;;   # SWAS184-EVAL
+    [Gg][Ii][Tt]-*) return 0 ;;   # SWAS184-CASE
+    [Gg][Ii][Tt]|[Gg][Ii][Tt].[Ee][Xx][Ee]) _s84s=1; _s84w=1 ;;   # SWAS184-CASE
+    env) _s84e=1; _s84w=1 ;;
+    sh|bash|dash|zsh|ksh|python*|perl*|ruby*|node*) _s84l=1; _s84w=1; [ "$_s84q" = 1 ] || _s84i=1 ;;   # SWAS184-ARM
+    xargs) _s84xa=1 ;;
+  esac
+  [ "$_s84xa" = 1 ] && [ "$_s84w" = 1 ]   # SWAS184-XARGS
+}
+
+# _cp8b_subst_denied "<cmd>": SWAS-184 - PREDICATE, 0 = deny. Gate: the command holds an opener. Window: the text after the
+# first one (so every body is in it). Lead pass: a private copy marks every opener, makes `; & | )` stops and glues a paren to
+# the word before it; the first word after each marker must be plain. Word-test pass (the shared stop text): `(` is a stop
+# too, a `$` right before a quote is deleted (`gi$'t'` is git), the text is de-quoted (`g\it`, `"g"it` are git) and split on
+# whitespace; a git word must then be followed by a measured read, and an interpreter must name a script.
+_cp8b_subst_denied() {
+  case "$1" in
+    *'$('*|*'<('*|*'>('*|*'`'*|*'${'[!A-Za-z0-9_\#!@*?\$-]*) : ;;
+    *) return 1 ;;
+  esac
+  _cp8b_sub_window "$1" || return 1
+  _s84y=$(printf '%s' "$_s84_win" | tr '\n`' ';;' | sed -e 's/[;&|)]/ ; /g' -e 's/</ < /g') || _guard_fault subst-window   # SWAS184-STOP
+  _guard_vanished subst-window "$_s84_win" "$_s84y"
+  _s84gl='s/\([^[:space:](]\)(/\1_/g'   # the paren glue; it is private to the lead test (F1: shared, it hid a nested opener)
+  _s84o=$(printf '@@ %s' "$_s84_win" | sed -e 's/\$(/ @@ /g' -e 's/`/ @@ /g' -e 's/[<>](/ @@ /g' -e 's/\${[^A-Za-z0-9_#!@*?$-]/ @@ /g' -e 's/[;&|)]/ ; /g') || _guard_fault subst-window
+  _guard_vanished subst-window "$_s84_win" "$_s84o"
+  _s84g=$(printf '%s' "$_s84o" | sed -e "$_s84gl") || _guard_fault subst-window
+  _guard_vanished subst-window "$_s84o" "$_s84g"
+  if _cp8b_sub_lead "$_s84g"; then return 0; fi
+  _s84x=$(printf '%s' "$_s84y" | sed -e "s/\\$\\([\"']\\)/\\1/g" -e 's/[()]/ ; /g') || _guard_fault subst-window   # SWAS184-DQUOTE
+  _s84x=$(_cp8b_dequote "$_s84x") || _guard_fault subst-window   # SWAS184-DQ
+  _s84f=0
+  case "$-" in
+    *f*) _s84f=1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $_s84x
+  _s84s=0; _s84k=0; _s84l=0; _s84e=0; _s84xa=0; _s84r=1; _s84i=0; _s84ir=0; _s84q=0; _s84pn=0; _s84pv=''
+  for _s84tk in "$@"; do
+    if _cp8b_sub_tok "$_s84tk"; then _s84r=0; break; fi
+  done
+  [ "$_s84i" = 1 ] && _s84r=0   # the window ended with an interpreter still waiting for a script
+  [ "$_s84f" = 1 ] || set +f
+  return $_s84r
+}
+
+# _cp8b_sub_reason: SWAS-184 - the refusal text for a substitution deny (escape-card row R28 `substitution-git`).
+_cp8b_sub_reason() {
+  printf '13: after a command substitution ($(...), backtick, <(...)) the command may hold a git command only as a measured read (rev-parse, log, show, diff, status, describe, merge-base, ls-files, rev-list) with no -c/--config-env/--exec-path/--namespace before the subcommand, no GIT_*= assignment, no eval, no program name that is not a plain literal, and an interpreter only with a script path (no -c/-e flag, no stdin) - denied (control-plane integrity; coarse fail-closed). Run the git command as its OWN command, not after a substitution; for a message use git commit -F <file> or gh pr create --body-file <file>; or split the command in two. (escape card R28 substitution-git)'
+}
+
+# _cp8b_control_plane_denied "<cmd>": PREDICATE - the CP-8b control-plane decision. Walks the segments
+# and binds each segment's LEADING VERB to that segment's OWN arguments (design section 9.4).
+_cp8b_control_plane_denied() {
+  _cp8b_raw=$1   # DRIFT-2: the whole command, for _cp8b_message_tip (the message-body escape hint).
+  # GUARD-READ-LANE-2 T1, half 2 (design §5): a pipe into an interpreter forces RAW judgment of every
+  # upstream segment before anything below can exempt it as data. Add-only — a miss falls straight
+  # through to today's walk.
+  if _cp8b_piped_interp_hit "$1"; then _cp8b_deny_reason "$_cp8b_pi_seg"; _cp8b_pi_note; return 0; fi
+  # SWAS-184: the text after the first substitution opener of the WHOLE command is judged before any segment is, so a
+  # lead-based arm (a read lead, an assignment, a kit-exec script) cannot step past a body the segmenter would cut.
+  if _cp8b_subst_denied "$1"; then _cp8b_sub_reason; return 0; fi   # SWAS184-SITE-A
+  # GUARD-READ-LANE-2 T8 (design §3-F-a): segment the QUOTED-SPAN MASK when it was kept. It declines to
+  # the identical string on every ambiguous byte and whenever the gate does not hold, so this line is a
+  # no-op for every command that is not a read-led whole.
+  _cp8b_walk_load "$1"   # GUARD-QUOTED-EXEC-INTERMITTENT: faults (exit 2) on a failed/vanished stage
+  while _cp8b_next_seg; do
+    # fork-free blank test
+    case $_seg in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    # TWO VIEWS OF ONE SEGMENT, and the split is the whole of F-a's blast radius. `$_segm` is the
+    # MASKED view and is consulted by exactly the tests whose subject is SHELL METACHARACTER SEMANTICS
+    # (here: the `<`/`>` redirect bail). `$_seg` is restored to the command's TRUE BYTES and is what
+    # every other test, every reason string, and every downstream recogniser sees — so pathhit, the
+    # literal-token walk, the grammars and the deny messages are unchanged, byte for byte. A real
+    # UNQUOTED operator is never masked in the first place (the mask is span-bounded), so the DENY
+    # half of the sentinel pair is held by `$_segm` itself, not by the restore.
+    _segm=$_seg
+    case "$_seg" in
+      *["$_cp8b_mk_all"]*) _seg=$(_cp8b_unmask_quoted "$_seg") ;;
+      esac
+
+    # 1. git write-primitives are subcommand-bound and apply REGARDLESS of a control-plane mention
+    #    (`git diff --output` writes anywhere). Checked first.
+    if _cp8b_git_write_denied "$_seg"; then return 0; fi
+
+    # 2. a segment we cannot parse, or one carrying a redirect, is NEVER relaxed - it keeps today's
+    #    scan-and-deny. (`echo -n > .github/workflows/ci.yml` leads with a READ verb; only the redirect
+    #    check stands between it and an allow-back.)
+    #    F-a: the redirect test reads `$_segm` — a `>` inside a quoted span is a character in an
+    #    argument, not an operator, and treating it as one is what denies `echo "a -> b"`. The scan it
+    #    guards still runs on the restored `$_seg`.
+    if _cp8b_unparseable "$_seg" || _gmq redirect-bail "$_segm" -q '[<>]'; then
+      if _cp8b_scan_denied "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi
+      continue
+    fi
+
+    _lv=$(_cp8b_lead "$_seg")
+    case "$_lv" in
+      # 3. READ TOOLS - CP-8a's strict stdout-only set, REUSED VERBATIM, not re-derived. It deliberately
+      #    excludes every tool with a write/exec escape: sed (s///e executes, `w` writes), awk (system(),
+      #    print >), find (-exec/-delete), sort (-o), uniq (out), less/more (!cmd), xxd (-r). Their
+      #    arguments are DATA: a read command cannot mutate the path it merely mentions.
+      grep|egrep|fgrep|rg|ls|cat|head|tail|wc|diff|stat|file|du|cut|tr|nl|od|hexdump|column|tac|comm|cmp|basename|dirname|realpath|readlink|echo|printf|which|type)
+        : ;;
+      git)
+        _sub=$(_cp8b_git_sub "$_seg")
+        case "$_sub" in
+          # Read subcommands whose arguments are DATA — `git commit -m "… conformance/x …"` is a MESSAGE,
+          # not a target. This set is CP-8a's, REUSED VERBATIM and deliberately NOT widened.
+          #
+          # Every other git subcommand is left to fall through to scan-and-deny below, and that is a
+          # decision, not an oversight. An earlier cut of this slice also certified
+          # `add|fetch|pull|rebase|merge|stash|tag|branch|config|push` as "reads" — which would have
+          # handed back an arbitrary-execution primitive, because `git rebase --exec "rm -rf conformance"`
+          # RUNS the string. That is CP-8a's fail-open repeating exactly: certifying a capability safe by
+          # NAMING it, without enumerating every flag it carries ("git diff is a read" — false for
+          # --output). None of them NEED the exemption: with no mutation verb in the segment, scan-and-deny
+          # allows them anyway. Speculative exemptions are treated as guilty.
+          commit|status|blame|describe)
+            : ;;
+          checkout|restore|archive|bundle|worktree|init|clone)
+            : ;;   # already TARGET-BOUND in step 1; a clean pass there is a real ALLOW.
+          *)
+            if _cp8b_scan_denied "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+        esac ;;
+      # 4. MUTATION VERBS - target-bound. Two sub-classes by what the verb does to its SOURCE:
+      #    - ALL path tokens are targets when the verb can WRITE THROUGH any of its arguments:
+      #        mv/rsync DESTROY the source (this is what catches `mv conformance /tmp/gone`);
+      #        ln creates a WRITABLE ALIAS - `ln -s conformance/x /tmp/link` then `echo … > /tmp/link`
+      #        writes the control-plane file, so `ln` is NOT a content-copy and every token it names is a
+      #        target (security review of CP-8b: grouping `ln` with `cp` was the family's signature
+      #        error - certifying a capability safe by the name it is grouped under, not by what it does);
+      #        rm/chmod/… mutate their targets in place.
+      #    - Only the DESTINATION is a target for cp/install, which copy CONTENT: editing the copy cannot
+      #      reach the original, so copying a control-plane file OUT (`cp conformance/x /tmp/b`) is safe.
+      #      ⚠️ NOT TRUE OF EVERY cp/install INVOCATION. Some flags make the destination an ALIAS of
+      #      the source rather than a copy of its content, and this comment asserted otherwise until
+      #      2026-08-01. Same signature error the `ln` note above records — certifying a capability by
+      #      the family it is grouped under rather than by what it does. NOT fixed here: the remedy is
+      #      a command-matrix change with a different blast radius from this file's path work, and it
+      #      is tracked as GUARD-CP-HARDLINK-ALIAS. The flag detail lives on that row, not in this
+      #      file — a guard's own source is read by the agent it denies, so an open hole is described
+      #      here by its shape, not by a recipe.
+      # GUARD-READ-LANE-2 F-b — the ONE read grammar of a DUAL-MODE verb. This arm deliberately
+      # SHADOWS the mutation arm below for `sed`: `case` takes the FIRST matching arm, so the `sed`
+      # entry in the `mv|rsync|…|sed` list below is now SHADOWED — unreachable for a bare `sed` lead.
+      # It is KEPT there on purpose, and the keeping is the safety property: deleting THIS arm restores
+      # today's deny exactly, with no second edit and no chance of an accidental read-lane hole left
+      # behind. (T6 seat review item 2.) `sed` stays in that list (it IS
+      # a mutation verb — that is the D1 build invariant, and the D1-M1 mutant leg proves a lexicon
+      # entry would fail open), and every spelling the grammar declines falls THROUGH to it unchanged.
+      # `sed -i`, `-e`, `-f`, `-s`, `--expression=`, a `w`/`e`/`s///w` script, a flag-shaped or
+      # expansion-carrying operand: all still target-bound. A redirect never reaches here at all —
+      # step 2 above scans any segment carrying `<`/`>` before the lead is consulted.
+      sed)
+        _cp8b_seg_is_sed_n "$_seg" && continue
+        if _cp8b_cp_target_in all "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+      # GUARD-READ-LANE-2 F-e — the same shadow for `find`, with one difference that matters: `find` is
+      # NOT in the mutation list below (it never was — it fell to the `*)` scan-and-deny arm), so this
+      # arm's decline path re-enters THAT arm explicitly rather than falling through. Every spelling
+      # the grammar declines is therefore scanned exactly as it is today, byte for byte.
+      find)
+        _cp8b_seg_is_find_ro "$_seg" && continue
+        if _cp8b_scan_denied "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+      mv|rsync|ln|rm|rmdir|shred|truncate|chmod|chown|tee|patch|dd|sed)
+        if _cp8b_cp_target_in all "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+      cp|install)
+        if _cp8b_cp_target_in last "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+      # 5. ANYTHING ELSE - an interpreter, a wrapper, or simply unrecognized. Its arguments may be CODE.
+      #    Today's behavior, byte for byte. This is the branch that makes the whole change monotone.
+      *)
+        if _cp8b_scan_denied "$_seg"; then _cp8b_deny_reason "$_seg"; return 0; fi ;;
+    esac
+  done
+  return 1
+}
+
+# ============================================================================================
+# GUARD-BASENAME-AFTER-CD-BYPASS + GUARD-INTERPRETER-FAMILY-BYPASS — the resolved-target arm.
+# (design: docs/architecture/2026-08-13-guard-judge-resolved-target-design.md §3.)
+# The guard judges the RESOLVED target, not the verb. COMPOSITION PROPERTY (§3-C, §9(b)): the final
+# control-plane deny is `old-verb-arm (_cp8b_control_plane_denied) ∨ new-target-arm (below)`. The old
+# arm is retained VERBATIM — so every existing DENY fixture stays green by construction and this is a
+# monotone ADD (panel #19 shape). REALIZATION NOTE: the design's "union at four sites" is realized here
+# as one cohesive parallel arm OR'd with the retained old arm — this reproduces the census oracle
+# (scratchpad out_MIN2.tsv = today_cp ∨ newarm) exactly and touches no existing decision site, keeping
+# the blast radius to an addition. Reads/CP-script execution stay allowed; ordinary-target writes by
+# the same tools stay allowed.
+#
+# HONEST CEILING (design §6): this narrows the drift window for SINGLE-COMMAND, QUOTE-FREE writes only.
+# Persisted cwd (no `cd` in the command), `$VAR`/`bash -c`/quoted-separator cd, and `python3 -c`
+# building a path by concatenation remain disclosed residuals — the guard stays a speed bump (D3′).
+
+# _cp8b_norm "<path>": textual normalization — collapse //, a /./ FIXPOINT, trailing /, and a `..`
+# fixpoint. Byte-identical to guard_check_path's twin sed (single source of truth for composed-path
+# shape) — the two are pinned equal by a byte-identity selftest leg (GUARD-CP-WRITE-ROUTES K-COUPLE).
+# The /./ leg is a labelled fixpoint (`:b … tb`) mirroring the `..` leg: a single `g` pass misses
+# OVERLAPPING /./ runs (hooks/./././pre-push -> hooks/./pre-push residual), so the loop is required to
+# fully collapse repeated /./ (K-N2 pins it).
+_cp8b_norm() {
+  printf '%s' "$1" | sed -e 's#//*#/#g' -e ':b' -e 's#/\./#/#' -e 'tb' -e 's#^\./##' -e 's#/*$##' -e ':a' -e 's#[^/]*/\.\./##' -e 'ta'
+}
+
+# _cp8b_has_quote "<segment>": 0 iff the segment carries a quote/escape byte. A quote byte means the
+# quote-blind segmenter (:568) MAY have crossed a quote, so a cd in this segment is not trustworthy
+# (security C1). This is the fail-safe that keeps the desync attack DENY (see _cp8b_eff_update).
+_cp8b_has_quote() { case "$1" in
+  *\'*|*\"*|*\\*) return 0 ;;
+  esac; return 1; }
+
+# _cp8b_cd_arg "<segment>": the second token of a `cd` segment.
+_cp8b_cd_arg() { printf '%s' "$1" | sed -E 's/^[[:space:]]*//' | awk '{print $2}'; }
+
+# Part A — cd-state accumulator, fail-safe against desync. $_CP8B_EFF is '' (repo-relative root) or a
+# pure relative DESCENT prefix. It updates ONLY on a pure relative descent in a QUOTE-FREE cd segment.
+# Every climb-out / relaxation direction (a quote byte, absolute arg, `..`, arg-less cd, `cd -`,
+# `cd ~`, `$VAR`/command-substitution) is a NO-OP that LEAVES the prefix unchanged. Rationale (C1): a
+# forged *descent* via quote-desync could relax (compose a deeper, ordinary path), so a quoted cd
+# segment is not trusted; a forged *climb-out* (absolute/..) is ignored, so the prior real prefix
+# survives and the real target still composes → DENY. A no-op only ever RETAINS denials (composition
+# is unioned with the literal token), so it is never worse than today — fail-closed by construction.
+# The desync attack `cd hooks && echo "z || cd /tmp" && tee pre-push`: the bogus ` cd /tmp"` segment is
+# BOTH quoted and absolute → no-op → $_CP8B_EFF stays `hooks` → `tee pre-push` composes hooks/pre-push
+# → DENY. (Leg K-D binds this; K-A binds the accumulator itself.)
+# GUARD-CWD-CONFIDENCE-UNKNOWN, Face C — THE SEED. `_cp8b_seed_from_cwd "<cwd>"` sets the two seed
+# globals the target arm starts its walk from. The seed lives HERE, in the core, and not in guard.sh,
+# for three reasons the vet made conditions (H3): (1) `guard.sh:3-5` forbids deny logic in the
+# adapter; (2) the delta leg replays CORES ONLY (`aa_delta_adjudicate`), so a seed in the adapter
+# could never be ratcheted; (3) the two JSON-less entrypoints COULD pass their own cwd through the
+# same door, with no further change here.
+# ⚠️ CEILING, CORRECTED (reviewer I3) — AN EARLIER DRAFT OF THIS COMMENT SAID THEY GET IT "FOR FREE",
+# AND THAT WAS FALSE. Measured: `scripts/kit-guard:215` calls guard_check_command with ONE argument,
+# and `hooks/pre-push` never calls it at all (it calls guard_check_push). So TODAY the CLI floor is
+# judged AT THE ROOT — `rm verify.sh` run from `conformance/` via kit-guard does NOT get the cwd
+# treatment. Behaviour is deliberately unchanged in this slice; the door is open and unused.
+#
+# ABSENT OR EMPTY ⇒ TODAY'S BEHAVIOUR, byte for byte: prefix '' (the repo root), confidence intact.
+# That is what keeps every pre-existing cell, every older harness with no `cwd` field, and every
+# internal caller that passes one argument exactly as they are.
+_CP8B_SEED_EFF=''
+_CP8B_SEED_UNKNOWN=0
+# Face A's confidence flag. Initialised at file scope as well as per-walk so that no caller under
+# `set -u` can trip over it, and so a core sourced bare (the delta leg does exactly that) is sane.
+_CP8B_EFF_UNKNOWN=0
+# The effective-directory prefix itself, initialised for the same reason. ROOT CAUSE (GUARD-QUOTED-EXEC-
+# INTERMITTENT): only `_cp8b_target_arm_denied` assigns it (from the seed) before walking, but the OLD arm
+# reaches `_cp8b_compose` first, via `_cp8b_tad_redir_cp` -> `_cp8b_composed_is_cp`, and under `set -u` an
+# unset read aborted that `$(…)` rc 2, which `|| return 1` silently read as "not control-plane". '' is the
+# prefix's own "repo root, no descent" value and makes compose return 1 exactly as the swallowed abort did.
+_CP8B_EFF=''
+# SWAS-77 (design 2026-10-11-guard-dev-clone-exec-affordance §2 D1) — the dev clone the walk believes it is standing in.
+# `_CP8B_CLONE` is the PHYSICAL path of an independent clone `C` (see `_cp8b_dev_clone_phys`), or '' for "not in a
+# clone". It is set in exactly TWO places: the seed below (D1a, the session's cwd IS a clone) and the first-move rule in
+# `_cp8b_first_move` (D1b, the line's first segment is `cd <clone> &&`). It is reset at the start of every walk, cleared by
+# any later directory change, and the launder arm never reads it. `_CP8B_SEED_CLONE` is the seed's copy that each walk
+# resets from; `_CP8B_SEED_UNKNOWN` is STILL 1 in a clone (the STRIKABLE HALF stays unstruck), so every write arm reads the
+# cwd as unknown exactly as before.
+_CP8B_CLONE=''
+_CP8B_SEED_CLONE=''
+_cp8b_seed_from_cwd() {
+  _CP8B_SEED_EFF=''; _CP8B_SEED_UNKNOWN=0; _CP8B_SEED_CLONE=''
+  [ -n "${1:-}" ] || return 0
+  # A DELETED / UNREACHABLE cwd is UNKNOWN, not root: the agent is standing somewhere the guard
+  # cannot name, which is the exact condition Face B prices. `pwd -P` matches PROTECTED_ROOT's own
+  # physical resolution (guard.sh:15), so a symlinked cwd compares correctly instead of falling out.
+  _scr=$( CDPATH='' cd -- "$1" 2>/dev/null && pwd -P ) || _scr=''
+  if [ -z "$_scr" ]; then _CP8B_SEED_UNKNOWN=1; return 0; fi
+  case "${PROTECTED_ROOT:-}" in
+    '') _CP8B_SEED_UNKNOWN=1; return 0 ;;
+    esac
+  if [ "$_scr" = "${PROTECTED_ROOT:-}" ]; then return 0; fi
+  case "$_scr" in
+    "${PROTECTED_ROOT:-}"/*) _CP8B_SEED_EFF=$(_cp8b_norm "${_scr#"${PROTECTED_ROOT:-}"/}"); return 0 ;;
+  esac
+  # ⚠️ STRIKABLE HALF C-outside (design §3-C, owner's call at ratification). A cwd OUTSIDE the
+  # protected root is UNKNOWN — the fail-closed reading. Striking is THIS ONE LINE: delete it (leaving
+  # `return 0`) and an outside cwd falls back to '' (root), i.e. today's behaviour for dev-clones, at
+  # the price of the D1/D2 asymmetry staying open. The `K-CWD-outside ` cells are its own.
+  # (SWAS-77 update: the Bash route now has a NARROW dev-clone carve-out, `_cp8b_tad_is_clone_exec`, for a closed set of kit
+  # scripts. A cwd that is a clone is still UNKNOWN to every write arm; striking this line would still re-kind K-CWD-outside.)
+  _CP8B_SEED_UNKNOWN=1
+  # SWAS-77 D1a: a cwd that is ITSELF a dev clone is recorded for the clone-exec carve-out. The unknown flag above is KEPT.
+  # Fail closed: any resolution error leaves '' (today's behaviour). Run in a command substitution so no helper state leaks.
+  # (The `[ -d .git ]` precheck is fork-free: a cwd with no `.git` directory is never a clone, so it pays no subshell.)
+  if [ -d "$_scr/.git" ]; then _scc=$(_cp8b_dev_clone_phys "$_scr") && _CP8B_SEED_CLONE=$_scc; fi
+  return 0
+}
+
+# _cp8b_glob_byte_in "<operand>": 0 iff the operand carries a glob/brace byte, i.e. the shell will
+# expand it against a filesystem the guard cannot see. Vet H2: `conf*/verify.sh` intersects no
+# control-plane family, so composing the literal `conf*` was a silent miss, not a conservative one.
+_cp8b_glob_byte_in() { case "$1" in
+  *'*'*|*'?'*|*'['*|*'{'*) return 0 ;;
+  esac; return 1; }
+
+_cp8b_eff_update() {  # $1 = the cd segment ; reads/writes $_CP8B_EFF
+  # GUARD-CWD-CONFIDENCE-UNKNOWN Face A — every branch that returns SILENTLY below now RECORDS that
+  # it could not follow. Nothing else changes: the prefix is still left exactly as it was, so every
+  # composition this function ever produced is byte-identical. The flag is a second, additive fact —
+  # "and by the way, I am no longer sure where we are" — which Face B, and only Face B, charges for.
+  if _cp8b_has_quote "$1"; then _CP8B_EFF_UNKNOWN=1; return; fi
+  _ea=$(_cp8b_cd_arg "$1")
+  case "$_ea" in
+    ''|-|'~'*|/*|*..*|*'$'*|*'`'*) _CP8B_EFF_UNKNOWN=1; return ;;
+  esac
+  # A `-`-PREFIXED OPERAND IS A DECLINE, NOT A PARSE. `_cp8b_cd_arg` is awk's `$2`, so today
+  # `cd -P conformance` yields the operand `-P` and COMPOSES a directory literally named `-P`: the
+  # tracker does not fail to follow, it follows somewhere that cannot exist, and the real descent
+  # into `conformance` is lost while confidence is retained. Declining every `-`-led operand (`-`,
+  # `--`, `-P`, `-L`, `-e`, `-@`, anything future) replaces a silent mis-track with a refusal, which
+  # is `D-240813-3`'s fail-by-disqualification. This is deliberately NOT a flag table: a table is the
+  # `D-240816-1` enumeration trap, and the operand-shape test cannot rot. (M-CWD2 pins it.)
+  case "$_ea" in
+    -*) _CP8B_EFF_UNKNOWN=1; return ;;
+    esac
+  # GLOB / BRACE BYTES (vet H2). `cd conf*` is not composable — the shell expands it against the real
+  # filesystem and the guard cannot know the result — yet it is not declined by any clause above, so
+  # today it composes the LITERAL `conf*` and `conf*/verify.sh` intersects no control-plane family
+  # (directory families are outside _cp8b_glob_hits_cp). Same treatment: decline, do not resolve.
+  # (M-CWD2b pins it.)
+  # (Kept as a named predicate rather than inline, so the M-CWD2b mutant has an anchor that does not
+  # consist entirely of glob metacharacters — a sed expression over `*'['*` is its own hazard.)
+  if _cp8b_glob_byte_in "$_ea"; then _CP8B_EFF_UNKNOWN=1; return; fi
+  if [ -z "$_CP8B_EFF" ]; then _CP8B_EFF=$(_cp8b_norm "$_ea")
+  else _CP8B_EFF=$(_cp8b_norm "$_CP8B_EFF/$_ea"); fi
+}
+
+# =============================================================================================
+# SWAS-77 GUARD-DEV-CLONE-EXEC-AFFORDANCE (design docs/architecture/2026-10-11-guard-dev-clone-exec-affordance-design.md rev 3).
+# An agent can run the kit's own checks in its DEV CLONE (`cd <clone> && sh scripts/x.sh --selftest`), and the read-only
+# verbs from the root. The Edit/Write route has had the dev-clone relaxation since GUARD-PATH-ALIAS-BYPASS; the Bash route had
+# none, so every way of running a clone's script was refused with `trigger=pathhit`. Everything below is an ALLOW-side
+# recogniser consulted at the existing carve-out site (the walk, "SWAS-77 D2"); a bug here fails CLOSED to today's deny.
+# HONEST CEILING (design §4): running a clone's script runs agent-authored code, and `sh /tmp/x.sh` already ran. These are
+# speed bumps for honest mistakes; the boundary is the PR-time ratification gate, not this text.
+# =============================================================================================
+
+# _cp8b_pop_tok "<text>": split the first whitespace-delimited token off <text>. Sets `_pt_tok` and `_pt_rest` (the remainder,
+# leading blanks dropped). Pure parameter expansion; no subshell, no globbing.
+_cp8b_pop_tok() {
+  _pt_s=${1#"${1%%[![:space:]]*}"}
+  case "$_pt_s" in
+    *[[:space:]]*) _pt_tok=${_pt_s%%[[:space:]]*}; _pt_rest=${_pt_s#"$_pt_tok"} ;;
+    *)             _pt_tok=$_pt_s; _pt_rest='' ;;
+  esac
+  _pt_rest=${_pt_rest#"${_pt_rest%%[![:space:]]*}"}
+}
+
+# _cp8b_dev_clone_phys "<abs dir>": print the PHYSICAL path of <dir> and return 0 iff it is a DEV CLONE (design §2 D1): (1) the
+# Edit/Write predicate `guard_dev_clone_relaxable` holds (under temp, outside the root, the root itself not under temp, no
+# surviving `..`) UNCHANGED; (2) it is an existing directory; (3) `<dir>/.git` is a DIRECTORY, i.e. an independent clone and its
+# top level. A git worktree (`.git` is a gitfile into `<root>/.git/worktrees/…`) does NOT qualify: git run by clone code would
+# write the root's common repository (refs/notes, refs/claims, config, hooks). Like the Edit/Write relaxation it does not check
+# that <dir> is a clone of THIS kit (§4 states why that is acceptable). Any error returns 1 (today's behaviour).
+_cp8b_dev_clone_phys() {
+  _dcp=$1
+  case "$_dcp" in
+    /*) : ;;
+    *) return 1 ;;
+  esac
+  [ -n "${PROTECTED_ROOT:-}" ] || return 1
+  [ -d "$_dcp" ] || return 1
+  guard_dev_clone_relaxable "$_dcp" "$PROTECTED_ROOT" || return 1
+  [ -d "$_dcp/.git" ] && [ ! -L "$_dcp/.git" ] || return 1     # DC-GITDIR
+  # SWAS-278a (design §3.3, Sec-M4): a `.git` DIRECTORY that holds a `commondir` is a linked worktree to git, whatever it points at, so it is
+  # no independent clone; and a config that RELOCATES the repository (core.worktree, core.bare=true, include.*, includeIf.*) is not one either.
+  [ ! -e "$_dcp/.git/commondir" ] && [ ! -L "$_dcp/.git/commondir" ] || return 1     # DC-COMMONDIR
+  _cp8b_g_cfg_reloc_free "$_dcp/.git/config" || return 1     # DC-RELOC
+  _dcq=$(CDPATH='' cd -P -- "$_dcp" 2>/dev/null && pwd -P) || return 1
+  [ -n "$_dcq" ] || return 1
+  printf '%s' "$_dcq"
+}
+
+# _cp8b_first_move "<segment>": design §2 D1b. <segment> is the walk's FIRST non-blank segment (true bytes). Returns 0 iff the
+# whole command STARTS with the literal words `cd <abs> &&` and <segment> is that very `cd`, in which case it records the move:
+#   · <abs> resolves physically to the protected root  -> the walk is at the CONFIDENT root (the one unknown->confident move);
+#   · <abs> is a dev clone                              -> `_CP8B_CLONE` is set and the cwd stays UNKNOWN to every write arm;
+# Anything else returns 1 and the caller treats the `cd` exactly as before (not followed, unknown). The first move is the ONLY
+# place confidence is restored, because the segmenter cannot know whether a `cd` in any later position, or after `;`, `||`, `|`
+# or `&`, actually ran (guard-core's "an unfollowable cd only ever retains denials" invariant, :4334-4341, holds everywhere
+# else). "First" is the first segment of the WHOLE command string: a later line, a comment line, a heredoc, `(cd`, `{ cd`,
+# `X=1 cd`, `builtin cd` and `command cd` do not count. The operand is quote-free, `$`-free, glob-free, has no
+# `..`, and names an existing directory. Fail closed on every doubt.
+_cp8b_first_move() {   # $1 = the segment, $2 = its lead (the walk already computed it)
+  _fmr=${_tad_raw:-}
+  _fmr=${_fmr#"${_fmr%%[![:space:]]*}"}
+  case "$_fmr" in
+    cd[[:space:]]*) _fmr=${_fmr#cd} ;;   # FM-POSITION
+    *) return 1 ;;
+  esac
+  _cp8b_pop_tok "$_fmr"; _fmo=$_pt_tok; _fmr=$_pt_rest
+  case "$_fmr" in
+    '&&'*) : ;;   # FM-CONNECTOR
+    *) return 1 ;;
+  esac
+  case "$_fmo" in
+    /*) : ;;
+    *) return 1 ;;
+  esac
+  case "$_fmo" in
+    *..*|*[!A-Za-z0-9._/@:+,-]*) return 1 ;;
+  esac
+  _cp8b_has_quote "$1" && return 1
+  _fml=$2                                                                   # FM-LEAD
+  [ "$_fml" = cd ] || return 1
+  [ "$(_cp8b_cd_arg "$1")" = "$_fmo" ] || return 1
+  [ -d "$_fmo" ] || return 1
+  [ -n "${PROTECTED_ROOT:-}" ] || return 1
+  _fmp=$(CDPATH='' cd -P -- "$_fmo" 2>/dev/null && pwd -P) || return 1
+  [ -n "$_fmp" ] || return 1
+  if [ "$_fmp" = "$PROTECTED_ROOT" ]; then
+    _CP8B_EFF=''; _CP8B_EFF_UNKNOWN=0; _CP8B_CLONE=''
+    return 0
+  fi
+  _fmc=$(_cp8b_dev_clone_phys "$_fmo") || return 1
+  _CP8B_CLONE=$_fmc; _CP8B_EFF_UNKNOWN=1
+  return 0
+}
+
+# _cp8b_abs_literal_phys "<path>": print the PHYSICAL resolution of a LITERAL ABSOLUTE path (no `..`, only the plain-literal
+# byte set `_redir_targets` already uses). rc 1 on anything else or on a resolution error. The CALLER decides what the
+# physical path must (not) be under; the two callers each keep their own containment test so a mutant can bind each alone.
+_cp8b_abs_literal_phys() {
+  case "$1" in
+    /*) : ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *..*) return 1 ;;   # G-REDIR-DOTDOT
+    *[!A-Za-z0-9._/@:+=,-]*) return 1 ;;
+  esac
+  _resolve_physical "$1"
+}
+
+# _cp8b_clone_redirs_ok "<segment>": design §2 D2.4. 0 iff every file-redirect TARGET of <segment> is a literal absolute path
+# whose PHYSICAL resolution is OUTSIDE the protected root. fd-dups (`N>&M`, `>&-`) are not targets and `_redir_targets` already
+# excludes them; `>&word` and `&>word` ARE file writes and arrive as targets. A relative target (cwd unknown) or a non-literal
+# one (rc 3) returns 1 and the segment keeps today's verdict.
+_cp8b_clone_redirs_ok() {
+  _ccrc=0; _ccrt=$(_redir_targets "$1") || _ccrc=$?
+  [ "$_ccrc" = 0 ] || return 1
+  _ccrr=$(_resolve_physical "${PROTECTED_ROOT:-}") || return 1
+  while [ -n "$_ccrt" ]; do
+    case "$_ccrt" in
+      *"$_cp8b_nl"*) _ccre=${_ccrt%%"$_cp8b_nl"*}; _ccrt=${_ccrt#*"$_cp8b_nl"} ;;
+      *)             _ccre=$_ccrt; _ccrt='' ;;
+    esac
+    [ -n "$_ccre" ] || continue
+    _ccrq=$(_cp8b_abs_literal_phys "$_ccre") || return 1
+    case "$_ccrq/" in
+      "$_ccrr"/*) return 1 ;;   # CLONE-OUTSIDE
+    esac
+  done
+  return 0
+}
+
+# _cp8b_clone_strip_redirs "<segment>": <segment> with its STRICT fd-dups (`N>&M`, `>&M`, `>&-`) and every `>` / `>>` / `&>`
+# redirect-plus-target removed, so the argument walk sees only words. rc 1 if a `>` survives. The targets themselves were judged
+# by `_cp8b_clone_redirs_ok` first.
+_cp8b_clone_strip_redirs() {
+  # The fd number must stand as its OWN word (`(^|blank)`): `--help2>/tmp/o` is the word `--help2` plus `>`, not an fd-2 redirect,
+  # so it is not stripped and the surviving `>` declines (sec L2). The fd-dup pass runs twice so `2>&1 >&2` strips both.
+  _ccs=$(printf '%s' "$1" | sed -E -e 's/(^|[[:space:]])[0-9]*>&([0-9]+|-)([[:space:]]|$)/\1 /g' -e 's/(^|[[:space:]])[0-9]*>&([0-9]+|-)([[:space:]]|$)/\1 /g' -e 's/(^|[[:space:]])(&|[0-9]*)>>?[[:space:]]*[^[:space:]]+/\1 /g')
+  case "$_ccs" in
+    *'>'*) return 1 ;;
+  esac
+  printf '%s' "$_ccs"
+}
+
+# _cp8b_clone_script_rel "<script token>": sets `_cx_rel` (the script's path RELATIVE to the clone) and returns 0 iff the token
+# is a kit script of the clone (design §2 D2.1): RELATIVE and matching the kit pattern, or ABSOLUTE and resolving physically to
+# `$_CP8B_CLONE/<kit pattern>`. The absolute spelling is admitted only once the agent is already in that clone (the caller
+# requires `_CP8B_CLONE`), so clone code always runs with its own tree as cwd and never grades or writes the root's tree.
+# Either way the PHYSICAL path must stay under the clone, so a symlinked `scripts/` pointing at the root declines.
+# Since SWAS-186 the CLONE-REL containment test is a second wall (the name test below also declines an outside path), pinned jointly by SWAS77-M20.
+_cp8b_clone_script_rel() {
+  _cx_s=$(_cp8b_dequote "$1"); _cx_s=${_cx_s#./}
+  case "$_cx_s" in
+    *..*) return 1 ;;
+  esac
+  case "$_cx_s" in
+    /*)
+      _cx_p=$(_resolve_physical "$_cx_s") || return 1
+      case "$_cx_p" in
+        "$_CP8B_CLONE"/*) : ;;   # CLONE-UNDER-IN
+        *) return 1 ;;   # CLONE-UNDER
+      esac
+      _cx_rel=${_cx_p#"$_CP8B_CLONE"/} ;;
+    conformance/*.sh|scripts/*.sh|scripts/kit-guard|scripts/sparkwright)
+      _cx_p=$(_resolve_physical "$_CP8B_CLONE/$_cx_s") || return 1
+      case "$_cx_p" in
+        "$_CP8B_CLONE"/*) : ;;
+        *) return 1 ;;   # CLONE-REL
+      esac
+      _cx_rel=${_cx_p#"$_CP8B_CLONE"/} ;;   # SWAS-186: the PHYSICAL name, so //, /./ and a symlink alias reduce to the real script; CLONE-REL-NAME
+    *) return 1 ;;
+  esac
+  case "$_cx_rel" in
+    conformance/*.sh|scripts/*.sh|scripts/kit-guard|scripts/sparkwright) return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_clone_verb_ok "<script rel>" "<first arg>": design §2 D2.2, the CLOSED verb gate on both families. The first
+# argument must be: none (a bare gate, `conformance/*` only, and NEVER a bare `conformance/tracker-*.sh`); `--selftest`;
+# `--help` / `-h`; or one of the two named exceptions `scripts/kit-guard path|cmd|mcp` and `scripts/board-claim.sh check <KEY>`.
+# A scoped-battery flag and `scripts/sparkwright prepush` are NOT in the gate, nor is its alias, a bare
+# `conformance/prepush-lane.sh` (the script the front door execs; SWAS-186), and a bare tracker gate is refused
+# (clone code would reach the live tracker credential through the clone's own adapter; the tracker gates keep --selftest and
+# --help, which run hermetically). Everything else (every front-door writer, `--fix`) stays refused in a clone; those run the
+# reviewed code from the root.
+_cp8b_clone_verb_ok() {
+  case "$2" in
+    --selftest|--help|-h) return 0 ;;
+    '')
+        # _cx_p is the physical path _cp8b_clone_script_rel set for this same command (one caller). `test -ef` is POSIX
+        # (dash/bash/zsh/busybox); if it ever errored the name arms below still refuse the canonical spellings. The
+        # tracker loop needs filename globbing on; with it off, CLONE-EF-TRACKER falls back to the name arm (pinned by N11).
+        [ "${_cx_p-}" -ef "$_CP8B_CLONE/conformance/prepush-lane.sh" ] && return 1   # CLONE-EF-LANE: file identity, so a letter-case spelling or a hard link is the lane too (SWAS-186)
+        for _cx_t in "$_CP8B_CLONE"/conformance/tracker-*.sh; do [ "${_cx_p-}" -ef "$_cx_t" ] && return 1; done   # CLONE-EF-TRACKER
+        case "$1" in
+          conformance/tracker-*.sh) return 1 ;;   # CLONE-TRACKER
+          conformance/prepush-lane.sh) return 1 ;;   # CLONE-PREPUSH-ALIAS: the body of `sparkwright prepush` (SWAS-186)
+          conformance/*.sh) return 0 ;;
+        esac
+        return 1 ;;
+  esac
+  case "$1:$2" in
+    scripts/kit-guard:path|scripts/kit-guard:cmd|scripts/kit-guard:mcp) return 0 ;;
+    scripts/board-claim.sh:check) return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_clone_arg_ok "<path-shaped token>": design §2 D2.3. 0 iff the token, resolved PHYSICALLY (a relative one as
+# `$_CP8B_CLONE/<token>`, never against the hook's own cwd), stays under the clone and is itself dev-clone-relaxable. Any `..`
+# declines; a symlink inside the clone that points at the root therefore declines. The final `_cp8b_via_link_cp` is
+# fed the already-physical path (so it is the belt, not the wall): the containment test above is the control.
+_cp8b_clone_arg_ok() {
+  case "$1" in
+    *..*) return 1 ;;
+  esac
+  case "$1" in
+    /*) _cxa_a=$1 ;;
+    *) _cxa_a=$_CP8B_CLONE/$1 ;;
+  esac
+  _cxa_p=$(_resolve_physical "$_cxa_a") || return 1
+  case "$_cxa_p/" in
+    "$_CP8B_CLONE"/*) : ;;
+    *) return 1 ;;
+  esac
+  guard_dev_clone_relaxable "$_cxa_p" "${PROTECTED_ROOT:-}" || return 1
+  _cp8b_via_link_cp "$_cxa_p" && return 1
+  return 0
+}
+
+# _cp8b_clone_val_ok "<value>": a value that is PATH-SHAPED (absolute, contains `/`, or names an entry that exists, even as a
+# dangling link, at `$_CP8B_CLONE/<value>`) must pass `_cp8b_clone_arg_ok`; anything else is data (a KEY, a number).
+_cp8b_clone_val_ok() {
+  [ -n "$1" ] || return 0
+  case "$1" in
+    /*|*/*) : ;;
+    *) [ -e "$_CP8B_CLONE/$1" ] || [ -L "$_CP8B_CLONE/$1" ] || return 0 ;;
+  esac
+  _cp8b_clone_arg_ok "$1"
+}
+
+# _cp8b_clone_flag_ok "<flag token>": a flag-glued value (`--out=<path>`) is judged as a path by the rules above; any OTHER
+# flag-shaped token that carries a `/` (`-o<path>`) declines.
+_cp8b_clone_flag_ok() {
+  case "$1" in
+    *=*) case "${1%%=*}" in
+           */*) return 1 ;;
+         esac
+         _cp8b_clone_val_ok "${1#*=}"; return ;;
+    */*) return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_clone_tok_ok "<dequoted token>": one argument of the walk.
+_cp8b_clone_tok_ok() {
+  # The walk resolves a token LITERALLY under `set -f`, but the shell will expand it. Any
+  # byte outside the plain literal set (`* ? [ ] { } ~`, `$`, quotes, ...) declines, whole token and `=` value alike.
+  case "$1" in
+    *[!A-Za-z0-9._/@:+=,-]*) return 1 ;;   # CLONE-BYTES
+  esac
+  case "$1" in
+    '') return 0 ;;
+    -*) _cp8b_clone_flag_ok "$1"; return ;;
+  esac
+  _cp8b_clone_val_ok "$1" || return 1
+  case "$1" in
+    *=*) _cp8b_clone_val_ok "${1#*=}" || return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_clone_cmd_ok "<text after cmd>": `scripts/kit-guard cmd '<cmd>'` has a FIXED ARITY of exactly one argument, a quoted
+# command string that is DATA (it is judged by the clone's guard, not run), so it is exempt from the path walk.
+# Any further argument, or a `$`, backtick, `<`, `>` or a nested quote inside the string, declines.
+_cp8b_clone_cmd_ok() {
+  _cxc_sq="'"; _cxc_dq='"'
+  case "$1" in
+    "$_cxc_sq"*"$_cxc_sq")
+      _cxc_i=${1#"$_cxc_sq"}; _cxc_i=${_cxc_i%"$_cxc_sq"}
+      case "$_cxc_i" in
+        *"$_cxc_sq"*|*'$'*|*'`'*|*'>'*|*'<'*) return 1 ;;
+      esac ;;
+    "$_cxc_dq"*"$_cxc_dq")
+      _cxc_i=${1#"$_cxc_dq"}; _cxc_i=${_cxc_i%"$_cxc_dq"}
+      case "$_cxc_i" in
+        *"$_cxc_dq"*|*\\*|*'$'*|*'`'*|*'>'*|*'<'*) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_clone_args_ok "<rel>" "<verb>" "<text after the verb>": the argument walk, on the DEQUOTED view under `set -f`.
+# `board-claim.sh check` takes exactly one KEY; `kit-guard cmd` is arity 1.
+_cp8b_clone_args_ok() {
+  _cxw_rest=$3
+  case "$1:$2" in
+    scripts/kit-guard:cmd) _cp8b_clone_cmd_ok "$_cxw_rest"; return ;;
+    scripts/board-claim.sh:check)
+      _cp8b_pop_tok "$_cxw_rest"; _cxw_key=$_pt_tok
+      [ -n "$_cxw_key" ] && [ -z "$_pt_rest" ] || return 1
+      case "$_cxw_key" in
+        [ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) case "$_cxw_key" in
+                     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-]*) return 1 ;;
+                   esac ;;
+        *) return 1 ;;
+      esac
+      return 0 ;;
+  esac
+  _cxw_g=0; case "$-" in
+    *f*) _cxw_g=1 ;;
+  esac
+  set -f
+  _cxw_rc=0
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_cxw_rest
+  while [ $# -gt 0 ]; do
+    _cxw_t=$(_cp8b_dequote "$1"); shift
+    _cp8b_clone_tok_ok "$_cxw_t" || { _cxw_rc=1; break; }
+  done
+  [ "$_cxw_g" = 1 ] || set +f
+  return $_cxw_rc
+}
+
+# _cp8b_tad_is_clone_exec "<segment>": design §2 D2. 0 iff <segment> runs a KIT SCRIPT OF THE CLONE the walk is standing in
+# (`_CP8B_CLONE`): script form (relative, or absolute into the same clone), the closed verb gate, no argument leaving the clone,
+# and a strict redirect rule. Consulted at the walk's carve-out site whatever `_kroot` is, and inside the same line-poison
+# accounting as kit-exec. Any doubt returns 1 and the segment is judged exactly as today.
+_cp8b_tad_is_clone_exec() {
+  [ -n "${_CP8B_CLONE:-}" ] || return 1                                      # CLONE-GUARD
+  [ -n "${PROTECTED_ROOT:-}" ] || return 1
+  # The shell EXPANDS `{lnk,x}/y`, `l*`, `~-` before the script sees them, and the argument walk below resolves
+  # tokens literally. Whatever path the token takes, a clone-exec carve-out is declined when the WHOLE raw command (clone mode
+  # from the first move or from the seed alike) carries a brace, glob or tilde byte. `$?` (the exit status, as in `; echo rc=$?`)
+  # is not a glob and is blanked first. Over-denies a grep pattern on the same line: split such a pipeline into its own call.
+  _cx_raw=${_tad_raw:-}
+  while :; do
+    case "$_cx_raw" in
+      *'$?'*) _cx_raw=${_cx_raw%%'$?'*}${_cx_raw#*'$?'} ;;
+      *) break ;;
+    esac
+  done
+  case "$_cx_raw" in
+    *'{'*|*'}'*|*'*'*|*'?'*|*'['*|*']'*|*'~'*) return 1 ;;   # CLONE-RAWBYTES
+  esac
+  case "$1" in
+    *'<'*|*'$'*|*'`'*) return 1 ;;
+  esac
+  case "$1" in
+    *'>'*) _cp8b_tad_redir_cp "$1" && return 1
+           _cp8b_clone_redirs_ok "$1" || return 1 ;;
+  esac
+  _cx_seg=$(_cp8b_clone_strip_redirs "$1") || return 1
+  _cx_seg=$(_cp8b_strip_wrappers "$_cx_seg")
+  _cp8b_pop_tok "$_cx_seg"; _cx_tok=$_pt_tok; _cx_rest=$_pt_rest
+  case "$(_cp8b_dequote "$_cx_tok")" in
+    sh|bash|dash|zsh|ksh) _cp8b_pop_tok "$_cx_rest"; _cx_tok=$_pt_tok; _cx_rest=$_pt_rest ;;
+  esac
+  _cp8b_clone_script_rel "$_cx_tok" || return 1
+  _cx_rl=$_cx_rel
+  _cp8b_pop_tok "$_cx_rest"; _cx_verb=$(_cp8b_dequote "$_pt_tok"); _cx_rest=$_pt_rest
+  _cp8b_clone_verb_ok "$_cx_rl" "$_cx_verb" || return 1
+  _cp8b_clone_args_ok "$_cx_rl" "$_cx_verb" "$_cx_rest"
+}
+
+# =============================================================================================
+# SWAS-278a GUARD-DEV-CLONE-PREPUSH-OVERDENY (design docs/architecture/2026-10-17-guard-dev-clone-prepush-design.md rev 2.2).
+# FIVE closed grammars, consulted ONLY in clone mode at the CLONE-SITE (the walk), after `_cp8b_tad_is_clone_exec` and inside the same
+# line-poison accounting: G1 `sparkwright prepush [--warranted]`, G2 `ci-gates.sh --own-tree [dir]`, G3 `promotion-readiness.sh --class
+# --changed <listing>`, G4 `<root>/scripts/board.sh <verb> ...` (the ROOT's code against the clone's data), G5 `pipx run semgrep==X.Y.Z ...`.
+# Each fixes its argv exactly (the generic `_cp8b_clone_args_ok` walk is not reused), peels no wrapper, refuses any earlier environment
+# change on the line, and takes redirect targets only under a temp root and outside the protected root. G4 and G5 reach git in the clone,
+# so they also require the clone-integrity checks of §3.7 (the git-config ALLOWLIST, no live hooks) and G4 the origin, conf and root==main
+# checks of §3.6. A sixth grammar, G6 `sparkwright new <fresh temp dest> ...` (SWAS-875), is chosen inside the `scripts/sparkwright` arm of
+# `_cp8b_g_dispatch` by the first argument; G1 is untouched. A bug here fails CLOSED to the verdict the segment had before. HONEST CEILING (design §11): G1, G2, G3, G5 and G6 run
+# agent-authored code; every check below is decided once at hook time and acted on later; these are speed bumps for honest mistakes,
+# against clone code the honest control is the credential's own scope, not the host binding (docs/governance/DECISIONS.md D-241017-1).
+# =============================================================================================
+
+# _cp8b_g_git <git args>: a git run whose configuration is the repository's own and nothing from the hook's environment (design C4):
+# every inherited name is dropped (`env -i`), the system and global configs are off, HOME is nowhere, and PATH alone is re-supplied.
+_cp8b_g_git() {
+  env -i PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin HOME=/nonexistent LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"
+}
+
+# _cp8b_g_cfg_reloc_free "<config file>": 0 iff the file (read with `config --file`, never `--includes`) does not RELOCATE the repository:
+# no `core.worktree`, no `core.bare` true, no `include.*` and no `includeIf.*` (design §3.3, C3). A clone with no config file is clean;
+# a config that cannot be read is not. This is part of the clone PREDICATE, so it binds every grammar and SWAS-77's clone-exec alike.
+_cp8b_g_cfg_reloc_free() (
+  # a per-worktree config (extensions.worktreeConfig) can carry core.worktree: a `config.worktree` beside the config is a relocation risk (security M1)
+  [ ! -e "${1%/config}/config.worktree" ] && [ ! -L "${1%/config}/config.worktree" ] || return 1   # DC-WTCONFIG-FILE
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  _gk=$(_cp8b_g_git config --file "$1" --name-only --list 2>/dev/null) || return 1
+  _gb=0
+  # a subshell body: the newline IFS and -f end with it, and the walk is linear in the list (security M1)
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_cp8b_nl
+  set -f
+  for _gl in $_gk; do
+    case "$_gl" in
+      extensions.worktreeconfig) return 1 ;;   # DC-WTCONFIG-KEY
+      core.worktree|include.*|includeif.*) return 1 ;;   # DC-RELOC-KEY
+      core.bare) _gb=1 ;;
+    esac
+  done
+  if [ "$_gb" = 1 ]; then
+    _gv=$(_cp8b_g_git config --file "$1" --bool --get core.bare 2>/dev/null) || return 1
+    [ "$_gv" = false ] || return 1                       # DC-RELOC-BARE
+  fi
+  return 0
+)
+
+# _cp8b_g_clean "<clone-controlled text>": a name that came from the clone (a git-config key, whose quoted subsection can hold a credential, a TAB,
+# an ESC, a quote or a backslash) has its subsection withheld (section.*.variable), is then reduced to [A-Za-z0-9._*-] and capped at 64 bytes
+# before it is put on a deny; `?` when nothing is left (security I1). Ceiling, measured: a NUL in a subsection makes git print a key cut at the NUL
+# with no variable, so, when the cut subsection has no dot, the mask finds no second dot and the reduction is all that stands between that text and
+# the deny (if it has a dot, the mask fires and what follows the last dot prints, reduced [R, reasoned, not run]).
+_cp8b_g_clean() {
+  _gck=$1
+  # The form of gp_cfg in scripts/preflight.sh (SWAS-662): a subsection can hold a credential, so print section.*.variable.
+  case "${_gck#*.}" in
+    *.*) _gck="${_gck%%.*}.*.${_gck##*.}" ;;   # G-WHY-MASK
+  esac
+  _gcl=$(printf '%s' "$_gck" | LC_ALL=C tr -cd 'A-Za-z0-9._*-' | cut -c1-64)   # G-WHY-CLEAN
+  printf '%s' "${_gcl:-?}"
+}
+
+# _cp8b_g_cfg_allow "<clone>": the git-config ALLOWLIST (design §3.7, C3). 0 iff EVERY key of `<clone>/.git/config` is one of the plain
+# repository keys, one `remote.origin.url` with its `remote.origin.fetch`, or `branch.*.remote|merge`; `core.bare` only with the value
+# false. Anything else (core.fsmonitor, credential.helper, core.sshCommand, core.hooksPath, filter.*, alias.*, extensions.*, include.*, ...)
+# declines: a denylist would be the enumeration trap (D-240816-1). Read without `--includes`, under the C4 environment.
+_cp8b_g_cfg_allow() {
+  _gbk=''
+  [ -f "$1/.git/config" ] && [ ! -L "$1/.git/config" ] || return 1
+  _ga=$(_cp8b_g_git config --file "$1/.git/config" --name-only --list 2>/dev/null) || return 1
+  # The walk runs in _cp8b_g_cfg_allow_keys under a newline IFS with -f; it sets _gbk, so it cannot be a subshell. Both are restored here, once,
+  # whatever the walk returns (security M1: the walk is linear in the key list; a newline-split loop was quadratic).
+  _ga_ofs=$IFS
+  _ga_gf=0; case "$-" in
+    *f*) _ga_gf=1 ;;
+    esac
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_cp8b_nl
+  set -f
+  _cp8b_g_cfg_allow_keys "$1" "$_ga"; _ga_rc=$?
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_ga_ofs
+  [ "$_ga_gf" = 1 ] || set +f
+  return "$_ga_rc"
+}
+# _cp8b_g_cfg_allow_keys "<clone>" "<newline-separated key names>": the walk of _cp8b_g_cfg_allow; called only with IFS a newline and -f on.
+_cp8b_g_cfg_allow_keys() {
+  for _gl in $2; do
+    _gbk=$_gl   # the key under test: when a case below returns 1 this is the offender (named on the deny, review I1)
+    case "$_gl" in
+      '') continue ;;   # dead since field splitting drops empty items; kept as belt-and-braces
+      core.repositoryformatversion|core.filemode|core.logallrefupdates|core.ignorecase|core.precomposeunicode) : ;;
+      user.name|user.email) : ;;   # benign identity keys: they run no code and redirect nothing # G-IDENTITY
+      core.bare) [ "$(_cp8b_g_git config --file "$1/.git/config" --bool --get core.bare 2>/dev/null)" = false ] || return 1 ;;
+      remote.origin.url|remote.origin.fetch) : ;;
+      branch.*.remote|branch.*.merge) : ;;
+      *) return 1 ;;   # G-ALLOWLIST
+    esac
+  done
+  return 0
+}
+
+# _cp8b_g_origin_ok "<clone>": design §3.7, the origin check. `remote.origin.url` has EXACTLY ONE value (a second url makes git push to
+# both), it is a non-local URL (https://, ssh:// or user@host:path, never a filesystem path or file://), it is byte-equal to the ROOT's,
+# and the clone sets no pushurl and no url.*.insteadOf / pushInsteadOf. Without it the old recipe (`git clone .`) makes the clone's origin
+# the main checkout, and board-claim pushes refs/claims into the root's .git (split-brain claims).
+_cp8b_g_origin_ok() (
+  _go_u=$(_cp8b_g_git config --file "$1/.git/config" --get-all remote.origin.url 2>/dev/null) || return 1   # G-ORIGIN-ALL
+  case "$_go_u" in
+    ''|*"$_cp8b_nl"*) return 1 ;;
+  esac
+  case "$_go_u" in
+    https://*|ssh://*) : ;;
+    file:*|/*|.*|*://*) return 1 ;;
+    *@*:*) : ;;
+    *) return 1 ;;   # G-ORIGIN-LOCAL
+  esac
+  _go_r=$(_cp8b_g_git config --file "$PROTECTED_ROOT/.git/config" --get remote.origin.url 2>/dev/null) || return 1
+  [ -n "$_go_r" ] && [ "$_go_u" = "$_go_r" ] || return 1   # G-ORIGIN-ROOT
+  _go_k=$(_cp8b_g_git config --file "$1/.git/config" --name-only --list 2>/dev/null) || return 1
+  # a subshell body: the newline IFS and -f end with it, and the walk is linear in the list (security M1)
+  # nosemgrep: bash.lang.security.ifs-tampering.ifs-tampering
+  IFS=$_cp8b_nl
+  set -f
+  for _gl in $_go_k; do
+    case "$_gl" in
+      remote.origin.pushurl|url.*.insteadof|url.*.pushinsteadof) return 1 ;;   # G-ORIGIN-PUSH
+    esac
+  done
+  return 0
+)
+
+# _cp8b_g_hooks_ok "<clone>": design §3.7, no live hooks. 0 iff `<clone>/.git/hooks` is absent or a plain directory holding no entry that
+# is executable and does not end in `.sample` (board-claim's git runs pre-push and reference-transaction). A non-directory `hooks` declines.
+_cp8b_g_hooks_ok() {
+  _gh=$1/.git/hooks
+  [ -e "$_gh" ] || [ -L "$_gh" ] || return 0
+  [ -d "$_gh" ] && [ ! -L "$_gh" ] || return 1
+  # an unreadable hooks directory cannot be scanned, so it fails CLOSED (security M2); the hooks git runs by name are tested directly
+  [ -r "$_gh" ] && [ -x "$_gh" ] || return 1   # G-HOOKS-READ
+  for _gn in pre-push reference-transaction post-checkout pre-commit fsmonitor-watchman; do
+    if [ -e "$_gh/$_gn" ] || [ -L "$_gh/$_gn" ]; then return 1; fi   # G-HOOKS-NAMED
+  done
+  _ghf=0; case "$-" in
+    *f*) _ghf=1 ;;
+  esac
+  set +f
+  for _ge in "$_gh"/* "$_gh"/.[!.]*; do
+    [ -e "$_ge" ] || [ -L "$_ge" ] || continue
+    case "$_ge" in
+      *.sample) continue ;;
+    esac
+    if [ -x "$_ge" ]; then [ "$_ghf" = 0 ] || set -f; return 1; fi   # G-HOOKS
+  done
+  [ "$_ghf" = 0 ] || set -f
+  return 0
+}
+
+# The ROOT's board code table (design §3.6, C3): every file G4 runs, sources or reads from the root. Closed; a drift leg in
+# conformance/agent-autonomy.sh (SWAS278A-X12f) reds when a table file names a computed sibling-script path that is not here.
+_CP8B_G4_TABLE='scripts/board.sh scripts/board-claim.sh scripts/checkout-lease.sh scripts/tracker-conf.sh scripts/tracker-cred.sh scripts/tracker-jira.sh scripts/tracker-read.sh scripts/runaway-guard.sh conformance/backlog-lib.sh .kit/budget.conf'
+
+# _cp8b_g_root_main_ok: design §3.6 (C1, N6). 0 iff every table file of the ROOT worktree hashes equal to `refs/remotes/origin/main:<path>`.
+# `rev-parse` and `hash-object` without `-w` write nothing (a `git diff` would refresh and rewrite the root's index). The baseline is the
+# remote-tracking ref, never the local main, which may have been moved. A main checkout left on an unreviewed branch lends no board code.
+_cp8b_g_root_main_ok() {
+  _gm_n=0
+  for _gm_p in $_CP8B_G4_TABLE; do
+    [ -f "$PROTECTED_ROOT/$_gm_p" ] && [ ! -L "$PROTECTED_ROOT/$_gm_p" ] || return 1
+    _gm_n=$((_gm_n + 1))
+  done
+  [ "$_gm_n" -gt 0 ] || return 1
+  set --
+  for _gm_p in $_CP8B_G4_TABLE; do set -- "$@" "refs/remotes/origin/main:$_gm_p"; done
+  _gm_want=$(_cp8b_g_git -C "$PROTECTED_ROOT" rev-parse "$@" 2>/dev/null) || return 1   # G4-ROOT-MAIN
+  set --
+  for _gm_p in $_CP8B_G4_TABLE; do set -- "$@" "$PROTECTED_ROOT/$_gm_p"; done
+  _gm_got=$(_cp8b_g_git -C "$PROTECTED_ROOT" hash-object --no-filters -- "$@" 2>/dev/null) || return 1   # G4-HASH
+  [ -n "$_gm_want" ] && [ "$_gm_want" = "$_gm_got" ]
+}
+# _cp8b_g_why_root: after `_cp8b_g_root_main_ok` declined, name which of its two causes it was (review I1): the root has no `origin/main` ref to
+# compare against (a stale or never-fetched clone of the forge), or a table file of the root worktree differs from it.
+_cp8b_g_why_root() {
+  if _cp8b_g_git -C "$PROTECTED_ROOT" rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1; then printf '%s' "${1:-root-not-main}"
+  else printf 'stale-origin-main'; fi
+}
+
+# _cp8b_g_conf_pin_ok "<clone>": design §3.6. The clone's `.kit/tracker.conf` must hash equal to main's, both read in the ROOT's repository
+# context, so an edited conf in the clone (another tracker site) never reaches the credential.
+_cp8b_g_conf_pin_ok() {
+  [ -f "$1/.kit/tracker.conf" ] && [ ! -L "$1/.kit/tracker.conf" ] || return 1
+  _gc_want=$(_cp8b_g_git -C "$PROTECTED_ROOT" rev-parse "refs/remotes/origin/main:.kit/tracker.conf" 2>/dev/null) || return 1
+  _gc_got=$(_cp8b_g_git -C "$PROTECTED_ROOT" hash-object --no-filters -- "$1/.kit/tracker.conf" 2>/dev/null) || return 1
+  [ -n "$_gc_want" ] && [ "$_gc_want" = "$_gc_got" ]   # G4-CONFPIN
+}
+
+# _cp8b_g_redirs_ok "<segment>": design §4 (Sec-L1, N4). 0 iff every file-redirect target is a literal absolute path whose spelling AND
+# physical resolution are under a temp root and outside the protected root, and which does not exist yet or is a regular file with one link
+# (a hardlinked scratch name would write the linked inode). So `~/.gitconfig`, the pre-push cache, the memory directory and every path
+# under $HOME decline. fd-dups are not targets (`_redir_targets` excludes them).
+_cp8b_g_redirs_ok() {
+  _gr_c=0; _gr_t=$(_redir_targets "$1") || _gr_c=$?
+  [ "$_gr_c" = 0 ] || return 1
+  _gr_root=$(_resolve_physical "$PROTECTED_ROOT") || return 1
+  while [ -n "$_gr_t" ]; do
+    case "$_gr_t" in
+      *"$_cp8b_nl"*) _gr_e=${_gr_t%%"$_cp8b_nl"*}; _gr_t=${_gr_t#*"$_cp8b_nl"} ;;
+      *)             _gr_e=$_gr_t; _gr_t='' ;;
+    esac
+    [ -n "$_gr_e" ] || continue
+    _gr_p=$(_cp8b_abs_literal_phys "$_gr_e") || return 1
+    _under_temp "$_gr_e" && _under_temp "$_gr_p" || return 1   # G-REDIR-TEMP
+    case "$_gr_e/" in
+      "$_gr_root"/*) return 1 ;;
+    esac
+    case "$_gr_p/" in
+      "$_gr_root"/*) return 1 ;;   # G-REDIR-OUT
+    esac
+    if [ -e "$_gr_p" ] || [ -L "$_gr_e" ]; then
+      [ -f "$_gr_p" ] || return 1
+      _gr_n=$(_nlink_of "$_gr_p") || return 1
+      [ "$_gr_n" = 1 ] || return 1   # G-REDIR-NLINK
+    fi
+  done
+  return 0
+}
+
+# _cp8b_g_file_ok "<path>" <nodot 0|1>: a FILE operand of G3/G4. Absolute: a scratch file (dev-clone-relaxable, so under temp and outside
+# the root both literally and physically, and not behind a link into the control plane). Relative: contained in the clone. Either way a
+# regular file with ONE link (design §3.5: a hardlink to a home-directory secret would otherwise be uploaded by --description-file).
+# `nodot` (G4 only) also declines any path component starting with a dot.
+_cp8b_g_file_ok() {
+  case "$1" in
+    ''|*..*|-*) return 1 ;;
+  esac
+  if [ "${2:-0}" = 1 ]; then
+    case "/$1" in
+      */.*) return 1 ;;   # G-NODOT
+    esac
+  fi
+  case "$1" in
+    /*) _gf_p=$(_resolve_physical "$1") || return 1
+        guard_dev_clone_relaxable "$1" "$PROTECTED_ROOT" || return 1   # G-SCRATCH
+        _cp8b_via_link_cp "$_gf_p" && return 1 ;;
+    *)  _cp8b_clone_arg_ok "$1" || return 1
+        _gf_p=$(_resolve_physical "$_CP8B_CLONE/$1") || return 1 ;;
+  esac
+  [ -f "$_gf_p" ] || return 1
+  _gf_n=$(_nlink_of "$_gf_p") || return 1
+  [ "$_gf_n" = 1 ]   # G-NLINK
+}
+
+# _cp8b_g_key_ok "<tok>": a tracker key, [A-Z][A-Z0-9]*-[0-9]+.
+_cp8b_g_key_ok() {
+  case "$1" in
+    [ABCDEFGHIJKLMNOPQRSTUVWXYZ]*-[0123456789]*) : ;;
+    *) return 1 ;;
+  esac
+  _gq_p=${1%%-*}; _gq_n=${1#*-}
+  case "$_gq_p" in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) return 1 ;;
+  esac
+  case "$_gq_n" in
+    ''|*[!0123456789]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_g_branch_ok "<tok>": git's ref rules for the cases a guard can check (N2): no `..`, no leading `-`, `/` or `.`, no trailing `.lock`
+# or `/`, no `@{`, no `:`, no empty component.
+_cp8b_g_branch_ok() {
+  case "$1" in
+    ''|-*|/*|.*|*/|*..*|*.lock|*'@{'*|*:*|*//*|*/.*) return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_g_record_ok "<tok>": the clone-relative `docs/reviews/<name>.md` of `board.sh comment --from-record`.
+_cp8b_g_record_ok() {
+  case "$1" in
+    docs/reviews/*.md) : ;;
+    *) return 1 ;;
+  esac
+  _gp_n=${1#docs/reviews/}
+  case "$_gp_n" in
+    ''|*/*|.*) return 1 ;;
+  esac
+  _cp8b_g_file_ok "$1" 1
+}
+
+# _cp8b_g_tokval <kind> "<tok>": k = key, n = digits, w = one plain word (not a flag), b = branch, f = file, r = review record.
+_cp8b_g_tokval() {
+  case "$1" in
+    k) _cp8b_g_key_ok "$2" ;;
+    n) case "$2" in
+         ''|*[!0123456789]*) return 1 ;;
+       esac ;;
+    w) case "$2" in
+         ''|-*) return 1 ;;
+       esac ;;
+    b) _cp8b_g_branch_ok "$2" ;;
+    f) _cp8b_g_file_ok "$2" 1 ;;
+    r) _cp8b_g_record_ok "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_g_walk "<positional kinds>" "<flag specs>" <args...>: EXACT argv. Positionals first, one kind letter each; then flags, each
+# `--flag:kind` (one value), `--flag:-` (boolean), a trailing `+` allowing repeats; every other flag declines. Sets `_gx_seen`
+# (the flags seen, space-delimited) for the verb's own post-conditions.
+_cp8b_g_walk() {
+  _gw_pos=$1; _gw_spec=$2; shift 2
+  _gx_seen=' '
+  while [ -n "$_gw_pos" ]; do
+    [ $# -gt 0 ] || return 1
+    _cp8b_g_tokval "${_gw_pos%"${_gw_pos#?}"}" "$1" || return 1
+    _gw_pos=${_gw_pos#?}; shift
+  done
+  while [ $# -gt 0 ]; do
+    _gw_f=$1; shift
+    _gw_e=''
+    for _gw_s in $_gw_spec; do
+      case "$_gw_s" in
+        "$_gw_f":*) _gw_e=${_gw_s#*:}; break ;;
+      esac
+    done
+    [ -n "$_gw_e" ] || return 1
+    _gw_rep=0
+    case "$_gw_e" in
+      *+) _gw_rep=1; _gw_e=${_gw_e%+} ;;
+    esac
+    case "$_gx_seen" in
+      *" $_gw_f "*) [ "$_gw_rep" = 1 ] || return 1 ;;
+    esac
+    _gx_seen="$_gx_seen$_gw_f "
+    [ "$_gw_e" = - ] && continue
+    [ $# -gt 0 ] || return 1
+    _cp8b_g_tokval "$_gw_e" "$1" || return 1
+    shift
+  done
+  return 0
+}
+
+# _cp8b_g_seen "<flag>": 0 iff the last `_cp8b_g_walk` saw <flag>.
+_cp8b_g_seen() {
+  case "$_gx_seen" in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_g4_args <verb> <args...>: the SHAPE of a board verb (design §4.4); no git, no filesystem beyond the operands. `migrate`,
+# `release --stale`, `--field` and every verb or flag not listed decline.
+_cp8b_g4_args() {
+  [ $# -gt 0 ] || return 1
+  _g4v=$1; shift
+  case "$_g4v" in
+    show)    _cp8b_g_walk k '--comments:n' "$@" ;;
+    list)    _cp8b_g_walk '' '--limit:n' "$@" ;;
+    claim)   _cp8b_g_walk k '--branch:b' "$@" ;;
+    release) _cp8b_g_walk k '' "$@" ;;
+    move)    _cp8b_g_walk kw '' "$@" ;;
+    create)  _cp8b_g_walk '' '--title-file:f --title:w --description-file:f --metric-file:f --size:w --risk:w --type:w --parent:k --label:w+' "$@" || return 1
+             if _cp8b_g_seen --title-file && _cp8b_g_seen --title; then false; else true; fi ;;
+    edit)    _cp8b_g_walk k '--title-file:f --description-file:f --metric-file:f --size:w --risk:w --label-add:w+ --label-remove:w+ --parent:k --dry-run:-' "$@" ;;
+    comment) _cp8b_g_walk k '--from-record:r --dry-run:-' "$@" || return 1
+             _cp8b_g_seen --from-record ;;
+    rank)    _cp8b_g_walk k '--top:- --before:k --after:k --dry-run:-' "$@" || return 1
+             _gx_n=0
+             for _gx_o in --top --before --after; do if _cp8b_g_seen "$_gx_o"; then _gx_n=$((_gx_n + 1)); fi; done
+             [ "$_gx_n" = 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_g4 <verb> <args...>: G4 (design §4.4). The script is the ROOT's board.sh (already checked by the dispatcher); the checks are the shape,
+# then the clone's git config allowlist and hooks, its origin, its conf pin and the root==main table.
+_cp8b_g4() {
+  _cp8b_g4_args "$@" || return 1
+  _cp8b_g_cfg_allow "$_CP8B_CLONE" || { _CP8B_G_WHY="config-key $(_cp8b_g_clean "${_gbk:-}")"; return 1; }   # G4C-ALLOWLIST
+  _cp8b_g_hooks_ok "$_CP8B_CLONE" || { _CP8B_G_WHY=hooks; return 1; }                      # G4C-HOOKS
+  _cp8b_g_origin_ok "$_CP8B_CLONE" || { _CP8B_G_WHY=origin; return 1; }                    # G4C-ORIGIN
+  _cp8b_g_conf_pin_ok "$_CP8B_CLONE" || { _CP8B_G_WHY=$(_cp8b_g_why_root conf-pin); return 1; }              # G4C-CONFPIN
+  _cp8b_g_root_main_ok || { _CP8B_G_WHY=$(_cp8b_g_why_root); return 1; }                   # G4C-ROOT
+  return 0
+}
+
+# _cp8b_g1 <args...>: G1, `sparkwright prepush [--warranted]` (design §4.1). The script is the clone's own, by file identity; after `prepush`
+# the argv is exactly empty or exactly `--warranted`.
+_cp8b_g1() {
+  [ "$_cx_p" -ef "$_CP8B_CLONE/scripts/sparkwright" ] || return 1   # G1-IDENT
+  [ "${1:-}" = prepush ] || return 1
+  case $# in
+    1) return 0 ;;
+    2) [ "$2" = --warranted ] ;;   # G1-ARITY
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_g2 <args...>: G2, `ci-gates.sh --own-tree [dir]` (design §4.2). The operand is `.` or inside the clone.
+_cp8b_g2() {
+  [ "${1:-}" = --own-tree ] || return 1
+  case $# in
+    1) return 0 ;;
+    2) case "$2" in
+         .) return 0 ;;
+         -*) return 1 ;;
+       esac
+       _cp8b_clone_arg_ok "$2" ;;   # G2-OPERAND
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_g3 <args...>: G3, `promotion-readiness.sh --class --changed <listing>` (design §4.3), the two flags once each in either order.
+# The listing is read, never written: a clone file or a scratch file, a regular file with one link.
+_cp8b_g3() {
+  _g3c=0; _g3h=0; _g3l=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --class) [ "$_g3c" = 0 ] || return 1; _g3c=1; shift ;;
+      --changed) [ "$_g3h" = 0 ] && [ $# -ge 2 ] || return 1; _g3h=1; _g3l=$2; shift 2 ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$_g3c" = 1 ] && [ "$_g3h" = 1 ] || return 1
+  _cp8b_g_file_ok "$_g3l" 0
+}
+
+# _cp8b_g5 <args after pipx>: G5, `pipx run semgrep==X.Y.Z [scan] --config p/default --metrics=off [--json] [--error] [--quiet|-q] <path>...`
+# (design §4.5). The lead is exactly the pinned run; the flags are a closed set, each once; `--metrics=off` and `--config p/default` are
+# required; every path is relative, inside the clone and existing. The clone must be clean (config allowlist, no live hooks) and hold no
+# `__pypackages__` (pipx honours PEP 582 there, and that would run clone-supplied Python).
+_cp8b_g5() {
+  [ "${1:-}" = run ] || return 1
+  shift
+  case "${1:-}" in
+    semgrep==*) _g5v=${1#semgrep==} ;;
+    *) return 1 ;;
+  esac
+  # exactly three numeric parts: a two-part pin would slip through the split below
+  case "$_g5v" in
+    *.*.*) : ;;
+    *) return 1 ;;   # G5-3PART
+  esac
+  _g5a=${_g5v%%.*}; _g5r=${_g5v#*.}; _g5b=${_g5r%%.*}; _g5c=${_g5r#*.}
+  for _g5p in "$_g5a" "$_g5b" "$_g5c"; do
+    case "$_g5p" in
+      ''|*[!0123456789]*) return 1 ;;   # G5-PIN
+    esac
+  done
+  shift
+  [ "${1:-}" = scan ] && shift
+  _g5s=' '
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --config) [ "${2:-}" = p/default ] || return 1; _g5k=--config; shift 2 ;;
+      --metrics=off) _g5k=--metrics=off; shift ;;
+      --json|--error) _g5k=$1; shift ;;
+      --quiet|-q) _g5k=--quiet; shift ;;
+      -*) return 1 ;;   # G5-FLAGS
+      *) break ;;
+    esac
+    case "$_g5s" in
+      *" $_g5k "*) return 1 ;;
+    esac
+    _g5s="$_g5s$_g5k "
+  done
+  case "$_g5s" in
+    *' --config '*) : ;;
+    *) return 1 ;;
+  esac
+  case "$_g5s" in
+    *' --metrics=off '*) : ;;
+    *) return 1 ;;   # G5-METRICS
+  esac
+  [ $# -ge 1 ] || return 1
+  for _g5p in "$@"; do
+    case "$_g5p" in
+      /*|-*) return 1 ;;
+    esac
+    _cp8b_clone_arg_ok "$_g5p" && [ -e "$_CP8B_CLONE/$_g5p" ] || return 1
+  done
+  [ ! -e "$_CP8B_CLONE/__pypackages__" ] && [ ! -L "$_CP8B_CLONE/__pypackages__" ] || { _CP8B_G_WHY=pypackages; return 1; }   # G5-PYPACKAGES
+  _cp8b_g_cfg_allow "$_CP8B_CLONE" || { _CP8B_G_WHY="config-key $(_cp8b_g_clean "${_gbk:-}")"; return 1; }
+  _cp8b_g_hooks_ok "$_CP8B_CLONE" || { _CP8B_G_WHY=hooks; return 1; }
+}
+
+# _cp8b_g6_line: G6-LINE (SWAS-875, design docs/architecture/2026-11-13-dev-clone-g6-new-875-design.md §2.2), judged on the RAW line (`_tad_raw`), not on
+# the argv: every dest check below runs at hook time, so an earlier segment of the same line could create the dest after the check and before
+# `new` runs. 0 iff the line is exactly `cd <abs path that is the clone> && <this segment>`: no `;` newline `|` `||`, no second `&&`, no background
+# `&` or `&>`, no `<` `$` backtick or `(` anywhere, and on this segment only one `>`/`>>` to a literal absolute scratch file that does not exist yet,
+# and `2>&1`. A subshell body: the `set -f` ends with it.
+_cp8b_g6_line() (
+  _g6l=${_tad_raw:-}
+  case "$_g6l" in
+    *"$_cp8b_nl"*|*';'*|*'|'*|*'<'*|*'$'*|*'`'*|*'('*) return 1 ;;
+  esac
+  case "$_g6l" in
+    *'&&'*) : ;;
+    *) return 1 ;;
+  esac
+  _g6a=${_g6l%%'&&'*}; _g6b=${_g6l#*'&&'}
+  case "$_g6b" in
+    *'&&'*) return 1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_g6a
+  [ $# = 2 ] && [ "$1" = cd ] || return 1
+  case "$2" in
+    /*) : ;;
+    *) return 1 ;;
+  esac
+  case "$2" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:+=,-]*) return 1 ;;
+  esac
+  [ "$2" -ef "$_CP8B_CLONE" ] || return 1   # G6-CD
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_g6b
+  _g6g=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      '2>&1') shift ;;
+      '>'|'>>') [ -z "$_g6g" ] && [ $# -ge 2 ] || return 1; _g6g=$2; shift 2 ;;
+      *'>'*|*'&'*) return 1 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$_g6g" ] || return 0
+  case "$_g6g" in
+    /*) : ;;
+    *) return 1 ;;
+  esac
+  case "$_g6g" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:+=,-]*) return 1 ;;
+  esac
+  # a .. in the log is the common redirect rule's (_cp8b_abs_literal_phys, G-REDIR-DOTDOT), which runs on this segment
+  _under_temp "$_g6g" || return 1
+  # no symlink on the walk from the log's parent up to its deepest existing ancestor (a dangling link counts as present), and that ancestor is a real directory; the leaf itself is G6-LOGNEW's
+  _g6x=$(dirname "$_g6g")
+  while [ ! -e "$_g6x" ] && [ ! -L "$_g6x" ]; do _g6x=$(dirname "$_g6x"); done
+  { [ -d "$_g6x" ] && [ ! -L "$_g6x" ]; } || return 1   # G6-LOGNOLINK
+  { [ ! -e "$_g6g" ] && [ ! -L "$_g6g" ]; } || return 1   # G6-LOGNEW
+  # the log's deepest existing ancestor must be in no repository either: a log is never created inside another lane's clone or its .git
+  _g6t=$(_resolve_physical "$_g6g") || return 1
+  while [ ! -d "$_g6t" ]; do _g6t=$(dirname "$_g6t"); done
+  _cp8b_g6_notree "$_g6t"   # G6-LOGTREE
+)
+
+# _cp8b_g6_notree "<dir>": G6-DEST-NOTREE. 0 iff git itself says <dir> is in no repository: `rev-parse --is-inside-work-tree` exits 128 and its output
+# STARTS WITH `fatal: not a git repository (or any of the parent directories)` (the discovery-failure text; a different fatal does not match). Rc 0 (a work tree, the inside of a `.git`, a bare repository) declines, and so does every other error: dubious
+# ownership, a `.git` file with a missing gitdir, an unknown repository extension, a corrupt repository, a mount boundary. `_cp8b_g_git` pins LC_ALL=C.
+_cp8b_g6_notree() {
+  _g6r=0; _g6o=$(_cp8b_g_git -C "$1" rev-parse --is-inside-work-tree 2>&1) || _g6r=$?
+  case "$_g6r" in
+    0) return 1 ;;   # G6-NOTREE-RC0
+    128) _g6k=${_g6o#'fatal: not a git repository (or any of the parent directories)'}; [ "$_g6k" != "$_g6o" ] || return 1 ;;   # G6-NOTREE-TEXT
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_g6_flags <args after the dest>: G6-FLAGS and G6-BOARD. Exactly `--noninteractive` and `--stack|--team|--board|--harness|--name <value>`, each
+# once, in any order. A value is the next token and never starts with `-`; the `--flag=value` form never matches. `--board` must be `md`.
+_cp8b_g6_flags() {
+  _g6s=' '
+  while [ $# -gt 0 ]; do
+    _g6f=$1; shift
+    case "$_g6f" in
+      --noninteractive) : ;;
+      --stack|--team|--board|--harness|--name)
+        [ $# -gt 0 ] || return 1
+        case "$1" in
+          ''|-*) return 1 ;;
+        esac
+        [ "$_g6f" != --board ] || [ "$1" = md ] || { _CP8B_G_WHY=board; return 1; }   # G6-BOARD
+        shift ;;
+      *) return 1 ;;
+    esac
+    case "$_g6s" in
+      *" $_g6f "*) return 1 ;;   # G6-ONCE
+    esac
+    _g6s="$_g6s$_g6f "
+  done
+  case "$_g6s" in
+    *' --noninteractive '*) : ;;
+    *) return 1 ;;   # G6-NONINT
+  esac
+  for _g6f in --stack --team --board --harness --name; do
+    case "$_g6s" in
+      *" $_g6f "*) : ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# _cp8b_g6 <args...>: G6, `sparkwright new <dest> --noninteractive --stack <s> --team <t> --board md --harness <h> --name <n> [> <log>] [2>&1]` (SWAS-875,
+# design 2026-11-13-dev-clone-g6-new-875-design.md §2.2). The checks run in order; the `<why>` is `line`, `dest`, `board`, `config-key`, `hooks`, or none.
+# The dest must be absolute, spelled with no `..`, under a temp root as spelled AND as physically resolved, with its deepest existing ancestor in no
+# repository, and not exist (not even as a broken link). `--stack`, `--team`, `--harness` and `--name` get the dispatch's plain-token class only:
+# `new` validates each against its own registries and refuses before writing.
+_cp8b_g6() {
+  _CP8B_G_WHY=''
+  _cp8b_g6_line || { _CP8B_G_WHY=line; return 1; }   # G6-LINE
+  _g6d=${2:-}
+  [ "${_g6d#*..}" = "$_g6d" ] || { _CP8B_G_WHY=dest; return 1; }   # G6-DOTDOT
+  [ "$_cx_p" -ef "$_CP8B_CLONE/scripts/sparkwright" ] || return 1   # G6-IDENT
+  [ "${1:-}" = new ] || return 1   # G6-VERB
+  case "$_g6d" in
+    /*) : ;;
+    *) _CP8B_G_WHY=dest; return 1 ;;
+  esac
+  # no symlink on the walk from the dest up to its deepest existing ancestor (a dangling link counts as present), and that ancestor is a real directory
+  _g6w=$_g6d
+  while [ ! -e "$_g6w" ] && [ ! -L "$_g6w" ]; do _g6w=$(dirname "$_g6w"); done
+  { [ -d "$_g6w" ] && [ ! -L "$_g6w" ]; } || { _CP8B_G_WHY=dest; return 1; }   # G6-NOLINK
+  _g6p=$(_resolve_physical "$_g6d") || { _CP8B_G_WHY=dest; return 1; }
+  { _under_temp "$_g6d" && _under_temp "$_g6p"; } || { _CP8B_G_WHY=dest; return 1; }   # G6-TEMP
+  _g6e=$_g6p
+  while [ ! -d "$_g6e" ]; do _g6e=$(dirname "$_g6e"); done
+  _cp8b_g6_notree "$_g6e" || { _CP8B_G_WHY=dest; return 1; }   # G6-NOTREE
+  [ ! -e "$_g6d" ] && [ ! -L "$_g6d" ] || { _CP8B_G_WHY=dest; return 1; }   # G6-NEW
+  shift 2
+  _cp8b_g6_flags "$@" || return 1
+  _cp8b_g_cfg_allow "$_CP8B_CLONE" || { _CP8B_G_WHY="config-key $(_cp8b_g_clean "${_gbk:-}")"; return 1; }   # G6-CFG
+  _cp8b_g_hooks_ok "$_CP8B_CLONE" || { _CP8B_G_WHY=hooks; return 1; }   # G6-HOOKS
+}
+
+# _cp8b_g_dispatch <tokens...>: the redirect-stripped words of one segment. Every token is plain (CLONE-BYTES set), the lead is the script
+# after an optional bare sh/bash/dash, or `pipx`; the script selects the grammar. G4's script is the ROOT's board.sh, by physical path and file
+# identity; G1-G3's is the clone's, by `_cp8b_clone_script_rel` (relative, or absolute into the same clone).
+_cp8b_g_dispatch() {
+  [ $# -gt 0 ] || return 1
+  for _gd_t in "$@"; do
+    case "$_gd_t" in
+      *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:+=,-]*) _cp8b_g_decline "$_gg_seg" "plain-token rule (a quote or special byte in a word)"; return 1 ;;   # G-BYTES
+    esac
+  done
+  case "$1" in
+    sh|bash|dash) shift ;;
+  esac
+  [ $# -gt 0 ] || return 1
+  _gd_lead=$1; shift
+  case "$_gd_lead" in
+    pipx) _CP8B_G_KNOWN=1; _cp8b_g5 "$@"; return ;;
+    /*) case "$_gd_lead" in
+          *..*) return 1 ;;
+        esac
+        _gd_p=$(_resolve_physical "$_gd_lead") || return 1
+        if [ "$_gd_p" = "$PROTECTED_ROOT/scripts/board.sh" ] && [ "$_gd_p" -ef "$PROTECTED_ROOT/scripts/board.sh" ]; then   # G4-ROOTCODE
+          _CP8B_G_KNOWN=1; _cp8b_g4 "$@"; return
+        fi ;;
+  esac
+  _cp8b_clone_script_rel "$_gd_lead" || return 1
+  case "$_cx_rel" in
+    scripts/sparkwright) _CP8B_G_KNOWN=1
+      if [ "${1:-}" = new ]; then _cp8b_g6 "$@"; else _cp8b_g1 "$@"; fi ;;   # G6-DISPATCH
+    conformance/ci-gates.sh) _CP8B_G_KNOWN=1; _cp8b_g2 "$@" ;;
+    conformance/promotion-readiness.sh) _CP8B_G_KNOWN=1; _cp8b_g3 "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cp8b_seg_envchange "<seg>": 0 iff the segment CHANGES THE ENVIRONMENT of later segments, whatever the name (design §3.4, N3): a bare
+# `NAME=value` statement, or an `export` / `unset` / `declare` / `typeset` / `readonly` / `set` / `local` lead (the group opener and any
+# assignment prefix peeled). The walk keeps the flag for the rest of the line.
+_cp8b_seg_envchange() {
+  _ecr=$(_cp8b_group_peel "$1")
+  _ecw=$(_cp8b_lead_word "$_ecr")
+  [ -n "$_ecw" ] || return 1
+  case "$_ecw" in
+    [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_]*=*)
+      if _cp8b_seg_all_assign "$_ecr"; then return 0; fi
+      _ecr=$(_cp8b_strip_assigns "$_ecr")
+      _ecw=$(_cp8b_lead_word "$_ecr") ;;
+  esac
+  case "$_ecw" in
+    export|unset|declare|typeset|readonly|set|local) return 0 ;;
+  esac
+  return 1
+}
+
+# _cp8b_tad_is_clone_grammar "<segment>": design §4, the front of the five grammars. 0 iff <segment> is exactly one of G1-G5 in the dev clone
+# the walk is standing in. Consulted at the CLONE-SITE only, after `_cp8b_tad_is_clone_exec`, and under the same line-poison accounting. Any
+# doubt returns 1 and the segment is judged exactly as before.
+_cp8b_g_decline() {   # <segment> <why>: always rc 1. When the segment's lead LOOKS like a grammar script (lexically: a decline before dispatch has not parsed it), name the check on the deny (review I1, m1)
+  _cp8b_pop_tok "$1"; _gdl=$_pt_tok; _gdr=$_pt_rest
+  case "$_gdl" in
+    sh|bash|dash) _cp8b_pop_tok "$_gdr"; _gdl=$_pt_tok; _gdr=$_pt_rest ;;
+  esac
+  _gdk=0
+  case "$_gdl" in
+    scripts/sparkwright|conformance/ci-gates.sh|conformance/promotion-readiness.sh|*/scripts/sparkwright|*/conformance/ci-gates.sh|*/conformance/promotion-readiness.sh|"${PROTECTED_ROOT:-/nonexistent}"/scripts/board.sh) _gdk=1 ;;
+    pipx) _cp8b_pop_tok "$_gdr"; [ "$_pt_tok" = run ] && _gdk=1 ;;
+  esac
+  if [ "$_gdk" = 1 ]; then
+    _CP8B_G_KNOWN=1; _CP8B_G_WHY=$2
+    _CP8B_G_NOTE=" Dev-clone grammar declined this shape: $2. (escape card R29 dev-clone-grammar)"
+  fi
+  return 1
+}
+_cp8b_tad_is_clone_grammar() {
+  _gg_seg=$1
+  [ -n "${_CP8B_CLONE:-}" ] || return 1                                      # G-CLONE
+  [ -n "${PROTECTED_ROOT:-}" ] || return 1
+  _CP8B_G_KNOWN=0; _CP8B_G_WHY=''; _gbk=''
+  [ "${_CP8B_ENVSET_PRIOR:-0}" = 0 ] || { _cp8b_g_decline "$_gg_seg" "environment change earlier on the line"; return 1; }   # G-ENVSET
+  _gg_raw=${_tad_raw:-}
+  while :; do
+    case "$_gg_raw" in
+      *'$?'*) _gg_raw=${_gg_raw%%'$?'*}${_gg_raw#*'$?'} ;;
+      *) break ;;
+    esac
+  done
+  case "$_gg_raw" in
+    *'{'*|*'}'*|*'*'*|*'?'*|*'['*|*']'*|*'~'*) _cp8b_g_decline "$_gg_seg" "glob, brace or tilde byte on the command line"; return 1 ;;   # G-RAWBYTES
+  esac
+  case "$_gg_seg" in
+    *'<'*|*'$'*|*'`'*) _cp8b_g_decline "$_gg_seg" "expansion or input-redirect byte in the segment"; return 1 ;;
+  esac
+  case "$_gg_seg" in
+    *'>'*) if _cp8b_tad_redir_cp "$_gg_seg"; then _cp8b_g_decline "$_gg_seg" "redirect target outside the temp rule"; return 1; fi
+           _cp8b_g_redirs_ok "$_gg_seg" || { _cp8b_g_decline "$_gg_seg" "redirect target outside the temp rule"; return 1; } ;;
+  esac
+  _gg_w=$(_cp8b_clone_strip_redirs "$_gg_seg") || { _cp8b_g_decline "$_gg_seg" "redirect target outside the temp rule"; return 1; }
+  _gg_f=0; case "$-" in
+    *f*) _gg_f=1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_gg_w
+  _gg_rc=1
+  if _cp8b_g_dispatch "$@"; then _gg_rc=0; fi
+  [ "$_gg_f" = 1 ] || set +f
+  # review I1: a grammar script that was recognised but declined NAMES its failing check on the deny (the walk appends _CP8B_G_NOTE)
+  if [ "$_gg_rc" = 1 ] && [ "${_CP8B_G_KNOWN:-0}" = 1 ]; then
+    _CP8B_G_NOTE=" Dev-clone grammar declined this shape: ${_CP8B_G_WHY:-argument shape or operand outside the closed argv}. (escape card R29 dev-clone-grammar)"
+  fi
+  return "$_gg_rc"
+}
+
+# _cp8b_canon_root_script "<segment>": design §2 D2 note, the SPELLING EQUIVALENCE. When the segment is
+# `[sh|bash|…] <abs script> …` and the script resolves PHYSICALLY to `$PROTECTED_ROOT/<kit pattern>`, print the segment with the
+# script respelled root-relative, so the EXISTING kit-exec and kit-query rules judge `sh <root>/scripts/board.sh show K`
+# exactly as `sh scripts/board.sh show K` (the caller applies it only at the confident root, where the relative spelling means
+# the same file). Otherwise print the segment unchanged. Without it kit-exec's argument walk sees the absolute token as a
+# control-plane argument and kit-query's positional lookup misses it.
+_cp8b_canon_root_script() {
+  _crs_in=$1
+  [ -n "${PROTECTED_ROOT:-}" ] || { printf '%s' "$_crs_in"; return 0; }
+  _cp8b_pop_tok "$_crs_in"; _crs_lead=$_pt_tok; _crs_rest=$_pt_rest; _crs_pre=''
+  case "$_crs_lead" in
+    sh|bash|dash|zsh|ksh) _crs_pre="$_crs_lead "; _cp8b_pop_tok "$_crs_rest"; _crs_lead=$_pt_tok; _crs_rest=$_pt_rest ;;
+  esac
+  case "$_crs_lead" in
+    /*) : ;;
+    *) printf '%s' "$_crs_in"; return 0 ;;
+  esac
+  case "$_crs_lead" in
+    *..*|*[!A-Za-z0-9._/@:+,-]*) printf '%s' "$_crs_in"; return 0 ;;
+  esac
+  _crs_phys=$(_resolve_physical "$_crs_lead") || { printf '%s' "$_crs_in"; return 0; }
+  case "$_crs_phys" in
+    "$PROTECTED_ROOT"/conformance/*.sh|"$PROTECTED_ROOT"/scripts/*.sh|"$PROTECTED_ROOT"/scripts/kit-guard|"$PROTECTED_ROOT"/scripts/sparkwright)
+      printf '%s%s %s' "$_crs_pre" "${_crs_phys#"$PROTECTED_ROOT"/}" "$_crs_rest" ;;
+    *) printf '%s' "$_crs_in" ;;
+  esac
+}
+
+# _cp8b_compose "<token>": composed normalized path (effective-dir ⊕ token) on stdout; rc 1 if the
+# token is not composable (no effective dir, or an absolute token). Part B reuses the :1426 fixpoint.
+_cp8b_compose() {
+  [ -n "$_CP8B_EFF" ] || return 1
+  case "$1" in
+    /*) return 1 ;;
+    esac
+  _cp8b_norm "$_CP8B_EFF/$1"
+}
+
+# _cp8b_composed_is_cp "<token>": 0 iff the token, dequoted and `flag=`-stripped (like _cp8b_tok_is_cp
+# :609 — defect 2: else `dd if=/tmp/x of=pre-push` composes hooks/of=pre-push and escapes), composes
+# to a control-plane path against the effective dir.
+_cp8b_composed_is_cp() {
+  _ct2=$(_cp8b_dequote "$1"); case "$_ct2" in
+    *=*) _ct2=${_ct2#*=} ;;
+    esac
+  # rc 1 = not composable (legit: "not control-plane"); rc >= 2 = fault, never a quiet "no".
+  _cc_rc=0; _cc=$(_cp8b_compose "$_ct2") || _cc_rc=$?
+  [ "$_cc_rc" -le 1 ] || _guard_fault compose
+  [ "$_cc_rc" = 0 ] || return 1
+  [ -n "$_cc" ] && { is_control_plane_target "$_cc" || _cp8b_via_link_cp "$_ct2" "${_lv:-}"; }   # GSR C9: a composed target behind a link
+}
+
+# _cp8b_tad_redir_cp "<segment>": 0 iff a redirect TARGET bails to the deny side — either it classifies
+# control-plane (literal ∨ composed) OR it is a NON-LITERAL target (GUARD-CP-WRITE-ROUTES Cure 2, via
+# the shared _redir_targets disqualifier). Returning 0 makes the read/kit-exec recognition DECLINE, so a
+# `sh conformance/verify.sh > $(echo hooks/pre-push)` is no longer laundered — the pathhit trigger then
+# fires on the CP substring the reader was pointed at. The classification loop (composed-vs-plain) is
+# kept per-caller so the cd-composition catch (`cd hooks && … > pre-push`) survives (K-R-COMPOSED); the
+# split adopts _cp8b_redirect_hits_cp's `set -f` discipline (R2), not the old bare `for`.
+_cp8b_tad_redir_cp() {
+  case "$1" in
+    *'>'*) : ;;
+    *) return 1 ;;
+    esac
+  _rt=$(_redir_targets "$1") || return 0   # rc 3 => a non-literal target, any other rc a fault => fail closed (K-R1a)
+  [ -n "$_rt" ] || return 1
+  _rg=0; case "$-" in
+    *f*) _rg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $_rt
+  while [ $# -gt 0 ]; do
+    if [ -n "$1" ]; then
+      is_control_plane_target "$1" && { [ "$_rg" = 1 ] || set +f; return 0; }
+      _cp8b_via_link_cp "$1" && { [ "$_rg" = 1 ] || set +f; return 0; }   # GSR C9
+      _cp8b_composed_is_cp "$1" && { [ "$_rg" = 1 ] || set +f; return 0; }
+    fi
+    shift
+  done
+  [ "$_rg" = 1 ] || set +f
+  return 1
+}
+
+# Part C allow-side. _cp8b_tad_is_read "<segment>": a read-recognized segment never denies. A segment
+# carrying a REDIRECT is read-recognized only when the redirect target is NOT control-plane (E5) — this
+# is why the two mandatory flips fire: `printf`/`echo` are read verbs (:973), so without E5 narrowing
+# `cd hooks && printf x > pre-push` would relax. The read set is CP-8a's stdout-only list, REUSED and
+# PINNED (M1): awk/sed/find/sort/less/xxd/uniq stay OUT — each carries a write/exec escape and admitting
+# any fails OPEN under the lifted gate. E2 adds git READ subcommands, safe only because the old
+# scan-arm still denies `git diff --output=<cp>` (§9(b)); do not retire the old arm.
+# C4 Arm 1 (E4a, face a) tier 1 — PLAIN-LIST adds: stdout-only readers, each verified to carry NO
+# file-write flag in any form (jq writes only via shell redirect, which E5 already narrows via the
+# `>`-target bail at :1180, so `shellcheck cp.sh > hooks/pre-push` stays DENY). Sole consumer of this
+# list is _cp8b_tad_is_read (Finding 4 confirmed). `sort`/`less` stay OUT (sort -o writes, less
+# shell-escapes); awk/sed/find stay OUT (E4b rejected). `yq`/`tree` are NOT here — they carry
+# file-write flags and are handled by the decline-on-any-flag conditional arm below.
+# === GUARD-READ-EXEC-LANE (K-3a) face 1 — THE LEXICON SPLITS INTO THREE TIERS ======================
+# A LEXICON IS A VERB LIST; THE EXEC/WRITE FLAG LIVES IN THE ARGV. The T8 review said so at the mask
+# gate above (finding F-1) and deliberately left the DATA lexicon alone ("narrowing the data lexicon is
+# a different row"). This is that row: seven verbs leave plain membership.
+#
+# TIER 1 — PLAIN MEMBERSHIP, and each surviving verb is DISCLOSED with the flag surface that was
+# checked. Every one of these was measured to carry NO flag that executes a program or writes a file on
+# any dialect the vet could find (GNU, BSD/Apple, busybox):
+#   ls        — `-o`/`-l` are FORMAT flags; no output-file flag in any dialect.
+#   cat       — no write flag (`>` is the shell's, and E5 narrows redirect targets above).
+#   head tail — `-n`/`-c` take counts; BSD/GNU carry no output-file flag.
+#   wc du     — counters; no output flag.
+#   stat      — `-f`/`-c` are FORMAT strings, never a file to write.
+#   cut tr nl od hexdump tac comm cmp basename dirname realpath readlink — stdout-only filters; the
+#             only file-shaped operands are INPUTS. (`cmp` has no `-o`; `od`'s `-w` is a width.)
+#   echo printf — EMITTERS, kept because they write only to stdout. ⚠️ `printf` DOES carry bash's
+#             `-v NAME` (assign to a variable), which is a RESOLUTION change, not a file write; it is
+#             handled by face 2's poison rule (`_CP8B_RES_POISON`), not here.
+#   which type — resolution queries; no write.
+#   shasum md5 cksum — digests, stdout-only (`shasum -c` READS a checklist).
+#   yamllint jq shellcheck — linters/filters; `jq` writes only through a shell redirect, which E5
+#             already narrows (`shellcheck cp.sh > hooks/pre-push` stays DENY).
+# Re-admitting a removed verb to this list needs its OWN measurement, and the re-admission is pinned
+# BEHAVIOURALLY (mutant K-3a-M4 puts `rg` back and the A1 deny flips), never by a source oracle.
+_CP8B_READ_VERBS='ls cat head tail wc stat du cut tr nl od hexdump tac comm cmp basename dirname realpath readlink echo printf which type shellcheck jq shasum md5 cksum yamllint'
+# TIER 2/3 verbs — the ones that LEFT tier 1. They are still READ-SHAPED for the purposes of the
+# message tier (`_cp8b_fh_seg_write` / `_cp8b_seg_read_shaped`), which asks the weaker question "did the
+# operator mean to LOOK at this?" and only decides whether the kill-switch sentence is printed. Keeping
+# them here is what makes this face a VERDICT change and not a reason-text change: no deny reason moves
+# because a verb changed tier.
+_CP8B_READ_VERBS_TIERED='grep egrep fgrep rg diff column file'
+# TIER 2 — a VETTED POSITIVE FLAG ALLOWLIST, fail-closed on the unknown flag. The sets below are the
+# DEMONSTRATED NEED measured from this repo's own `scripts/ conformance/ .claude/ hooks/ docs/ skills/`
+# usage on 2026-09-08 plus the design's §4 frontier cells, intersected with the vet's universe
+# (design appendix). They are NOT the universe: the guard-completeness doctrine says to shrink a
+# certified set to demonstrated need and treat a speculative exemption as guilty. The deny log is the
+# instrument that earns each later widening — an XS row per batch, never a per-FP edit.
+# ⚠️ `--pre`, `--pre-glob`, `--filter`, `--save-config`, `--config`, `-O`, `--open-files-in-pager`,
+# `--to-file`, `--from-file`, `-l`/`--paginate` (diff) are ABSENT rather than denylisted. That is the
+# whole design: the NEXT unknown exec flag declines too, with zero enumeration.
+_CP8B_GREP_BARE='-E -F -I -a -c -i -l -n -o -q -r -v -w -x -<digits> --count'
+_CP8B_GREP_OPND='-e -f -m -A -B --include --regexp'
+_CP8B_GITGREP_EXTRA='--cached -p'
+_CP8B_RG_BARE='-n'
+_CP8B_RG_OPND='-A -e -f -g -t'
+_CP8B_DIFF_BARE='-q -r -u'
+_CP8B_DIFF_OPND='-U --exclude'
+# K-3a face 3 — `stash` LEFT this list: `git stash push -- <cp>` REVERTS the control-plane file's
+# working copy, which is a write by any reading (the T8 vet named it; celled at K-3a-A13).
+# `add` and `commit` STAY, disclosed: they write the index and new objects, never the worktree, and
+# their exec surface — hooks and the editor — is closed by faces 2 and 3 (`core.hooksPath` via `-c`
+# now declines). The commit itself is the pre-push/CI boundary's subject, not the guard's.
+_CP8B_GIT_READ_SUBS='commit status blame describe add diff log show grep ls-files'
+_cp8b_in_list() { for _w in $2; do [ "$_w" = "$1" ] && return 0; done; return 1; }
+# _cp8b_seg_has_flag "<seg>": 0 iff ANY token after the leading verb begins with '-'. The
+# decline-on-ANY-flag disqualifier for the yq/tree conditional read arm (vet Finding 1): genuine
+# fail-by-disqualification, NOT a write-flag denylist (a denylist fails OPEN on the next unknown write
+# flag — exactly the `yq -s <expr>` hole the vet caught).
+# ⚠️ K-3a fix round 1 (reviewer C1 / security F4): the first byte is read off the DEQUOTED shell word,
+# not off the raw token, so `column "-o" <cp>` and `yq "-i" . <cp>` are the flags they will actually be.
+# DENY-WARD ONLY: this helper's 0 means "declines recognition", so seeing MORE flags can only deny more.
+# The word-join walk supplies boundaries; an unsettleable segment keeps the raw tokens (also deny-ward).
+_cp8b_seg_has_flag() {
+  _pgf=0; case "$-" in
+    *f*) _pgf=1 ;;
+    esac
+  # ⚠️ BOTH VIEWS, AND THE DISJUNCTION IS THE POINT (fix round 2, security F9). The joined-and-dequoted
+  # view is what makes `column "-o" <cp>` decline; but on its own it also RELAXED this tier, because a
+  # `-`-leading FRAGMENT inside a quoted operand (`yq "a -b" <cp>`, `tree "a -o" <dir>`,
+  # `actionlint "a -shellcheck=x" …`) used to decline on the raw token `-b"` and stopped doing so once
+  # the span became one word. Those five were DENY at pristine, so allowing them is an ALLOW-WARD move
+  # this slice does not claim and cannot ratify. Declining when EITHER view shows a `-`-leading token
+  # is strictly deny-ward against pristine — this helper's 0 means "declines recognition", and its only
+  # callers are the two allow-side tier arms. K-3a-M13 pins the raw leg.
+  _pgs=$(_cp8b_word_join "$1") || _pgs=$1
+  _cp8b_seg_has_flag_view "$_pgs" real && { [ "$_pgf" = 1 ] || set +f; return 0; }
+  _cp8b_seg_has_flag_view "$1" raw && { [ "$_pgf" = 1 ] || set +f; return 0; }
+  [ "$_pgf" = 1 ] || set +f
+  return 1
+}
+# The one-view walk. `real` reads each word DEQUOTED (so a quoted flag is the flag it will be);
+# `raw` reads the token as written (so a `-`-leading fragment inside a quoted operand still declines,
+# exactly as it did before this row).
+_cp8b_seg_has_flag_view() {
+  _pgv=$2
+  _pgw=0; case "$-" in
+    *f*) _pgw=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -gt 0 ] && shift               # drop the leading verb
+  while [ $# -gt 0 ]; do
+    if [ "$_pgv" = real ]; then _pgt=$(_cp8b_word_real "$1"); else _pgt=$1; fi
+    case "$_pgt" in
+      -*) [ "$_pgw" = 1 ] || set +f; return 0 ;;
+      esac
+    shift
+  done
+  [ "$_pgf" = 1 ] || set +f
+  return 1
+}
+# _cp8b_seg_is_shell_n "<seg>": 0 iff the segment is EXACTLY a shell syntax check — the second token is
+# EXACTLY `-n` and NO other token begins with `-`. Fail-by-disqualification, mirroring
+# _cp8b_seg_has_flag: `-x` executes, `-nc` executes, `-n -c '<cmd>'` executes, and any second flag is an
+# unknown, so all of them decline and fall through to the existing deny path. F2-KL pins the exact
+# match: relaxing it to "any flag" read-recognizes `sh -x <cp>`, which EXECUTES the file.
+# === GUARD-READ-EXEC-LANE (K-3a) face 1 — the tier-2 flag grammar ================================
+# `_cp8b_flag_tok_ok "<token>" "<bare-set>" "<operand-set>"`: 0 iff this ONE `-`-leading token is on a
+# vetted set. Sets `_CP8B_FLAG_EATS=1` when the token takes the NEXT token as its value. The shape is
+# `_cp8b_seg_is_find_ro`'s (a positive primary allowlist), NOT a shell parse — it never inspects a
+# flag's VALUE, only its NAME, so it is dialect-neutral by construction and the guard never has to know
+# whether `grep` is really ugrep.
+#   `--name=value` — passes iff `--name` is on EITHER set (the value is never inspected).
+#   `--name`       — bare set: pass; operand set: pass and consume the next token BLIND (so
+#                    `-e --pre` makes `--pre` a pattern, which is what the real program does).
+#   `-<digits>`    — passes iff the literal `-<digits>` is on the bare set (grep-family shorthand).
+#   `-X`           — single letter, same two-set rule as `--name`.
+#   `-Xrest`       — if X is an OPERAND letter the remainder is its JOINED VALUE and it passes
+#                    (`-A3`, `-U3`, `-tsh`, `-efoo`). Otherwise it is a CLUSTER and passes iff EVERY
+#                    character is a letter AND on the BARE set — every letter, never just the first,
+#                    which is what makes `git grep -nO<cmd>` (A14) decline on the `O`.
+#   anything else  — DECLINES. That is the whole fail-closed property.
+_cp8b_flag_tok_ok() {
+  _CP8B_FLAG_EATS=0
+  case "$1" in
+    --*=*) _ftn=${1%%=*}
+           _cp8b_in_list "$_ftn" "$2" && return 0
+           _cp8b_in_list "$_ftn" "$3" && return 0
+           return 1 ;;
+    --*)   _cp8b_in_list "$1" "$2" && return 0
+           _cp8b_in_list "$1" "$3" && { _CP8B_FLAG_EATS=1; return 0; }
+           return 1 ;;
+    -[0-9]*) case "$1" in
+      *[!0-9-]*) return 1 ;;
+      esac
+           _cp8b_in_list '-<digits>' "$2" && return 0
+           return 1 ;;
+  esac
+  _ftb=${1#-}
+  [ -n "$_ftb" ] || return 1                     # a bare `-` is an unknown token
+  if [ "${#_ftb}" = 1 ]; then
+    _cp8b_in_list "$1" "$2" && return 0
+    _cp8b_in_list "$1" "$3" && { _CP8B_FLAG_EATS=1; return 0; }
+    return 1
+  fi
+  _ft1=$(printf '%.1s' "$_ftb")
+  _cp8b_in_list "-$_ft1" "$3" && return 0        # a leading OPERAND letter swallows the remainder
+  while [ -n "$_ftb" ]; do
+    _ftc=$(printf '%.1s' "$_ftb")
+    case "$_ftc" in
+      [A-Za-z]) : ;;
+      *) return 1 ;;
+      esac
+    _cp8b_in_list "-$_ftc" "$2" || return 1
+    _ftb=${_ftb#?}
+  done
+  return 0
+}
+# `_cp8b_seg_flags_vetted "<seg>" "<bare>" "<operand>" [display-verb]`: 0 iff EVERY `-`-leading token
+# after the lead verb is vetted by `_cp8b_flag_tok_ok`. `--` ends flag judgment. On a decline it
+# records `<verb> <flag>` in `_CP8B_READ_FLAG_HIT` so the deny reason can name the exact flag that
+# closed the read lane (the DRIFT-2 precedent: signpost the escape, never relax).
+# NOT a subshell (unlike `_cp8b_seg_find_walk`) precisely because it must set that global.
+# `_cp8b_word_join "<seg>"`: the segment with every WHITESPACE byte inside a quoted span replaced by
+# the sentinel `_cp8b_fws`, so a quoted span stays ONE shell word under `set -- $seg`. Every other byte
+# is preserved, quotes included. Returns 1 when the walk cannot settle the segment.
+#
+# ⚠️ THE FIRST CUT BLANKED THE SPAN'S CONTENTS AND THAT WAS A HOLE (fix round 1, reviewer C1 /
+# security F4). Blanking made `rg -n "--pre=/tmp/e" x <cp>` look like `rg -n "____________" x <cp>` —
+# no leading dash, therefore "data", therefore ALLOW — while the shell hands `--pre=/tmp/e` straight to
+# ripgrep as a flag. Ten spellings were measured ALLOW that way. The quoting must decide WORD
+# BOUNDARIES only; what the word IS must be decided by DEQUOTING it and reading its real first byte.
+#   `"rm -rf"`        -> one word, dequotes to `rm<sentinel>rf` -> no leading dash -> DATA (ALLOW)
+#   `"--pre=/tmp/e"`  -> one word, dequotes to `--pre=/tmp/e`   -> leading dash    -> JUDGED (declines)
+# That is the whole difference, and it is why the sentinel is a WORD-JOINER rather than a redaction.
+#
+# THE FAILURE DIRECTION IS DENY. Anything this walk cannot settle — an unterminated span, an escaped
+# quote or backslash pair, a backtick, a `$` outside `$'`, a heredoc `<<` — returns 1, and the caller
+# falls back to judging the RAW tokens, which can only ever see MORE `-`-leading words and therefore
+# declines at least as often. (`grep --pre=/tmp/e "x <cp>` still denies through that fallback.)
+# ⚠️ THE FALLBACK IS A FALLBACK, NOT A REFUSAL. An outright decline here was measured to double-lock
+# the mask walk's own M-A2c subject and to unbind M-A2 / M-A2b with it — a new decline that silently
+# removes three existing proofs is a widening of the wrong kind.
+_cp8b_fws=$(printf '\037')
+_cp8b_word_join() {
+  case "$1" in
+    *'`'*|*'<<'*) return 1 ;;                      # a backtick or a heredoc: not this walk's grammar
+    *\\*) return 1 ;;                              # any backslash: an escaped quote desynchronises
+  esac
+  _qbi=$1; _qbo=''; _qbq=''
+  while [ -n "$_qbi" ]; do
+    _qbc=${_qbi%"${_qbi#?}"}; _qbi=${_qbi#?}
+    if [ -z "$_qbq" ]; then
+      case "$_qbc" in
+        '"'|"'") _qbq=$_qbc ;;
+        '$') case "$_qbi" in
+          "'"*) : ;;
+          *) return 1 ;;
+          esac ;;   # `$'…'` is fine; any other `$` is not
+      esac
+      _qbo="$_qbo$_qbc"
+      continue
+    fi
+    if [ "$_qbc" = "$_qbq" ]; then _qbq=''; _qbo="$_qbo$_qbc"; continue; fi
+    case "$_qbc" in
+      [[:space:]]) _qbo="$_qbo$_cp8b_fws" ;;
+      *)           _qbo="$_qbo$_qbc" ;;
+    esac
+  done
+  printf '%s' "$_qbo"
+  [ -z "$_qbq" ]
+}
+# `_cp8b_word_real "<word>"`: the word as the SHELL will pass it — quote bytes, a leading `$'` and
+# BACKSLASHES stripped. Used only to read a word's first byte, never to resolve a path.
+# ⚠️ THE BACKSLASH STRIP IS FIX ROUND 2, security F8 (HIGH), and its absence was a round-1 REGRESSION:
+# round 0 denied `rg \-\-pre <exec> x <cp>` and round 1 allowed it. `_cp8b_word_join` declines on any
+# `\` (an escaped quote desynchronises the span walk), so the caller falls back to the RAW tokens —
+# and the raw token `\-\-pre` was read as a word whose first byte is `\`, i.e. "not a flag", while the
+# shell hands ripgrep `--pre`. Stripping normalises TOWARD the real word, which is the same
+# fail-direction argument `_cp8b_dequote` already makes one function over: the worst case is an
+# over-match, i.e. an over-DENY, i.e. closed. K-3a-M12 pins it.
+_cp8b_word_real() {
+  _wrw=$1
+  case "$_wrw" in
+    "\$'"*) _wrw=${_wrw#\$} ;;
+    esac
+  printf '%s' "$_wrw" | sed -e "s/'//g" -e 's/"//g' -e 's/\\//g'
+}
+_cp8b_seg_flags_vetted() {
+  _sfvb=$2; _sfvo=$3
+  _sfvv=${4:-$(_cp8b_dequote "$(_cp8b_lead "$1")")}
+  _sfvr=0
+  # WORD BOUNDARIES from the quoting walk, the WORD ITSELF from dequoting it (see `_cp8b_word_join`).
+  # An unsettleable segment falls back to the RAW tokens — strictly more `-`-leading words, so strictly
+  # more declines.
+  _sfvs=$(_cp8b_word_join "$1") || _sfvs=$1
+  _pfv=0; case "$-" in
+    *f*) _pfv=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_sfvs
+  [ $# -gt 0 ] && shift                          # drop the leading verb
+  while [ $# -gt 0 ]; do
+    _sfvt=$(_cp8b_word_real "$1")
+    case "$_sfvt" in
+      --) break ;;
+      -) : ;;                                    # M1: a bare `-` is STDIN, an operand, never a flag
+      -?*) if _cp8b_flag_tok_ok "$_sfvt" "$_sfvb" "$_sfvo"; then
+               [ "$_CP8B_FLAG_EATS" = 1 ] && [ $# -gt 1 ] && shift
+             else
+               _CP8B_READ_FLAG_HIT="$_sfvv $(printf '%s' "$_sfvt" | tr "$_cp8b_fws" ' ')"
+               _sfvr=1; break
+             fi ;;
+    esac
+    shift
+  done
+  [ "$_pfv" = 1 ] || set +f
+  return $_sfvr
+}
+# `_cp8b_git_grep_tail "<seg>"`: the segment from its `grep` sub onward, so the tier-2 walk sees a
+# plain `grep …` and never has to model git's global options. (Face 3 declines the global options that
+# can name a program BEFORE this is ever reached.)
+# === GUARD-READ-EXEC-LANE (K-3a) face 3 — git's global options can NAME A PROGRAM ================
+# `_cp8b_git_globals_exec "<seg>"`: 0 iff the global options between `git` and its subcommand include
+# one that can point git at an arbitrary executable — `-c <k>=<v>` (`diff.external`, `core.pager`,
+# `core.hooksPath`, `alias.*=!…`), `--exec-path`, or `--config-env`. No key allowlist: `-c
+# color.ui=never` declines too, priced as mover M1, because a key allowlist is the enumeration trap
+# `D-240816-1` names. `-C <dir>`, `-P` and every other global are untouched.
+#
+# ⚠️⚠️ WHERE THIS IS CONSULTED IS A SECURITY PROPERTY, and the design's first draft got it wrong
+# (security vet, CRIT). It is called from `_cp8b_tad_is_read`'s git branch ONLY. It must NEVER be moved
+# into `_cp8b_git_sub`: that helper has five callers, and making it answer '' on a `-c` would disarm
+# the WRITE arm and Face B-git — `git -c x=y archive -o conformance/x.tar HEAD`,
+# `git -c x=y checkout -- <cp>` and `git -c x=y worktree add -b br conformance/wt` would flip from
+# DENY to ALLOW. Those three are celled as KEPT-DENY controls and K-3a-M3 mutates the site itself.
+_cp8b_git_globals_exec() {
+  _gxf=0; case "$-" in
+    *f*) _gxf=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -gt 0 ] && shift                          # drop the `git` lead
+  _gxr=1
+  while [ $# -gt 0 ]; do
+    _gxt=$(_cp8b_dequote "$1")
+    case "$_gxt" in
+      -c|-c*|--exec-path|--exec-path=*|--config-env|--config-env=*)
+        _CP8B_READ_FLAG_HIT="git $_gxt"; _gxr=0; break ;;
+      # K-3a fix round 1, security F2 — THE OPERAND-TAKING GLOBALS, mirrored from `_cp8b_git_sub`'s own
+      # arm. Without the `shift 2` the walk read `-C`'s VALUE as the subcommand and stopped, so
+      # `git -C . -c diff.external=<exec> diff <cp>` walked straight past the `-c` and ALLOWed. The
+      # scan must reach the sub, exactly as `_cp8b_git_sub` does; a one-off list here would drift from
+      # that one, so it is the same four names spelled the same way.
+      -C|--git-dir|--work-tree|--namespace)
+        [ $# -ge 2 ] || break
+        shift 2 ;;
+      -*) shift ;;
+      *)  break ;;                               # the subcommand — no exec-bearing global found
+    esac
+  done
+  [ "$_gxf" = 1 ] || set +f
+  return $_gxr
+}
+# ⚠️ L2: the tail is a TOKENISED RECONSTRUCTION (`$*` over the word-split), not the raw bytes — runs of
+# whitespace collapse to one space. That is harmless here (only flag NAMES are judged downstream) but
+# it means this must never be used where byte fidelity matters.
+_cp8b_git_grep_tail() {
+  _ggf=0; case "$-" in
+    *f*) _ggf=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  while [ $# -gt 0 ]; do
+    [ "$(_cp8b_dequote "$1")" = grep ] && break
+    shift
+  done
+  _ggt=$*
+  [ "$_ggf" = 1 ] || set +f
+  printf '%s' "$_ggt"
+}
+_cp8b_seg_is_shell_n() {
+  _pnf=0; case "$-" in
+    *f*) _pnf=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -ge 3 ] || { [ "$_pnf" = 1 ] || set +f; return 1; }   # verb + -n + at least one file
+  shift                                                      # drop the lead verb (sh|bash|dash)
+  [ "$1" = "-n" ] || { [ "$_pnf" = 1 ] || set +f; return 1; }
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) [ "$_pnf" = 1 ] || set +f; return 1 ;;
+      esac
+    shift
+  done
+  [ "$_pnf" = 1 ] || set +f
+  return 0
+}
+# === GUARD-READ-LANE-2 F-b — `sed -n <range>p` and `awk <NR-range>` as a GRAMMAR TIER ==============
+# The D1 build invariant is UNTOUCHED: `sed`/`awk` are NOT in _CP8B_READ_VERBS (each carries a write and
+# an exec escape, so a lexicon entry fails OPEN — `sed -i`, `awk '{print > "<cp>"}'`, `awk '{system(…)}'`).
+# They get the `sh -n` precedent instead (_cp8b_seg_is_shell_n above): a recogniser that accepts ONE
+# EXACT grammar and DECLINES everything else, so every unknown spelling keeps today's deny.
+# Two tiers, ONE source of truth:
+#   • the ALLOW tier (`_cp8b_seg_is_sed_n "<seg>"` / `_cp8b_seg_is_awk_range "<seg>"`), wired into
+#     _cp8b_tad_is_read below — numeric/NR ranges only, plus full path-token hygiene;
+#   • the MESSAGE tier (`… "<seg>" msg`), the ONLY caller of which is _cp8b_seg_read_shaped's sed/awk
+#     arm (F-h). It answers a WEAKER question — "is this shaped like a read?" — for a segment that is
+#     denying either way, so it declines to judge the operands (a loop body's `$f` is a path it cannot
+#     see) and admits sed's ADDRESSED read `/re/p`. Both tiers run the SAME script test, so a mutation
+#     of the grammar moves both (the K-COUPLE-SED leg proves the fold is a call, not a copy).
+# WHY `/re/p` IS IN THE MESSAGE TIER BUT NOT THE ALLOW TIER: measured safe as a read (a regex ADDRESS
+# cannot write, and with exactly two unescaped delimiters and `p` as the only command there is no room
+# for a `w`/`e` COMMAND — a `w`/`e` BYTE inside the delimiters is data). It is nonetheless DECLINED on
+# the allow side because design §8 prices it out deliberately: the escape is `grep`, one retry, and a
+# regex-address grammar is a strictly larger attack surface for a strictly smaller refund. Pinned both
+# ways — `sed -n '/re/p' <cp>` DENIES, and its denial does not advertise the kill switch.
+_CP8B_SED_SCRIPT_RO='^[0-9]+(,([0-9]+|\$))?p$'
+_CP8B_SED_SCRIPT_ADDR='^/[^/\\]*/p$'
+# GUARD-READ-PATTERN-RELIEF Face 4 — THE RANGE ADDRESS FORMS, MESSAGE TIER ONLY. `/a/,/b/p`,
+# `/re/,5p` and `5,/re/p` are the spellings an operator reaches for right after the TIP sends them to
+# the `sed -n` grammar, and they were denying WITH "Set KIT_GUARD_SELFEDIT=1" — the guard telling a
+# reader to disarm it globally in order to read. This regex is consulted ONLY on the `msg` tier, so
+# THE VERDICT DOES NOT MOVE (the deny anchors beside every Face 4 cell assert that); design §8's
+# pricing keeping addressed sed out of the ALLOW tier stands, and Face 3 was struck at the GO.
+# ⚠️ `/` AND `\` ARE REFUSED INSIDE THE DELIMITERS, and that is the whole safety argument: a
+# `/`-permissive regex reads `/a/,/b/w .claude/hooks/guard-core.sh/p` as addr2 + `p` while sed
+# executes a `w` — a real write to the guard, celled as keeping the sentence. `$` cannot appear here
+# at all (`_cp8b_unparseable` denies upstream of the sed arm). `p` is the only command admitted.
+_CP8B_SED_SCRIPT_ADDR2='^(/[^/\\]*/|[0-9]+),(/[^/\\]*/|[0-9]+)p$'
+# _cp8b_seg_sed_script_ro "<script>" [msg]: 0 iff the (already quote-stripped) sed script is read-only.
+# The SOLE grammar site for both tiers. `w`, `e`, `r`, `s///w`, a second command, an unanchored suffix
+# — all decline here, which is why the trailing `p$` anchor is load-bearing (M-B1 pins it: a `w` admitted
+# here turns `sed -n 1,5w<cp> <file>`, a real WRITE, into an ALLOW).
+_cp8b_seg_sed_script_ro() {
+  _gmq sed-read-grammar "$1" -Eq "$_CP8B_SED_SCRIPT_RO" && return 0
+  [ "${2:-}" = msg ] || return 1
+  printf '%s' "$1" | grep -Eq "$_CP8B_SED_SCRIPT_ADDR" && return 0
+  printf '%s' "$1" | grep -Eq "$_CP8B_SED_SCRIPT_ADDR2"
+}
+# _cp8b_seg_qstrip "<token>": the token with EXACTLY ONE matching surrounding quote pair removed (both
+# `'` or both `"`, or none). Prints the stripped token; rc 0 = it was unquoted, 2 = single-quoted,
+# 3 = double-quoted, 1 = DECLINE. Declines on a backslash ANYWHERE and on any quote byte LEFT INSIDE
+# after the strip — an orphan (`'s/x/y/w`, the quote-blind segmenter's half of a quoted script), a glued
+# `a'b'c`, an empty `''`. This is how the grammars stay quote-honest without a quote parser: a token the
+# one-pair rule cannot account for is not judged, and not-judged means today's deny.
+_cp8b_seg_qstrip() {
+  case "$1" in
+    *\\*) return 1 ;;
+    esac
+  _qsv=$1; _qsq=0
+  case "$_qsv" in
+    "'"?*"'") _qsv=${_qsv#\'}; _qsv=${_qsv%\'}; _qsq=2 ;;
+    '"'?*'"') _qsv=${_qsv#\"}; _qsv=${_qsv%\"}; _qsq=3 ;;
+  esac
+  case "$_qsv" in
+    *\'*|*\"*) return 1 ;;
+    esac
+  printf '%s' "$_qsv"
+  return "$_qsq"
+}
+# _cp8b_seg_path_ok "<token>": 0 iff the token is a plain PATH OPERAND — non-empty, does not begin with
+# `-` (else `sed -n 1p -i` would read as a path), and carries no `$`, backtick, `<`, `>`. An unresolved
+# expansion is exactly the GUARD-KIT-EXEC-REDIRECT-UNRESOLVED-TARGET shape; neither grammar accepts one.
+# ⚠️ THE `&&`/`||` FORM IS DEFENSIVE, NOT STYLE. `_cp8b_seg_qstrip` reports the quoting KIND in its exit
+# status (2/3), and this core is sourced into `set -eu` shells (the conformance delta replay does exactly
+# that), where a plain `X=$(…)` on a non-zero status is an abort waiting for the right shell. MEASURED
+# HONESTLY: it does NOT reproduce today — every call site sits in an `&&`/`||`/`if` list, where `set -e`
+# is suppressed — so this spelling carries no conformance leg (one was written and deleted as vacuous).
+# It is kept because the cost is one line and the failure mode is a silent ALLOW-becomes-DENY.
+# _cp8b_seg_word_shape_ok "<UNQUOTED token>": 0 iff the shell cannot turn this one token into MORE than
+# one word, or into a `-`-led word. Two shapes can: BRACE expansion (`{-delete,-print}` — one inert
+# token to a `set -f` word-split, two `-`-led words to bash) and a LEADING glob (`*delete`, `?delete`,
+# `[-]delete` — expands to whatever filenames exist, and a pre-planted `./-delete` is a flag). A glob
+# that is not first (`conformance/*.sh`) can only ever expand to words under that literal prefix, so it
+# stays a path and stays allowed. CALLERS MUST GATE THIS ON UNQUOTEDNESS: `'{a,b}'` and `-name '*.sh'`
+# are inert to the shell and must keep passing.
+_cp8b_seg_word_shape_ok() {
+  case "$1" in
+    *'{'*|*'}'*|*','*) return 1 ;;
+    esac
+  case "$1" in
+    '*'*|'?'*|'['*) return 1 ;;
+    esac
+  return 0
+}
+_cp8b_seg_path_ok() {
+  case "$1" in
+    ''|-*|*'$'*|*'`'*|*'<'*|*'>'*|*';'*|*'&'*|*'|'*) return 1 ;;
+    esac
+  _pkv=$(_cp8b_seg_qstrip "$1") && _pkq=0 || _pkq=$?
+  [ "$_pkq" != 1 ] || return 1
+  [ "$_pkq" = 0 ] || return 0                   # quoted: the shell expands nothing inside it
+  _cp8b_seg_word_shape_ok "$_pkv"
+}
+# _cp8b_seg_is_sed_n "<seg>" [msg]: the sed grammar. ALLOW tier = `sed`, EXACTLY `-n`, ONE script token,
+# ≥1 path tokens, nothing else. Any other flag (`-i`, `-e`, `-f`, `-E`, `-s`, `--expression=…`), a second
+# script, or a flag-shaped operand declines — fail-BY-DISQUALIFICATION, the F2-KL precedent, never a
+# write-flag denylist (which fails open on the next unknown flag).
+_cp8b_seg_is_sed_n() {
+  if [ "${2:-}" = msg ]; then
+    # The message tier keeps T4's shape — a read-FLAG allowlist plus the SHARED script test — because
+    # its subject is a segment that DENIES either way and whose operands may be things it cannot
+    # classify (a loop body's `$f`). The write escapes it would otherwise have to find are already
+    # tested, over the WHOLE segment, by _cp8b_fh_write_escape before this is ever reached.
+    _cp8b_fh_flags_ok "$1" '-n' || return 1
+    _cp8b_seg_sed_script_ro "$(_cp8b_fh_first_operand "$1")" msg
+    return
+  fi
+  _cp8b_seg_sed_n_strict "$1"
+}
+_cp8b_seg_sed_n_strict() (
+  set -f
+  # shellcheck disable=SC2086  # word-splitting the segment into tokens IS the parse
+  set -- $1
+  [ $# -ge 3 ] || return 1
+  _sdl=$(_cp8b_dequote "${1:-}"); [ "${_sdl##*/}" = sed ] || return 1
+  shift
+  [ "$1" = "-n" ] || return 1
+  shift
+  [ $# -ge 2 ] || return 1                      # the script token + at least one path
+  _sds=$(_cp8b_seg_qstrip "$1") && _sdq=0 || _sdq=$?   # see the set -e note at _cp8b_seg_path_ok
+  [ "$_sdq" != 1 ] || return 1
+  shift
+  _cp8b_seg_sed_script_ro "$_sds" || return 1
+  while [ $# -gt 0 ]; do
+    _cp8b_seg_path_ok "$1" || return 1
+    shift
+  done
+  return 0
+)
+# _cp8b_seg_is_awk_range "<seg>" [msg]: the awk grammar. ALLOW tier = `awk`, an OPTIONAL single `-F<sep>`
+# (metachar-free), ONE program token, ≥1 path tokens. The program, quote-stripped, must be an anchored
+# `NR` comparison or `{print}`; `{print $N}` is admitted ONLY when the token was SINGLE-quoted, because
+# in any other quoting the `$` belongs to the shell. `-v`, `-f`, `-e`, `--source`, `system(`, `getline`,
+# a bare `>` anywhere, a second program: decline.
+_CP8B_AWK_PROG_RO='^NR *(<=|>=|==|<|>) *[0-9]+( *&& *NR *(<=|>=|<|>) *[0-9]+)?$|^\{ *print *\}$'
+_CP8B_AWK_PROG_FIELD='^\{ *print *\$[0-9]+ *\}$'
+_cp8b_seg_is_awk_range() {
+  # The message tier is the flag allowlist ALONE, by the same argument as sed's: the program token of a
+  # denied segment is often something the grammar cannot judge (`END{print NR}`, a printf format), and
+  # KEEPING the kill-switch sentence there is the exact mis-training F-h exists to stop. The write
+  # escapes (`>`, `system(`, `getline`, an in-place flag) are already tested over the whole segment.
+  if [ "${2:-}" = msg ]; then _cp8b_fh_flags_ok "$1" '-F'; return; fi
+  _cp8b_seg_awk_range_strict "$1"
+}
+_cp8b_seg_awk_range_strict() (
+  set -f
+  # shellcheck disable=SC2086  # word-splitting the segment into tokens IS the parse
+  set -- $1
+  [ $# -ge 3 ] || return 1
+  _awl=$(_cp8b_dequote "${1:-}"); [ "${_awl##*/}" = awk ] || return 1
+  shift
+  case "$1" in
+    -F?*) case "$1" in
+      *'$'*|*'`'*|*\\*|*\'*|*\"*|*'<'*|*'>'*) return 1 ;;
+      esac; shift ;;
+    -*)   return 1 ;;
+  esac
+  [ $# -ge 2 ] || return 1                      # the program token + at least one path
+  _awp=$(_cp8b_seg_qstrip "$1") && _awq=0 || _awq=$?  # see the set -e note at _cp8b_seg_path_ok
+  [ "$_awq" != 1 ] || return 1
+  shift
+  if ! _gmq awk-read-grammar "$_awp" -Eq "$_CP8B_AWK_PROG_RO"; then
+    [ "$_awq" = 2 ] || return 1                 # `{print $N}` is a SINGLE-quoted-only refund
+    _gmq awk-read-grammar "$_awp" -Eq "$_CP8B_AWK_PROG_FIELD" || return 1
+  fi
+  while [ $# -gt 0 ]; do
+    _cp8b_seg_path_ok "$1" || return 1
+    shift
+  done
+  return 0
+)
+# === GUARD-READ-LANE-2 F-e — `find` as a read through a PRIMARY ALLOWLIST =========================
+# Same build invariant, same shape as F-b: `find` is NOT in _CP8B_READ_VERBS. It carries a write escape
+# (`-delete`, `-fprint`, `-fprintf`, `-fls`) AND an exec escape (`-exec`, `-execdir`, `-ok`, `-okdir`),
+# so a lexicon entry fails OPEN. It gets a recogniser that accepts ONE grammar and declines everything
+# else, and the grammar is spelled as an ALLOWLIST of primaries (design §6): an unlisted primary
+# OVER-DENIES rather than escaping, which is why `-ls` and `-printf` — both harmless reads — are DENY
+# today and admitting them is a one-line ratified add rather than a drip.
+# THE LEAD IS TESTED BARE: `find`, de-quoted, with NO basename strip. A pathful lead cannot reach here
+# anyway (every dispatch site keys on `_cp8b_lead`, which neither de-quotes nor basenames), so a strip
+# here would be dead code claiming a relief that does not exist. This is the SAME net behaviour T6
+# shipped for `sed`; both pathful spellings are celled as disclosed over-denies in agent-autonomy.sh.
+# ARITY IS PART OF THE ALLOWLIST. `-mtime -1`, `-size +1k`, `-maxdepth 1` put a token AFTER a primary,
+# and for `-mtime`/`-size` that token is `-`-led. A flag-shaped walk with no arity would read `-1` as an
+# unknown primary and decline a real read; one that skipped arity entirely would read `-1` as a path.
+# So the allowlist is split in two: which primaries exist, and which of them consume the next token.
+_CP8B_FIND_RO_PRIMARIES='-name -iname -path -ipath -regex -iregex -type -maxdepth -mindepth -mtime -mmin -newer -size -empty -print -print0 -prune -depth -L -H -P -xdev -o -a -not ! ( )'
+_CP8B_FIND_RO_ARITY1='-name -iname -path -ipath -regex -iregex -type -maxdepth -mindepth -mtime -mmin -newer -size'
+# GUARD-READ-LANE-3 F-h — the verbs `-exec` may run and still be a READ.
+# ***THE ENFORCEMENT IS THE PAIR: THIS LIST **AND** THE OPERAND GRAMMAR BELOW.*** An earlier draft of
+# this comment claimed the list was "the whole enforcement — the only thing separating `-exec cat {} +`
+# from `-exec sh -c … {} +` is membership here". THAT WAS FALSE, and it was falsified by measurement
+# (reviewer M-1): with `sed cp tee xargs rm sh` ALL planted in this list, only `-exec tee {} +` flips to
+# ALLOW. `-exec rm` and `-exec xargs rm` stay denied by the flat destructive matrix; `-exec sed -i
+# s/a/b/ {}`, `-exec sh -c 'id' {}` and `-exec cp /tmp/e {}` stay denied because each carries a BARE
+# OPERAND and the sub-grammar admits none. So the list alone holds exactly the verbs whose dangerous
+# form needs no operand — which is why mutant M-Fh is anchored on `tee`: it is the one probe that
+# isolates this list. Neither half is sufficient; both are load-bearing. It is DELIBERATELY NOT
+# `_CP8B_READ_VERBS`, for the reason lane 2's F-a gate lexicon was not either (design §3-F-a, seat
+# findings 4–5): that list contains `file`, and `file -C -m X` WRITES `X.mgc`. Every member below
+# takes a path and emits to stdout; none has a documented write flag.
+# ***THE NEVER-ADD CLASS.*** No interpreter (`sh`, `bash`, `python3`, `perl`, `awk`), no in-place
+# editor (`sed`, `ed`, `perl -i`), no copier or writer (`cp`, `mv`, `tee`, `dd`, `install`, `ln`),
+# no `xargs`/`env`/`nice`/`timeout` (each runs a program of the caller's choosing), and not `file`
+# or `sort` (`sort -o` writes). A member added here is a control-plane WRITE surface, not a
+# convenience: it costs a ratified deny-removal and a write-cousin cell, exactly like a lexicon entry.
+# ***AND THE FLAG SLOT IS PART OF THE CONTRACT*** (security seat MED-1). The sub-grammar lets a member
+# carry its own `-`-led flags, so a member must have NO write mode reachable through a flag — not a
+# `--flag=value` one (structurally refused in the walk: any `=` in the slot declines) and not a
+# SEPARATE-VALUE one either, which the `=` refusal does NOT catch. `-o <file>`, `-w <file>`,
+# `--output <file>` on a future member would be an unguarded control-plane write with a read-looking
+# verb in front of it. Vet the flag surface of the verb, not just its default behaviour, before adding.
+# ***AND NO VERB WITH A FLAG THAT TAKES AN OUTPUT PATH — the OPERAND GRAMMAR, not the verb list alone,
+# is the invariant*** (reviewer I-2). A separate-value flag (`-o <file>`) reaches the slot as a `-`-led
+# token followed by a BARE operand, and the bare-operand refusal is what stops it — not this list. The
+# two rules protect different halves and a member must satisfy BOTH: no operand-free write (this list)
+# and no write reachable through a flag value (the grammar). Measured cousins are celled F-h W15/W15b.
+_CP8B_FIND_EXEC_READ_VERBS='cat head tail wc nl od cksum md5 md5sum shasum sha1sum sha256sum stat grep'
+# _cp8b_seg_find_exec_ro: the F-h sub-grammar, entered ONLY on a de-quoted `-exec` token, and TERMINAL
+# — it consumes the rest of the segment and the segment must end at its `+`. Positional parameters are
+# the remaining tokens AFTER `-exec`. `$_fdm` (msg tier) is read from the caller's scope, exactly as
+# the surrounding walk does. Shape: <read-verb> [flag-operands…] {} + , with EXACTLY one `{}`, `+` as
+# the LAST token, and NO literal operand (a literal path there is the verb's target, not the match —
+# `find conformance -exec cat .claude/hooks/guard-core.sh +` is a read of an ARGUMENT, and admitting
+# it would let the operand slot carry anything). `\;` is NOT admitted: it carries a backslash, and the
+# `D-240813-3` decline set is absolute on that byte — the disclosed over-deny is celled, escape is `+`.
+_cp8b_seg_find_exec_ro() {
+  [ $# -ge 3 ] || return 1
+  _cp8b_in_list "$(_cp8b_dequote "$1")" "$_CP8B_FIND_EXEC_READ_VERBS" || return 1
+  shift
+  _fxb=0
+  while [ $# -gt 1 ]; do
+    _fxt=$(_cp8b_dequote "$1")
+    case "$_fxt" in
+      '{}') _fxb=$((_fxb + 1)) ;;
+      # A `-`-led token is the VERB'S OWN FLAG (`head -5`, `wc -l`, `grep -c`). ***IT MAY NOT CARRY A
+      # `=` VALUE*** (security seat MED-1, measured DENY on 5d26fbfa -> ALLOW on the first build of this
+      # branch): `--output=.claude/x` is one token, is `-`-led, passes the operand hygiene test, and was
+      # accepted — so the slot was a silent CONTROL-PLANE-NAMED value the walk never classified. No verb
+      # on `_CP8B_FIND_EXEC_READ_VERBS` has a `--flag=value` write mode TODAY, which is exactly why this
+      # must be structural and not a lexicon judgement: the day one gains one, the slot is a write.
+      # Refusing the whole `=` shape is the disqualification-shaped cure (a CP-token test on the value
+      # would be a parse of the value, and would still miss a non-CP-named path that resolves into the
+      # tree). Disclosed over-deny: `grep --count` is fine, `grep --count=2` declines; the escape is the
+      # short flag. Celled `F-h W15`.
+      -*)   case "$_fxt" in
+        *'='*) return 1 ;;
+        esac
+            [ "$_fdm" = msg ] || _cp8b_seg_find_operand_ok "$1" || return 1 ;;
+      *)    return 1 ;;
+    esac
+    shift
+  done
+  [ "$_fxb" = 1 ] || return 1                      # exactly one `{}` — the match, once
+  [ "$(_cp8b_dequote "$1")" = '+' ] || return 1     # and the segment ENDS here
+  return 0
+}
+# _cp8b_seg_find_primary_ok "<tok>": 0 iff the token is an allowlisted primary/operator. THE SOLE
+# allowlist site for BOTH tiers — the allow tier below and the message tier (F-h) share it, so a
+# mutation of the allowlist moves both and they cannot drift (K-COUPLE-FIND proves this behaviourally).
+# The token is looked up raw first, then DE-QUOTED, because grouping parens reach the guard escaped
+# (`\(`) and a user may quote any primary. De-quoting cannot widen THIS LOOKUP — `'-delete'` and
+# `"-exec"` normalise to tokens that are still not on the list.
+# ⚠️ THAT IS TRUE OF THE LOOKUP AND WAS FALSE OF THE WALK, and the difference shipped a bypass: the walk
+# used to run its UNKNOWN-primary test (`case -*`) on the RAW token, so a quoted escape — which starts
+# with a QUOTE byte, not `-` — missed the test, fell through to the PATH-operand arm, and was accepted
+# as a path while the shell stripped the quotes and find executed it. The walk now de-quotes ONCE and
+# judges BOTH questions off the de-quoted token; the raw token is kept only for the path-operand test.
+_cp8b_seg_find_primary_ok() {
+  _cp8b_in_list "$1" "$_CP8B_FIND_RO_PRIMARIES" && return 0
+  _cp8b_in_list "$(_cp8b_dequote "$1")" "$_CP8B_FIND_RO_PRIMARIES"
+}
+# _cp8b_seg_find_operand_ok "<tok>": the hygiene test for a token consumed as a primary's OPERAND. It
+# may be `-`-led (`-mtime -1`), which is the only thing that distinguishes it from _cp8b_seg_path_ok;
+# everything else is the same refusal — an unresolved expansion, a redirect byte, a segmenter byte.
+# It takes the SAME word-shape refusal as the path arm, and for a slot-specific reason: `-name *`
+# unquoted is expanded by the SHELL, not by find, so the tokens find actually receives are filenames the
+# guard never saw — a pre-planted `./-delete` among them lands as a `-`-led word. `-name '*.sh'` is
+# quoted, inert, and unaffected; that refund is celled.
+_cp8b_seg_find_operand_ok() {
+  case "$1" in
+    ''|*'$'*|*'`'*|*'<'*|*'>'*|*';'*|*'&'*|*'|'*) return 1 ;;
+    esac
+  _fnv=$(_cp8b_seg_qstrip "$1") && _fnq=0 || _fnq=$?
+  [ "$_fnq" != 1 ] || return 1
+  [ "$_fnq" = 0 ] || return 0                   # quoted: the shell expands nothing inside it
+  _cp8b_seg_word_shape_ok "$_fnv"
+}
+# _cp8b_seg_find_arity_shape_ok "<de-quoted tok>": the SHAPE test for that same operand slot, and the
+# reason it exists is that the slot used to be unchecked — `find <cp> -name -exec cp /tmp/e {} +` had
+# its escape SWALLOWED as `-name`'s operand and the walk then accepted the rest. Real find errors on
+# that, but the guard was fail-OPEN by construction, and a shape the guard cannot judge must decline.
+# The slot admits a `-`-led token for exactly one reason (`-mtime -1`, `-size -1k`), so that is exactly
+# what it admits: a `-` followed by digits, with at most one trailing size/time unit letter. Every
+# escape name (`-exec`, `-delete`, `-fprint`, `-ls`, …) is alphabetic after the `-` and cannot pass.
+_cp8b_seg_find_arity_shape_ok() {
+  case "$1" in
+    -*) ;;
+    *) return 0 ;;
+    esac
+  _fas=${1#-}
+  case "$_fas" in
+    *[!0-9]) _fas=${_fas%[bcwkMGTP]} ;;
+    esac
+  case "$_fas" in
+    ''|*[!0-9]*) return 1 ;;
+    esac
+  return 0
+}
+# _cp8b_seg_is_find_ro "<seg>" [msg]: the find grammar. ALLOW tier = lead EXACTLY `find`, then every
+# token is an allowlisted primary, that primary's operand, or a clean PATH operand. Anything else —
+# `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint`, `-fprintf`, `-fls`, `-ls`, `-printf`, any
+# unknown primary, an expansion-carrying operand — declines, and declining is today's deny.
+# The MESSAGE tier (F-h) answers the WEAKER question, exactly as sed's and awk's do: its subject is a
+# segment that denies either way and whose operands may be things it cannot classify (a loop body's
+# `$f`), so it judges the PRIMARIES only and leaves the operands alone. The write escapes it would
+# otherwise have to find are already tested, over the whole segment, by _cp8b_fh_write_escape.
+_cp8b_seg_is_find_ro() {
+  if [ "${2:-}" = msg ]; then _cp8b_seg_find_walk "$1" msg; return; fi
+  _cp8b_seg_find_walk "$1"
+}
+_cp8b_seg_find_walk() (
+  _fdm=${2:-}                      # captured BEFORE `set --` overwrites the positional parameters
+  set -f
+  # shellcheck disable=SC2086  # word-splitting the segment into tokens IS the parse
+  set -- $1
+  [ $# -ge 2 ] || return 1
+  _fdl=$(_cp8b_dequote "${1:-}"); [ "$_fdl" = find ] || return 1
+  shift
+  while [ $# -gt 0 ]; do
+    _fdq=$(_cp8b_dequote "$1")                    # DE-QUOTE ONCE; both judgments below run off it
+    # GUARD-READ-LANE-3 F-h — `-exec` is handled HERE, before the primary allowlist, and is
+    # deliberately NOT a member of `_CP8B_FIND_RO_PRIMARIES` (adding it there would make it an
+    # ordinary primary whose operands are judged as paths — the `-exec cp /tmp/e {} +` hole lane 2's
+    # mutant M-E1 exists to catch). The sub-grammar is TERMINAL: it either accepts the whole
+    # remainder or declines, so no token after `-exec` is ever judged by the primary walk.
+    if [ "$_fdq" = -exec ]; then
+      shift
+      _cp8b_seg_find_exec_ro "$@" || return 1
+      return 0
+    fi
+    if _cp8b_seg_find_primary_ok "$_fdq"; then
+      if _cp8b_in_list "$_fdq" "$_CP8B_FIND_RO_ARITY1"; then
+        [ $# -ge 2 ] || return 1                  # a primary with no operand is a malformed find
+        shift
+        _cp8b_seg_find_arity_shape_ok "$(_cp8b_dequote "$1")" || return 1
+        [ "$_fdm" = msg ] || _cp8b_seg_find_operand_ok "$1" || return 1
+      fi
+      shift
+      continue
+    fi
+    case "$_fdq" in
+      -*) return 1 ;;
+      esac          # an UNKNOWN primary — the allowlist's whole point
+    [ "$_fdm" = msg ] || _cp8b_seg_path_ok "$1" || return 1
+    shift
+  done
+  return 0
+)
+# $2 (optional) is F-a's MASKED view of the same segment, used for the redirect bail ALONE: a `>` that
+# lies inside a quoted span is a character in an argument, not an operator. It defaults to $1, so every
+# caller that does not know about the mask keeps today's behaviour exactly. Everything below — the
+# lexicon lookup, the conditional tiers, the sed/awk/find grammars — runs on $1, the TRUE bytes.
+_cp8b_tad_is_read() {
+  case "${2:-$1}" in
+    *'>'*) _cp8b_tad_redir_cp "${2:-$1}" && return 1 ;;
+    esac
+  _rv=$(_cp8b_lead "$1")
+  _cp8b_in_list "$_rv" "$_CP8B_READ_VERBS" && return 0
+  # C4 Arm 1 tier 2 (face a) — CONDITIONAL readers `yq`/`tree`. Both carry file-write flags
+  # (`yq -i` in place; `yq -s/--split-exp <expr>` writes an expression-named file — no CP token in
+  # argv; `tree -o <file>`). DECLINE-ON-ANY-FLAG: read-recognized ONLY when the segment carries NO
+  # `-`-leading token at all (pure `yq '<expr>' <file>`, `yq . <file>`, `tree <dir>`). Any flag ->
+  # decline -> fall through to the existing deny path. Over-deny on harmless flags (`yq -P`,
+  # `tree -H`) is an accepted, disclosed FP. K-H pins this decline.
+  # GUARD-FP-RELIEF-2 Arm C (face 3) — `actionlint` joins this SAME conditional tier, deliberately NOT
+  # _CP8B_READ_VERBS: `-shellcheck=<cmd>` and `-pyflakes=<cmd>` make it run an arbitrary program, an
+  # exec primitive, so the plain list is unavailable. Decline-on-any-flag keeps both exec-flag forms
+  # DENY with zero enumeration; over-deny on `-oneline`/`-color` is a disclosed FP, the `yq -P` trade.
+  # Bare `actionlint` was never denied (no control-plane token in argv). F2-KK pins the decline.
+  # GUARD-READ-EXEC-LANE (K-3a) face 1 tier 3 — `column` and `file` join the SAME decline-on-any-flag
+  # tier. Both are rare on control-plane paths and both carry a write flag the guard cannot price
+  # (`column -o <file>` in one dialect, `file -C -m <path>` COMPILES `<path>.mgc` beside a CP file), so
+  # a set each is not worth its measurement. `column -t <cp.tsv>` becomes a disclosed over-deny; the
+  # escape is `cat`. Same reason token (`read-flag`) as tier 2.
+  case "$_rv" in
+    column|file) if _cp8b_seg_has_flag "$1"; then
+                   _CP8B_READ_FLAG_HIT="$_rv (any flag)"; return 1
+                 fi
+                 return 0 ;;
+  esac
+  # GUARD-READ-EXEC-LANE (K-3a) face 1 tier 2 — the vetted flag grammar. `git grep` shares grep's sets
+  # plus its own additions and is judged in the git branch below.
+  case "$_rv" in
+    grep|egrep|fgrep) _cp8b_seg_flags_vetted "$1" "$_CP8B_GREP_BARE" "$_CP8B_GREP_OPND" && return 0
+                      return 1 ;;
+    rg)   _cp8b_seg_flags_vetted "$1" "$_CP8B_RG_BARE" "$_CP8B_RG_OPND" && return 0
+          return 1 ;;
+    diff) _cp8b_seg_flags_vetted "$1" "$_CP8B_DIFF_BARE" "$_CP8B_DIFF_OPND" && return 0
+          return 1 ;;
+  esac
+  case "$_rv" in
+    yq|tree|actionlint) _cp8b_seg_has_flag "$1" || return 0 ;;
+  esac
+  # GUARD-FP-RELIEF-2 Arm D (face 4) — `sh|bash|dash -n <file>` is a shell SYNTAX CHECK. POSIX `-n`
+  # reads and parses without executing, so this is a READ arm, not an exec arm, and the file argument
+  # may be any path: reading a control-plane script for syntax is already granted via `cat`/`shellcheck`
+  # (capability-equivalent). zsh/ksh are excluded — unmeasured need, add on evidence. The E5 redirect
+  # bail at the top of this function runs FIRST, so `sh -n cp.sh > hooks/pre-push` stays DENY.
+  case "$_rv" in
+    sh|bash|dash) _cp8b_seg_is_shell_n "$1" && return 0 ;;
+  esac
+  # GUARD-READ-LANE-2 F-b — `sed`/`awk` join the SAME conditional tier, deliberately NOT
+  # _CP8B_READ_VERBS (build invariant M1: a lexicon entry would read-recognise `sed -i`, `awk
+  # '{print > "<cp>"}'` and `awk '{system("…")}'` — it fails OPEN, which is why the D1-M1 mutant leg
+  # exists). One exact grammar each; everything else declines to today's deny. The E5 redirect bail at
+  # the top of this function runs FIRST, so `sed -n 1,5p cp.sh > .claude/out` stays DENY.
+  case "$_rv" in
+    sed) _cp8b_seg_is_sed_n "$1" && return 0 ;;
+    awk) _cp8b_seg_is_awk_range "$1" && return 0 ;;
+  esac
+  # GUARD-READ-LANE-2 F-e — `find` joins the same conditional tier on the same argument (a lexicon
+  # entry would read-recognise `-exec`/`-delete`). The E5 redirect bail above runs FIRST, so
+  # `find conformance -name '*.sh' -printf '%p' > .claude/out` stays DENY.
+  case "$_rv" in
+    find) _cp8b_seg_is_find_ro "$1" && return 0 ;;
+  esac
+  if [ "$_rv" = git ]; then
+    # K-3a face 3 — a global option that can name a PROGRAM disqualifies READ recognition, before the
+    # sub is even looked up. `_cp8b_git_sub` is untouched (see the ⚠️⚠️ note at the helper).
+    _cp8b_git_globals_exec "$1" && return 1
+    _rgs=$(_cp8b_git_sub "$1")
+    # K-3a face 1 — `git grep` is tier 2 on grep's sets plus `--cached -p`. Its OWN exec flags
+    # (`-O`/`--open-files-in-pager`) are simply absent from those sets, so they decline.
+    if [ "$_rgs" = grep ]; then
+      _cp8b_seg_flags_vetted "$(_cp8b_git_grep_tail "$1")" \
+        "$_CP8B_GREP_BARE $_CP8B_GITGREP_EXTRA" "$_CP8B_GREP_OPND" 'git grep' && return 0
+      return 1
+    fi
+    _cp8b_in_list "$_rgs" "$_CP8B_GIT_READ_SUBS" && return 0
+  fi
+  return 1
+}
+
+# E1′ — kit-script EXECUTION exemption (NARROW). Lead sh/bash/dash/zsh/ksh + a conformance/*.sh |
+# scripts/*.sh | scripts/kit-guard | scripts/sparkwright script token (bare or ./-prefixed), NO
+# redirect, AND every OTHER token still classified. The broad "exempt the whole segment" form fails
+# OPEN (`sh conformance/verify.sh .claude/hooks/guard-core.sh` would ALLOW); the narrow form re-denies
+# it. Script ARGUMENTS stay unexamined (already the D3′ ceiling). (Leg K-E binds this — C2.)
+# C4 Arm 2 (face b) — wrapper-prefix RECOGNITION strip. Produces a recognition-copy of a kit-exec
+# segment with vetted benign wrappers peeled, so `timeout 600 sh conformance/verify.sh` is recognized
+# as the kit-exec it wraps. Fail-by-disqualification: each shape strips ONLY its exact vetted form;
+# anything else (a flag, an env assignment, a non-numeric timeout value) STOPS the loop, leaving a
+# non-shell / non-kit lead -> not kit-exec -> deny (over-deny, safe). Bounded to 3 iterations; a
+# residual non-wrapper lead breaks earlier. Used ONLY inside _cp8b_tad_is_kit_exec (constraint ii:
+# the copy NEVER leaves this arm — deny reasons keep printing the original $_seg).
+#   env    : BARE only (constraint i / vet Finding 2) — any following NAME=value assignment OR any
+#            flag disqualifies (keeps `env KIT_GUARD_SELFEDIT=1 …`, `env PATH=/tmp …`, `env -i …` DENY;
+#            K-F pins both the assignment and the flag leg).
+#   timeout: `timeout <[0-9]+[smhd]?>` — a flagged/non-numeric value (`timeout -s KILL`) disqualifies.
+#   nice   : bare `nice`, or `nice -n <digits>` — any other flag, or a non-digit -n value
+#            (`nice -n hooks/pre-push`), disqualifies.
+#   command: bare `command` — `command -v/-p/-V` disqualifies.
+# GUARD-FP-RELIEF-2 Arm B (face 2) adds two more tokens in the same grammar:
+#   time   : BARE only — any flag (`time -p`) disqualifies (disclosed over-deny). F2-KJ pins it.
+#   {      : the bare `{` token of a brace group. Safe by the same recognition-copy argument: the RAW
+#            segment still feeds every trigger, so `{ rm -rf conformance` stays DENY (lead after the
+#            strip is `rm`, not a shell) and `{ sh cp.sh > hooks/pre-push` still bails on the redirect.
+#
+# GUARD-FP-RELIEF-2 Arm A (face 1) — the VETTED ASSIGNMENT-PREFIX allowlist. A leading `NAME=value`
+# token is peeled from the recognition copy ONLY when NAME is a member of this list AND the value
+# passes `_cp8b_assign_val_safe`. Membership IS the whole enforcement: it fails closed on every unknown
+# name, so all nine measured face-1 negatives keep their DENY with ZERO deny-side edits.
+#
+# ***THE NEVER-ADD CLASS — the line this list does not cross.*** This arm precedes a kit-script
+# EXECUTION, so the danger is CODE-LOADING / EXEC-ENVIRONMENT variables. Permanently excluded, and no
+# future "reasonable" widening may include them: PATH, IFS, LD_PRELOAD, LD_LIBRARY_PATH,
+# DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, BASH_ENV, ENV, SHELLOPTS, and the whole GIT_* family
+# (GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_PAGER … each names a program git will run). Interpreter
+# option variables (NODE_OPTIONS, PERL5OPT, PYTHONSTARTUP, RUBYOPT) are the same class and are equally
+# excluded — they look harmless and are not. KIT_* names are never vetted either (KIT_GUARD_SELFEDIT is
+# the kill switch, KIT_PUSH_CITE a dial), but note KIT_* in command TEXT is inert — `selfedit_allowed`
+# reads the guard's OWN process env, not `$cmd` — so the exec-env family above, not KIT_*, is the
+# security-load-bearing exclusion (security vet MED-1).
+#
+# Contents are MEASURED-USAGE ONLY (owner ruling, design 2026-08-15 §8-Q1/A2): LANG/TZ are vet-confirmed
+# exec-inert and were still held out, because monotone add-only makes a token near-irreversible and
+# every token owes an evidence-backed leg. Widening costs one token plus one leg, on a measured denial.
+_CP8B_VETTED_ASSIGN='SELFTEST LC_ALL'
+# _cp8b_assign_val_safe "<value>": 0 iff the value is a plain literal with no shell-active byte.
+# ***BUILD MANDATE (security vet HIGH-1).*** This MUST be the decline-on-any-bad-char NEGATED-CLASS
+# idiom and MUST NEVER become a positive match: `grep -Eq '^[A-Za-z0-9._:/-]+'` anchors only the HEAD,
+# so `SELFTEST=x$(rm -rf conformance)` would satisfy it, strip clean, and ALLOW while the substitution
+# executes — fail-by-parse wearing a disqualification costume, the exact class D-240813-3 bans. The
+# metachar-FIRST forms (`SELFTEST=$(whoami)`) decline under BOTH builds and cannot tell them apart;
+# the valid-char-then-metachar fixtures and mutant F2-KI2b are what pin the idiom itself.
+_cp8b_assign_val_safe() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._:/-]*) return 1 ;;
+    esac
+  return 0
+}
+# _cp8b_peel_lead_assign "<seg>": drop a leading well-formed `NAME=value` token and the whitespace
+# after it. The pattern re-states the SAME character class the disqualifier enforces, so for every
+# NON-EMPTY value a mutant that flips only _cp8b_assign_val_safe SURVIVES — this pattern rejects the
+# same value a second time. That is why F2-KI2/F2-KI2b flip BOTH halves and honestly pin the PAIR, as
+# the C4 literal-side-conjunction leg does.
+# THE REDUNDANCY IS NOT TOTAL, and the earlier "no fixture can separate them" claim was FALSE (review
+# F1, falsified by measurement): the value pattern is `*` (zero-or-more) while the disqualifier also
+# rejects the EMPTY value, so `SELFTEST= sh <kit-script>` separates the halves — a val_safe-only mutant
+# IS killable there. Mutant F2-KI2c pins that half ALONE via the empty-value leg. Keep the `*`: making
+# it `+` would re-orphan that mutant by restoring total redundancy.
+_cp8b_peel_lead_assign() {
+  printf '%s' "$1" | sed -E 's%^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._:/-]*[[:space:]]+%%'
+}
+_cp8b_strip_wrappers() {
+  _sw=$1
+  _swi=0
+  while [ "$_swi" -lt 3 ]; do
+    _swl=$(_cp8b_lead "$_sw")
+    _sw2=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*//' | awk '{print $2}')
+    case "$_swl" in
+      timeout)
+        case "$_sw2" in
+          [0-9]*) : ;;
+          *) break ;;
+          esac         # value must start with a digit
+        case "$_sw2" in
+          *[!0-9smhd]*) break ;;
+          esac           # ... and be a pure [0-9]+[smhd]? duration
+        _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*timeout[[:space:]]+[0-9]+[smhd]?[[:space:]]+//') ;;
+      nice)
+        case "$_sw2" in
+          -n)
+            _sw3=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*//' | awk '{print $3}')
+            case "$_sw3" in
+              ''|*[!0-9]*) break ;;
+              esac        # `nice -n` needs a digit value
+            _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*nice[[:space:]]+-n[[:space:]]+[0-9]+[[:space:]]+//') ;;
+          -*) break ;;                                        # any other flag disqualifies
+          *) _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*nice[[:space:]]+//') ;;   # bare nice
+        esac ;;
+      command)
+        case "$_sw2" in
+          -*) break ;;
+          esac                     # command -v/-p/-V disqualify
+        _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*command[[:space:]]+//') ;;
+      env)
+        [ -n "$_sw2" ] || break                               # `env` with no argument -> nothing to strip
+        case "$_sw2" in
+          -*|*=*) break ;;
+          esac                 # BARE env only (constraint i; K-F pins)
+        _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*env[[:space:]]+//') ;;
+      time)
+        case "$_sw2" in
+          ''|-*) break ;;
+          esac                  # BARE time only; `time -p` disqualifies
+        _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*time[[:space:]]+//') ;;
+      '{')
+        [ -n "$_sw2" ] || break                               # a lone `{` has nothing to peel toward
+        _sw=$(printf '%s' "$_sw" | sed -E 's/^[[:space:]]*\{[[:space:]]+//') ;;
+      *=*)
+        # Arm A: vetted-NAME assignment prefix. Both tests must pass or the loop breaks (-> deny).
+        _swn=${_swl%%=*}; _swv=${_swl#*=}
+        _cp8b_in_list "$_swn" "$_CP8B_VETTED_ASSIGN" || break
+        _cp8b_assign_val_safe "$_swv" || break
+        # TIGHTEN (security vet Finding 1, owner chose the narrowing cure): decline the peel when the
+        # VALUE itself classifies control-plane. Without this the peel removes a CP-classifying token
+        # from the recognition copy BEFORE the kit-exec token walk sees it, so
+        # `SELFTEST=hooks/pre-push sh <kit-script>` would ALLOW — and it is NOT equivalence-covered,
+        # because the two-statement spellings (`SELFTEST=hooks/pre-push ; sh …`, `export SELFTEST=…`)
+        # both DENY (measured). This is ALLOW-side narrowing (a peel we decline to perform), not a deny
+        # edit. Both spellings of the target are checked, exactly as _cp8b_tad_redir_cp does:
+        #   literal  — `SELFTEST=hooks/pre-push …`                              (F2-KI3 pins)
+        #   composed — `cd hooks && SELFTEST=pre-push …`, which composes to hooks/pre-push under the
+        #              effective dir and was MEASURED ALLOW under a literal-only cure (F2-KI3b pins).
+        # Both helpers take the whole `NAME=value` token: each already dequotes and strips the `flag=`
+        # prefix, so they classify the VALUE by the same rule the token walk and composed trigger use.
+        _cp8b_tok_is_cp "$_swl" && break
+        _cp8b_composed_is_cp "$_swl" && break
+        # Shape-restricted peel: name and value were both validated above, so this matches exactly the
+        # lead token. A non-match makes no progress and the ≤3 bound then exits with a non-shell lead
+        # -> not kit-exec -> deny (over-deny, safe).
+        _sw=$(_cp8b_peel_lead_assign "$_sw") ;;
+      *) break ;;
+    esac
+    _swi=$((_swi + 1))
+  done
+  printf '%s' "$_sw"
+}
+_cp8b_tad_is_kit_exec() {
+  # FIX 2: mirror E5's read-arm narrowing — bail (fall through to deny) ONLY when a redirect TARGET
+  # classifies control-plane. An fd-dup (`2>&1`, `>&2`, `N>&M`) and an ordinary target (`> /tmp/out`)
+  # are non-targets, so the canonical `sh conformance/verify.sh 2>&1` / `> /tmp/out.log` stay kit-exec.
+  # `_cp8b_tad_redir_cp` reuses the effective-dir compose, so `cd hooks && sh …verify.sh > pre-push`
+  # still bails and denies (target composes to hooks/pre-push). An input `<` redirect target that is
+  # control-plane is caught downstream by the literal-token walk below (a read, never a write).
+  # C4 Arm 2 constraint iii: the redirect bail runs on the RAW `$1` FIRST, BEFORE wrapper stripping.
+  # F-3 (T8 review): `$2`, when given, is the METACHAR VIEW of the same segment (the masked copy, in
+  # which a quoted `>` is a sentinel and only a real operator is a `>`); `$1` stays the TRUE-BYTE view
+  # the lexicon lookups below need. Every other caller passes one argument and is byte-unchanged.
+  case "${2:-$1}" in
+    *'>'*) _cp8b_tad_redir_cp "${2:-$1}" && return 1 ;;
+    esac
+  # C4 Arm 2: peel vetted benign wrappers into a recognition-copy (`_kx`). Consumed ONLY below —
+  # never fed to the outer trigger evaluation (:1311-1313) or the effective-dir logic (constraint ii).
+  # SAFETY IS STRUCTURAL, NOT TEST-GUARDED: `_kx` is function-local and `$_seg`/`$1` are untouched
+  # downstream, so no fixture pins this. A future refactor that assigns `_seg=$_kx` (leaking the
+  # stripped copy back to the triggers) would NOT be caught by any mutant — the strip set is all
+  # non-CP tokens, so such a leak cannot flip a verdict today, which is exactly why it is unmutatable
+  # (design §10-A3, mutant K-F2 dropped-with-rationale). Keep `_kx` read-only to this arm.
+  _kx=$(_cp8b_strip_wrappers "$1")
+  _kv=$(_cp8b_lead "$_kx")
+  case "$_kv" in
+    sh|bash|dash|zsh|ksh) _ksc=$(printf '%s' "$_kx" | sed -E 's/^[[:space:]]*//' | awk '{print $2}') ;;
+    *) _ksc=$_kv ;;
+  esac
+  _ksc=$(_cp8b_dequote "$_ksc"); _ksc=${_ksc#./}
+  case "$_ksc" in
+    conformance/*.sh|scripts/*.sh|scripts/kit-guard|scripts/sparkwright) : ;;
+    *) return 1 ;;
+  esac
+  _kpg=0; case "$-" in
+    *f*) _kpg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $_kx
+  # SWAS-181: the one exempt token is the word `governance`, de-quoted, standing immediately after a
+  # `--gate` that follows the verb `record` or `land` of scripts/promotion-verify.sh (the governance
+  # lane, `--gate governance`). `_ctm_match` classifies the bare word as a directory family, which
+  # would decline the whole segment. Fail-by-disqualification (D-240813-3): any miss keeps today's
+  # verdict. No skip when the segment carries `--merge-cmd` (`land` evals it, and this walk is
+  # quote-blind) or any `$`, backtick, `(`, `<` or `>` byte (a `--gate governance` pair could then sit
+  # inside a substitution and run there). The deny removal is ratified by the design GO (D-240813-2(c)).
+  _kgo=0
+  if [ "$_ksc" = scripts/promotion-verify.sh ]; then
+    case "$_kx" in
+      *--merge-cmd*) : ;;
+      # `;` `&` `|` newline and `#` are not in this set: `_cp8b_segments` splits on them upstream, so this check depends on that split.
+      *'$'*|*'`'*|*'('*|*'<'*|*'>'*) : ;;
+      *) _kgo=1 ;;
+    esac
+  fi
+  _kgs=0   # 0 idle · 1 script seen, next is the verb · 2 verb is record|land · 3 next is --gate's value · 9 done
+  while [ $# -gt 0 ]; do
+    _kt=$(_cp8b_dequote "$1"); _kt=${_kt#./}
+    if [ "$_kgs" = 3 ]; then
+      _kgs=2
+      if [ "$_kt" = governance ]; then shift; continue; fi
+    elif [ "$_kgs" = 2 ] && [ "$_kt" = --gate ]; then _kgs=3
+    elif [ "$_kgs" = 1 ]; then
+      case "$_kt" in
+        record|land) _kgs=2 ;;
+        *) _kgs=9 ;;
+      esac
+    elif [ "$_kgs" = 0 ] && [ "$_kgo" = 1 ] && [ "$_kt" = "$_ksc" ]; then _kgs=1
+    fi
+    if [ "$_kt" != "$_ksc" ] && _cp8b_tok_is_cp "$1"; then [ "$_kpg" = 1 ] || set +f; return 1; fi
+    shift
+  done
+  [ "$_kpg" = 1 ] || set +f
+  return 0
+}
+
+# GUARD-READONLY-FP-RELIEF Arm A — the kit-exec READ-ONLY QUERY allowlist (cures register faces
+# (f1)+(h) in ONE arm). `_cp8b_tad_is_kit_exec` above declines the WHOLE segment as soon as any
+# token OTHER than the script classifies control-plane. That disqualifier is right for an unknown
+# script (a CP path in argv may be a WRITE target — `sh conformance/verify.sh <cp>` must stay DENY),
+# and wrong for the handful of DECLARED query modes whose entire job is to be ASKED about a path:
+#   sh scripts/kit-guard path <cp>                                  — ask the guard about a path
+#   sh conformance/promotion-readiness.sh --class --changed <listing>  — the ENTRY CONTRACT's act 1
+#   sh conformance/agent-boundary.sh --changed <listing> --ratified 0  — its act-1 cross-check
+#
+# A PAIR MUST NAME A SCRIPT THAT EXISTS. The first cut of this table listed `conformance/phase-gate.sh`
+# one merge after that script was parked and deleted: the arm is a pure token match and never stats the
+# file, so the allow was unprovable and the behavioural lock below passed over a pair that could not run
+# (GUARD-ALLOWLIST-OUTLIVES-ITS-SCRIPT). The lock now asserts existence before it runs a pair, so a
+# table entry that outlives its script REDs by name instead of passing vacuously.
+#
+# THE ENFORCEMENT IS THE DECLARED TABLE, NOT A PARSE (D-240813-3: fail-by-parse cures are banned).
+# `_cp8b_kit_query_toks` is the whole allowlist: an unknown script yields the empty set and the arm
+# DECLINES, so every unlisted kit script keeps today's verdict with zero deny-side edits — the
+# `_CP8B_VETTED_ASSIGN` shape. Adding a pair costs one table line, one leg, and a green coupling lock.
+#
+# ⚠️ READ-ONLINESS IS LOCKED BEHAVIORALLY, NOT BY REVIEW MEMORY (security vet M1). Every pair in this
+# table is RUN against a fixture control-plane argument by `conformance/agent-autonomy.sh`'s Arm-A
+# coupling lock, which asserts the repo worktree is byte-unchanged afterwards. A pair that GAINS a
+# write path reds that lock. A grep-lock over this list would have been fail-by-hope.
+#
+# Decline-on-ANY (each is a disqualifier, so a bug here over-denies):
+#   · any redirect byte (`<` or `>`) in the segment — `… --path CLAUDE.md > conformance/out.txt`
+#   · any `$` / backtick — the guard reads PRE-shell-parse bytes and cannot resolve them
+#   · any `..` byte in the script token (belt; the anchored exact table match is the primary)
+#   · a script token that is not an EXACT table key after `./`-stripping (no path-alias spellings)
+#   · a FIRST post-script token outside the declared set — this is what keeps the WRITER subcommand
+#     `scripts/kit-guard install-shims` off the arm
+#   · ANY other flag-shaped token outside the declared set (vet M1: presence-matching `--class` alone
+#     would let `--class --<writer>` ride). Note the declared sets are per-script SETS, not a single
+#     flag: `--class --changed` is already two flag tokens, so a literal one-flag rule could not cure
+#     the named face. Non-flag tokens after the query token are DATA (the coupling lock is what makes
+#     that safe), which is why a quoted `kit-guard cmd "<probe>"` still recognizes.
+# The script position is POSITIONAL (token 1, or token 2 after a bare interpreter): an interpreter
+# FLAG (`sh -x …`, `sh -c …`) or an env-assignment prefix lands in the script slot, misses the table
+# and declines.
+_cp8b_kit_query_toks() {
+  case "$1" in
+    scripts/kit-guard)                  printf '%s' 'path cmd mcp' ;;
+    conformance/promotion-readiness.sh) printf '%s' '--class --changed' ;;
+    conformance/agent-boundary.sh)      printf '%s' '--changed --ratified' ;;
+    # GUARD-READ-LANE-3 F-i (design §2 R6, "the worst FP in the corpus"): the kit's own branch-protection
+    # check, invoked as its own header documents, is refused because its ARGUMENT lives under `profiles/`.
+    # ⚠️ SCOPE NARROWED FROM THE DESIGN, ON MEASUREMENT — see the §9 small bet in the build report.
+    # §3 Part 2 proposed admitting the WHOLE registered set (97 basenames off `verify.sh`'s dispatch
+    # lines). The bet's two halves came back clean — no registered check parses a write-mode flag, none
+    # has a literal repo-path write target, and a BEHAVIOURAL run of all 97 in their heaviest mode
+    # (`--selftest`) against a `git status --porcelain` oracle mutated the worktree ZERO times — but the
+    # third measurement decided it: that run cost **381 s** (with five checks still truncated at a 25 s
+    # cap). The Arm-A coupling lock is what makes THIS table safe, and it is safe precisely because it
+    # RUNS every declared pair on every `agent-autonomy.sh` invocation. A 97-script lock cannot ride in
+    # verify.sh or CI, and a table widened past the lock is the "fail-by-hope" this arm's own header
+    # bans. So F-i lands as what the lock can carry: one measured pair, one lock line, one census bump.
+    # The generalised form is boarded with its cost as evidence (GUARD-KIT-QUERY-REGISTERED-SET).
+    conformance/branch-protection.sh)   printf '%s' '--declared-only' ;;
+    # GUARD-TRAILER-IN-MESSAGE-FP (design §3 "Tracker read forms", §10 item 3): the config validator's reads
+    # are POSITIONAL (the conf is the argument), so they are admitted at EXACT ARITY only, by
+    # `_cp8b_kq_tracker_conf_ok`; this set names the verbs it may carry. `check-create` and `--selftest` are
+    # deliberately absent.
+    scripts/tracker-conf.sh)            printf '%s' 'get get-all get-prefix' ;;
+    # GUARD-READ-TRACKER-PREFLIGHT-CONF (design §2 D1): the post-incept re-check the kit itself prescribes,
+    # `--preflight [--as ci|dev|agent] --conf .kit/tracker.conf`, ONE shape, validated by `_cp8b_kq_tracker_contract_ok`
+    # (this set names the flags it may carry). It was CUT from the tracker-conf cut because the script reaches the
+    # network; the coupling lock now runs it hermetically (copied tree + fake adapter, and the literal real-tree
+    # run with every credential unset). `--deep --discover --fields --selftest --base --project` stay refused.
+    # SWAS-77 D3b: one more exact shape, `--fields --conf .kit/tracker.conf`, the live read of the create screen's field ids and
+    # allowed values (it prints no credential). Disclosed: it puts tracker-authored text (field names, allowed values)
+    # into the agent's context, an untrusted-input channel `board.sh show` already opens (fenced as data); named, not new.
+    conformance/tracker-contract.sh)    printf '%s' '--preflight --as --conf --fields' ;;
+    # SWAS-77 D3c: the migration DRY RUN, validated by `_cp8b_kq_board_migrate_ok` (this set names the verb it may carry).
+    # `--dry-run` writes nothing: it returns at scripts/board-migrate.sh before the preflight and before any ledger append.
+    # `.publish-identifiers` is a control-plane token in argv, which is why kit-exec declines `--screen .publish-identifiers`
+    # and a query row is needed at all.
+    scripts/board.sh)                   printf '%s' 'migrate' ;;
+  esac
+}
+# _cp8b_kq_tracker_contract_ok "<args…>": 0 iff the arguments after `conformance/tracker-contract.sh` are exactly
+# `--preflight` once, `--conf .kit/tracker.conf|./.kit/tracker.conf` once, and `--as ci|dev|agent` at most once, in any
+# order. Any other token, a repeated flag, a missing value or any other conf path declines to today's verdict.
+_cp8b_kq_tracker_contract_ok() {
+  _kcp=0; _kcc=0; _kca=0; _kcf=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --preflight) _kcp=$((_kcp + 1)); shift ;;
+      --fields) _kcf=$((_kcf + 1)); shift ;;      # SWAS-77 D3b
+      --as)
+        _kca=$((_kca + 1)); [ $# -ge 2 ] || return 1
+        case "$2" in
+          ci|dev|agent) ;;
+          *) return 1 ;;
+        esac
+        shift 2 ;;
+      --conf)
+        _kcc=$((_kcc + 1)); [ $# -ge 2 ] || return 1
+        case "$2" in
+          .kit/tracker.conf|./.kit/tracker.conf) ;;
+          *) return 1 ;;
+        esac
+        shift 2 ;;
+      *) return 1 ;;
+    esac
+  done
+  # SWAS-77 D3b: `--fields` is its OWN exact shape, `--fields --conf .kit/tracker.conf` (no `--preflight`, no `--as`), and never
+  # rides with the preflight form.
+  if [ "$_kcf" -gt 0 ]; then
+    [ "$_kcf" = 1 ] && [ "$_kcp" = 0 ] && [ "$_kcc" = 1 ] && [ "$_kca" = 0 ]
+    return
+  fi
+  [ "$_kcp" = 1 ] && [ "$_kcc" = 1 ] && [ "$_kca" -le 1 ]
+}
+# _cp8b_kq_lit_operand "<value>": a quote-free LITERAL path operand: non-empty, not flag-shaped, no `..`, and only the plain
+# literal byte set (so no `$`, glob, quote, backtick, space).
+_cp8b_kq_lit_operand() {
+  case "$1" in
+    ''|-*|*..*|*[!A-Za-z0-9._/@:+=,-]*) return 1 ;;
+  esac
+  return 0
+}
+# _cp8b_kq_board_migrate_ok "<args after migrate>": SWAS-77 D3c. 0 iff the arguments are exactly the migration DRY RUN:
+# `--from <p> --plan <p> --dry-run` once each (any order), plus optionally `--screen <p>`, `--ledger <p>` and
+# `--date <YYYY-MM-DD>` once each. `--freeze` (the writer) and every other token refuse. Every `<p>` is a quote-free literal;
+# `.publish-identifiers` is admitted only as the operand of `--screen`.
+_cp8b_kq_board_migrate_ok() {
+  _kmf=0; _kmp=0; _kmd=0; _kms=0; _kml=0; _kmt=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) _kmd=$((_kmd + 1)); shift ;;
+      --from|--plan|--screen|--ledger)
+        [ $# -ge 2 ] || return 1
+        _cp8b_kq_lit_operand "$2" || return 1
+        case "$2" in
+          *.publish-identifiers*) [ "$1" = --screen ] || return 1 ;;
+        esac
+        case "$1" in
+          --from) _kmf=$((_kmf + 1)) ;;
+          --plan) _kmp=$((_kmp + 1)) ;;
+          --screen) _kms=$((_kms + 1)) ;;
+          --ledger) _kml=$((_kml + 1)) ;;
+        esac
+        shift 2 ;;
+      --date)
+        [ $# -ge 2 ] || return 1
+        case "$2" in
+          [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+          *) return 1 ;;
+        esac
+        _kmt=$((_kmt + 1)); shift 2 ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$_kmf" = 1 ] && [ "$_kmp" = 1 ] && [ "$_kmd" = 1 ] && [ "$_kms" -le 1 ] && [ "$_kml" -le 1 ] && [ "$_kmt" -le 1 ]
+}
+# _cp8b_kq_strip_redirs "<segment>": SWAS-77 D3a. Print <segment> with its STRICT fd-dups (`N>&M`, `>&M`, `>&-`) removed and at
+# most ONE `>` / `>>` file redirect (target included) removed, and return 0; return 1 for anything else that carries a `>`.
+# The one target must be a literal absolute path whose PHYSICAL resolution is outside the protected root (a symlink out of the
+# root into it, or `..`, or a relative path, declines). `&>` and `>&word` are file writes with a different grammar and stay
+# refused whole.
+_cp8b_kq_strip_redirs() {
+  # (the fd number must stand as its own word, sec L2; the fd-dup pass runs twice so `2>&1 >&2` strips both)
+  _kq_a=$(printf '%s' "$1" | sed -E -e 's/(^|[[:space:]])[0-9]*>&([0-9]+|-)([[:space:]]|$)/\1 /g' -e 's/(^|[[:space:]])[0-9]*>&([0-9]+|-)([[:space:]]|$)/\1 /g')
+  case "$_kq_a" in
+    *'>'*) : ;;
+    *) printf '%s' "$_kq_a"; return 0 ;;
+  esac
+  case "$_kq_a" in
+    *'&>'*|*'>&'*) return 1 ;;
+  esac
+  _kq_n=$(printf '%s' "$_kq_a" | tr -cd '>' | wc -c | tr -d ' ')
+  case "$_kq_n" in
+    1|2) : ;;
+    *) return 1 ;;
+  esac
+  _kq_t=$(printf '%s' "$_kq_a" | sed -E -n 's/^[^>]*>>?[[:space:]]*([^[:space:]]+).*$/\1/p')
+  [ -n "$_kq_t" ] || return 1
+  _kq_b=$(printf '%s' "$_kq_a" | sed -E 's/(^|[[:space:]])[0-9]*>>?[[:space:]]*[^[:space:]]+/\1 /')
+  case "$_kq_b" in
+    *'>'*) return 1 ;;
+  esac
+  [ -n "${PROTECTED_ROOT:-}" ] || return 1
+  _kq_p=$(_cp8b_abs_literal_phys "$_kq_t") || return 1
+  _kq_r=$(_resolve_physical "$PROTECTED_ROOT") || return 1
+  case "$_kq_p/" in
+    "$_kq_r"/*) return 1 ;;   # KQ-OUTSIDE
+  esac
+  printf '%s' "$_kq_b"
+}
+# _cp8b_kq_tracker_conf_ok "<args…>": 0 iff the arguments after `scripts/tracker-conf.sh` are exactly
+# `<conf>` (one non-flag token, not a verb) or `get|get-all|get-prefix <arg> <conf>` (arity 3, no flag-shaped
+# token). Any other arity or shape declines to today's verdict. The arity is what the script itself enforces.
+_cp8b_kq_tracker_conf_ok() {
+  case $# in
+    1)
+      case "$1" in
+        -*|get|get-all|get-prefix|check-create) return 1 ;;
+      esac
+      return 0 ;;
+    3)
+      _cp8b_in_list "$1" "$(_cp8b_kit_query_toks scripts/tracker-conf.sh)" || return 1
+      case "$2" in
+        -*) return 1 ;;
+      esac
+      case "$3" in
+        -*) return 1 ;;
+      esac
+      return 0 ;;
+  esac
+  return 1
+}
+_cp8b_tad_is_kit_query() {
+  # SWAS-77 D3a: `<` stays refused. A strict fd-dup (`N>&M`, `>&M`, `>&-`) is removed, and ONE `>` / `>>` file target that is a
+  # literal ABSOLUTE path whose PHYSICAL resolution is outside the protected root is removed; any other `>` (`&>`, `>&word`, a
+  # relative or control-plane-relative target, a second redirect) still refuses the whole segment, exactly as before.
+  _kqseg=$1
+  case "$_kqseg" in
+    *'<'*) return 1 ;;
+    esac
+  case "$_kqseg" in
+    *'>'*)
+      # FORK-FREE precheck (review 4): this arm is consulted for EVERY segment at the confident root, and `npm test > /tmp/o 2>&1`
+      # must add no fork. Peel a bare interpreter and require the next token to be one of the table's scripts (the same names as
+      # `_cp8b_kit_query_toks`; a script added there must be added here) before paying for the sed/tr/wc strip below.
+      _kqp=${_kqseg#"${_kqseg%%[![:space:]]*}"}
+      case "$_kqp" in
+        sh[[:space:]]*|bash[[:space:]]*|dash[[:space:]]*|zsh[[:space:]]*|ksh[[:space:]]*)
+          _kqp=${_kqp#*[[:space:]]}; _kqp=${_kqp#"${_kqp%%[![:space:]]*}"} ;;
+      esac
+      _kqp=${_kqp#./}
+      case "$_kqp" in
+        scripts/kit-guard[[:space:]]*|conformance/promotion-readiness.sh[[:space:]]*|conformance/agent-boundary.sh[[:space:]]*|\
+        conformance/branch-protection.sh[[:space:]]*|scripts/tracker-conf.sh[[:space:]]*|conformance/tracker-contract.sh[[:space:]]*|\
+        scripts/board.sh[[:space:]]*) : ;;
+        *) return 1 ;;
+      esac
+      _kqseg=$(_cp8b_kq_strip_redirs "$_kqseg") || return 1 ;;
+    esac
+  case "$_kqseg" in
+    *'$'*|*'`'*) return 1 ;;
+    esac
+  _kqg=0; case "$-" in
+    *f*) _kqg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_kqseg
+  [ $# -gt 0 ] || { [ "$_kqg" = 1 ] || set +f; return 1; }
+  case "$1" in
+    sh|bash|dash|zsh|ksh) shift ;;
+    esac      # bare interpreter lead: script is next
+  [ $# -gt 0 ] || { [ "$_kqg" = 1 ] || set +f; return 1; }
+  _kqs=$(_cp8b_dequote "$1"); _kqs=${_kqs#./}; shift
+  case "$_kqs" in
+    *..*) [ "$_kqg" = 1 ] || set +f; return 1 ;;
+    esac
+  _kqv=$(_cp8b_kit_query_toks "$_kqs")
+  [ -n "$_kqv" ] || { [ "$_kqg" = 1 ] || set +f; return 1; }
+  [ $# -gt 0 ] || { [ "$_kqg" = 1 ] || set +f; return 1; }
+  if [ "$_kqs" = scripts/tracker-conf.sh ]; then   # GUARD-TRAILER-IN-MESSAGE-FP: positional, exact arity
+    # design §12 S2: a relative script is attacker-authored after a `cd`, so (as for board.sh) only at the confident root.
+    if [ -z "${_CP8B_EFF:-}" ] && [ "${_CP8B_EFF_UNKNOWN:-0}" = 0 ]; then
+      _cp8b_kq_tracker_conf_ok "$@" && _kqr=0 || _kqr=1
+    else _kqr=1; fi
+    [ "$_kqg" = 1 ] || set +f
+    return "$_kqr"
+  fi
+  if [ "$_kqs" = conformance/tracker-contract.sh ]; then   # GUARD-READ-TRACKER-PREFLIGHT-CONF: one exact shape, confident root only
+    if [ -z "${_CP8B_EFF:-}" ] && [ "${_CP8B_EFF_UNKNOWN:-0}" = 0 ]; then
+      _cp8b_kq_tracker_contract_ok "$@" && _kqr=0 || _kqr=1
+    else _kqr=1; fi
+    [ "$_kqg" = 1 ] || set +f
+    return "$_kqr"
+  fi
+  if [ "$_kqs" = scripts/board.sh ]; then   # SWAS-77 D3c: `board.sh migrate … --dry-run`, confident root only
+    # (The walk-state test below is a BELT only: the control is the `_kroot` gate at the call site, which the launder arm cannot
+    # reach. It is kept so a direct caller cannot get the row off the confident root. sec L4.)
+    if [ -z "${_CP8B_EFF:-}" ] && [ "${_CP8B_EFF_UNKNOWN:-0}" = 0 ]; then
+      case "$1" in
+        migrate) shift; _cp8b_kq_board_migrate_ok "$@" && _kqr=0 || _kqr=1 ;;
+        *) _kqr=1 ;;
+      esac
+    else _kqr=1; fi
+    [ "$_kqg" = 1 ] || set +f
+    return "$_kqr"
+  fi
+  _cp8b_in_list "$1" "$_kqv" || { [ "$_kqg" = 1 ] || set +f; return 1; }
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) _cp8b_in_list "$1" "$_kqv" || { [ "$_kqg" = 1 ] || set +f; return 1; } ;;
+    esac
+    shift
+  done
+  [ "$_kqg" = 1 ] || set +f
+  return 0
+}
+
+# GUARD-READONLY-FP-RELIEF Arm B — shell TEST EXPRESSIONS (cures register face N1). `test -f <cp>`
+# and `[ -f <cp> ]` interrogate a path's METADATA; neither builtin can mutate the path it names, so
+# a control-plane token there is DATA in the strictest sense.
+#
+# ***THE LEAD SET IS `test` AND `[` ONLY — `if`/`elif` ARE DELIBERATELY EXCLUDED*** (security vet C1,
+# substantiated live). `if`/`elif` do not introduce a test EXPRESSION; they introduce a COMMAND whose
+# exit status is tested. `if rm <cp>; then :; fi` and `if node write.js <cp>; then :; fi` both wear
+# the same "lead + operands" shape as a real test and both MUTATE. Re-adding either keyword to this
+# case arm is a write-surface widening, and mutant M-B2 in agent-autonomy.sh exists to catch exactly
+# that. An `if [ -f <cp> ]` false positive is cured only TRANSITIVELY — when the segmenter yields the
+# inner `[ …` as its own segment; otherwise it keeps today's deny plus the §3 tip.
+#
+# Decline-on-ANY (a bug here over-denies): any redirect byte; any `$`/backtick; any flag-shaped token
+# that is not EXACTLY a single-letter operator (`-exec`, `--remove`, `-pi` all decline — a long flag
+# is an unknown, and the numeric comparators `-eq`/`-lt`/… decline with them, a disclosed over-deny
+# on expressions that carry no path anyway); any token that is a known mutator verb.
+# The mutator-verb list is a BELT: `_cp8b_control_plane_denied`'s verb regex already denies every
+# member on this route, so no fixture can separate the two (stated, not claimed as coverage — the
+# `_kx` precedent at C4 Arm 2). It is kept because the two lists drift independently.
+_CP8B_TEST_MUTATORS='rm rmdir mv cp ln dd tee sed chmod chown install rsync shred truncate patch awk find sort uniq xxd git'
+_cp8b_tad_is_test_expr() {
+  case "$1" in
+    *'>'*|*'<'*) return 1 ;;
+    esac
+  case "$1" in
+    *'$'*|*'`'*) return 1 ;;
+    esac
+  _teg=0; case "$-" in
+    *f*) _teg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -gt 0 ] || { [ "$_teg" = 1 ] || set +f; return 1; }
+  case "$1" in
+    test|'[') shift ;;
+    *) [ "$_teg" = 1 ] || set +f; return 1 ;;
+    esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -[A-Za-z]) : ;;                                    # a single-letter test operator
+      -*) [ "$_teg" = 1 ] || set +f; return 1 ;;         # -exec / --remove / -pi / -eq -> unknown
+      ']'|'!'|'='|'!='|'-') : ;;                          # expression punctuation
+      *) if _cp8b_in_list "$1" "$_CP8B_TEST_MUTATORS"; then [ "$_teg" = 1 ] || set +f; return 1; fi ;;
+    esac
+    shift
+  done
+  [ "$_teg" = 1 ] || set +f
+  return 0
+}
+
+# E3 — message carriers: git commit/merge/tag + gh pr/issue/release with a message flag and NO
+# redirect. A control-plane hit is inside the message DATA, not a target (an injected `;` splits to its
+# own segment and is judged there). The enforcement counterpart of the advisory _cp8b_message_tip.
+#
+# design §12 A: the exemption is LEAD-KEYED. It was a substring match, so `bash -c "true; cp /tmp/e <cp-path>"
+# x --title "gh pr"` — whose split fragment merely CONTAINED `gh pr` — wore the message costume (the C1 lesson of
+# 2026-08-19, applied to the function that missed it). The segment's first two whitespace-normalised tokens
+# must be a carrier pair; anything else (a `git -C d commit`, an env prefix, a group opener) declines and keeps
+# the scan, an over-deny and never a bypass.
+_cp8b_tad_is_msg_carrier() {
+  _mcs=$1
+  _mcg=0; case "$-" in
+    *f*) _mcg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split of the segment; globbing disabled above
+  set -- $_mcs
+  _mcr=1
+  case "${1:-} ${2:-}" in
+    'git commit'|'git merge'|'git tag'|'gh pr'|'gh issue'|'gh release') _mcr=0 ;;
+  esac
+  [ "$_mcg" = 1 ] || set +f
+  [ "$_mcr" = 0 ] || return 1
+  case "$_mcs" in
+    *'>'*) return 1 ;;
+    esac
+  set -- "$_mcs"
+  _gmq message-carrier "$1" -Eq '(^|[[:space:]])(-m|-F|--message|--body|--body-file|--notes|--title)([=[:space:]]|$)'
+}
+
+# GUARD-TRAILER-IN-MESSAGE-FP (design §3, §10 item 2): `sh scripts/board.sh create`'s `--title`,
+# `--description` and `--field` values are text or tokens, never paths; its flag set is closed and the
+# md backend writes nothing. Keyed on the LEAD TOKENS, ONLY at the confident repo root (delta C1: under a
+# `cd /tmp/x` the relative script is attacker-authored), and NEVER added to the substring matcher
+# `_cp8b_tad_is_msg_carrier` above (delta C2: that would re-open the trailing-comment theft). Declines on
+# a redirect, `$` or a backtick in the segment. `_cp8b_seg_poisons` still runs at the call site.
+_cp8b_tad_is_board_create() {
+  case "$1" in
+    *'>'*|*'<'*|*'$'*|*'`'*) return 1 ;;
+  esac
+  [ -z "$_CP8B_EFF" ] && [ "${_CP8B_EFF_UNKNOWN:-0}" = 0 ] || return 1
+  _cp8b_lead_is_board_create "$1"
+}
+
+# _cp8b_tad_pathhit "<segment>": trigger 1 — string-level pathhit (single source of truth).
+_cp8b_tad_pathhit() { _cp8b_pathhit "$1"; }
+
+# _cp8b_tad_literal_tok "<segment>": trigger 2 — a LITERAL token classifies control-plane (M2 union:
+# the literal arm is retained alongside the composed arm; a climb-out desync can never remove it).
+_cp8b_tad_literal_tok() {
+  _lpg=0; case "$-" in
+    *f*) _lpg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  while [ $# -gt 0 ]; do
+    if _cp8b_tok_is_cp "$1"; then [ "$_lpg" = 1 ] || set +f; return 0; fi
+    shift
+  done
+  [ "$_lpg" = 1 ] || set +f
+  return 1
+}
+
+# _cp8b_tad_composed_tok "<segment>": trigger 3 — a cd-COMPOSED token (or composed redirect target)
+# classifies control-plane.
+_cp8b_tad_composed_tok() {
+  [ -n "$_CP8B_EFF" ] || return 1
+  _cts=$1                                # capture BEFORE set -- consumes the positionals (FIX 1)
+  _cpg=0; case "$-" in
+    *f*) _cpg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  while [ $# -gt 0 ]; do
+    if _cp8b_composed_is_cp "$1"; then [ "$_cpg" = 1 ] || set +f; return 0; fi
+    shift
+  done
+  [ "$_cpg" = 1 ] || set +f
+  # A GLUED redirect (`>pre-push`) is one token that composes to `hooks/>pre-push` (not CP), so the
+  # loop above misses it; the redirect-target parse recovers the bare target. Passing $1 here was DEAD
+  # CODE — the loop's `shift` empties the positionals, so the old `"$1"` was always "" (FIX 1).
+  _cp8b_tad_redir_cp "$_cts"
+}
+
+# === GUARD-TRAILER-IN-MESSAGE-FP design §14 — a GLOB in a write-verb operand =====================
+# `cp /tmp/e sk*`, `install /tmp/e sk*/build/SKILL.md`, `tee sk*/build/SKILL.md`, `cp /tmp/e *` were never matched
+# against the control-plane paths: the shell expands the glob AFTER the guard has judged the literal bytes.
+# THE CURE refuses on doubt and does not parse: expand the operand's glob segments against the ON-DISK tree the shell
+# would see (`case` as the pattern matcher, one segment per level, `set -f` held except for the listing), and deny
+# if ANY path it can reach is control-plane (a control-plane root makes everything beneath it one, so the walk stops
+# at the first hit). An absolute or `~` operand is walked from `/` (or `$HOME`). An uncertain cwd with a glob denies. Reads never reach here.
+# $1 = a path the glob reaches, $2 = the pattern segments still to come. A bare DIRECTORY name (`_ctm_match`) counts only
+# when the glob ENDS on it (`sk*` names the directory itself); on the way down only a file-level hit counts, so the
+# standing ruling that `cp a agents/foo*` is not a protected leaf is kept.
+_cp8b_glob_cp_path() {
+  is_control_plane_path "$1" && return 0
+  [ -z "$2" ] || return 1
+  case "$1" in
+    /*) _ctm_match "$1" && return 0; is_control_plane_path "$1/x"; return ;;   # absolute: the same suffix classifier the literal path gets
+    */*) return 1 ;;      # a NESTED directory name (`docs/governance`) keeps the standing broad-glob relief (`cp x docs/*`)
+  esac
+  _ctm_match "$1"
+}
+# design §15: the walk is bounded by WORK, not time. Every directory entry examined (and every literal-segment probe)
+# counts against `_gwq`, shared by every operand of the whole COMMAND (reset once in `guard_check_command`); past the budget the walk gives up and DENIES. A hook that
+# runs long is killed by the harness, and a killed hook does not block the command, so an unbounded walk
+# (`/usr/*/*/*/*/zz`: 20 s, `/System/*/*/*/*/zz`: 43 s) would FAIL OPEN. 1000 is ~8x the largest count a legitimate glob
+# in the corpus reaches (a repo-root listing is ~44 entries, `/tmp/*.bak` ~120); measured, it bounds the worst probe
+# (`/System/*/*/*/*/*/zz`) at ~3 s where 2000 took 7 s. No clock.
+_CP8B_GLOB_BUDGET=1000
+# _cp8b_glob_walk "<pattern>" ["/"]: with a second argument "/" the pattern is ABSOLUTE and the walk starts at the root
+# (design §14 follow-up). The six-segment cap counts from the FIRST glob segment, so a deep literal prefix is not penalised.
+_cp8b_glob_walk() {
+  _gwr=$1; _gwc=${2:-.}; _gwn=0; _gwg=0; _gwprobe=0
+  while [ -n "$_gwr" ]; do
+    case "$_gwr" in
+      */*) _gws=${_gwr%%/*}; _gwr=${_gwr#*/} ;;
+      *)   _gws=$_gwr; _gwr='' ;;
+    esac
+    case "$_gws" in
+      *[*?[]*) _gwg=1 ;;
+    esac
+    [ "$_gwg" = 0 ] || { _gwn=$((_gwn + 1)); [ "$_gwn" -le 6 ] || return 0; }   # deeper than six glob-side segments: doubt
+    [ -n "$_gws" ] || continue
+    _gwx=''
+    while [ -n "$_gwc" ]; do
+      case "$_gwc" in
+        *"$_cp8b_nl"*) _gwd=${_gwc%%"$_cp8b_nl"*}; _gwc=${_gwc#*"$_cp8b_nl"} ;;
+        *)             _gwd=$_gwc; _gwc='' ;;
+      esac
+      case "$_gws" in
+        *[*?[]*)
+          # design §16 R3: a BOUNDED stream, not a shell expansion — `for e in dir/*` expands and sorts the whole directory
+          # before anything is counted, so a huge pre-staged directory outlasted the hook timeout. `head -n` stops `find`
+          # after (remaining budget + 1) entries, and a full list means the budget is exceeded: DENY.
+          _gwl=${_gwd%/}
+          _gwlim=$((_CP8B_GLOB_BUDGET - ${_gwq:-0} + 1))
+          [ "$_gwlim" -gt 0 ] || return 0
+          # OPTION INJECTION: `_gwl` comes from the command text or a directory name the agent created, so it can begin with `-`
+          # (`mkdir -- -delete`; GNU find would read `-delete` as an expression and delete the hook's cwd). Never hand find a path
+          # that can start with `-`: a relative path gets `./`, an absolute one starts with `/`, and `.` is safe as it stands.
+          case "$_gwl" in
+            ''|/*|.) _gwf=${_gwl:-/} ;;
+            *)       _gwf=./$_gwl ;;
+          esac
+          # An END MARKER inside the same `$(…)`: a find or fork that dies mid-pipeline aborts the subshell before the printf, so a
+          # missing marker is a FAILED listing (never an empty directory, the #738 class) and DENIES.
+          # GUARD-SPELLING-RESIDUALS C1: the pipeline's status is `head`'s, so a `find` that fails or is MISSING (127) used to read
+          # as an empty directory. Probe it once per walk, in its own `$(…)` (a find that kills its parent dies with that subshell and
+          # prints no `ok`): no `ok` is a FAULT and DENIES. A group `{ find || printf fault; } | head` was tried and rejected: the group
+          # is itself a pipeline subshell, so a find that kills its parent erased the fault line and read as empty again (GTM-F1, Linux).
+          if [ "${_gwprobe:-0}" = 0 ]; then
+            _gwok=$(find -H . -maxdepth 0 >/dev/null 2>&1 && printf ok) || _gwok=''
+            [ "$_gwok" = ok ] || { _cp8b_gsr_tip=' TIP: the guard lists directories with find and it failed or is missing: make find available on PATH, or name the file literally. (escape card R26 find-fault)'; return 0; }
+            _gwprobe=1
+          fi
+          _gwlist=$(find -H "$_gwf" -mindepth 1 -maxdepth 1 2>/dev/null | head -n "$_gwlim"; printf '%s' "$_cp8b_etx") || return 0
+          case "$_gwlist" in
+            *"$_cp8b_etx") _gwlist=${_gwlist%"$_cp8b_etx"} ;;
+            *) return 0 ;;
+          esac
+          _gwrest=$_gwlist
+          while [ -n "$_gwrest" ]; do
+            case "$_gwrest" in
+              *"$_cp8b_nl"*) _gwe=${_gwrest%%"$_cp8b_nl"*}; _gwrest=${_gwrest#*"$_cp8b_nl"} ;;
+              *)             _gwe=$_gwrest; _gwrest='' ;;
+            esac
+            [ -n "$_gwe" ] || continue
+            _gwq=$((${_gwq:-0} + 1)); [ "$_gwq" -le "$_CP8B_GLOB_BUDGET" ] || return 0
+            _gwb=${_gwe##*/}
+            # leading-dot entries are ALWAYS considered: bash `dotglob` / zsh `GLOB_DOTS` make `*` and `?` match them and the agent can set
+            # either itself, so the guard cannot know the shell's glob options (refuse on doubt)
+            case "$_gwb" in
+              $_gws) : ;;
+              *) continue ;;
+            esac
+            _gwp=${_gwe#./}
+            if _cp8b_glob_cp_path "$_gwp" "$_gwr"; then return 0; fi
+            [ -d "$_gwe" ] && _gwx="$_gwx$_gwp$_cp8b_nl"
+          done
+          ;;
+        *)
+          _gwq=$((${_gwq:-0} + 1)); [ "$_gwq" -le "$_CP8B_GLOB_BUDGET" ] || return 0
+          if [ "$_gwd" = . ]; then _gwp=$_gws; else _gwp=${_gwd%/}/$_gws; fi
+          if _cp8b_glob_cp_path "$_gwp" "$_gwr"; then return 0; fi
+          [ -d "$_gwp" ] && _gwx="$_gwx$_gwp$_cp8b_nl" ;;
+      esac
+    done
+    _gwc=${_gwx%"$_cp8b_nl"}
+    [ -n "$_gwc" ] || [ -z "$_gwr" ] || return 1                  # nothing left to descend into
+  done
+  return 1
+}
+# _cp8b_glob_operand_denied "<seg>": 0 iff a non-flag operand of this write-verb segment carries an unquoted glob byte
+# and could expand onto a control-plane path. Fail closed: any odd state denies.
+_cp8b_glob_operand_denied() {
+  _gog=0; case "$-" in
+    *f*) _gog=1 ;;
+    esac
+  _gov=${2:-}; _gosg=$1
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -gt 0 ] && shift
+  # design §16 R3/R5: collect the candidates first. `-t X`, `-tX` and `--target-directory[=]X` are DESTINATIONS (R5). For cp and
+  # install only the destination can write the control plane, so only it is walked — a huge SOURCE glob is never listed (R3);
+  # every other verb (mv moves its sources away, rm, tee, ...) walks every operand. `sed` counts only with `-i`.
+  _goc=''; _goa=''; _gol=''; _gos=0
+  while [ $# -gt 0 ]; do
+    _got=$1; shift
+    # a quoted flag (`sed "-i"`) is the same flag
+    _gotf=$_got
+    case "$_got" in
+      '"'*|"$_cp8b_sq"*) _gotf=$(_cp8b_dequote "$_got") || _guard_fault glob-flag-dequote ;;
+    esac
+    case "$_gotf" in
+      -t|--target-directory) if [ $# -gt 0 ]; then _goc="$_goc $1"; shift; fi; continue ;;
+      --target-directory=*)  _goc="$_goc ${_gotf#*=}"; continue ;;
+      -t?*)                  _goc="$_goc ${_gotf#-t}"; continue ;;
+      -i*|-I*|--i*)          _gos=1; continue ;;   # GSR C4b: GNU -i / --in-place and its `--in` abbreviations, BSD -I
+      -[!-]*)
+        # GSR C4b: `-ni`, `-Ei`: i before the first value letter
+        _gof=${_gotf#-}
+        case "${_gof%%[efl]*}" in
+          *[iI]*) _gos=1 ;;
+        esac
+        continue ;;
+      -*)                    continue ;;
+      of=*)                  _got=${_gotf#of=} ;;
+    esac
+    _gol=$_got; _goa="$_goa $_got"
+  done
+  if [ "$_gov" = sed ] && [ "$_gos" = 0 ]; then [ "$_gog" = 1 ] || set +f; return 1; fi
+  case "$_gov" in
+    cp|install) if [ -n "$_goc" ]; then :; else _goc=" $_gol"; fi
+      # GSR C2: under cp/install doubt (a `#` comment or an odd quote) the last token is not the destination: walk EVERY operand
+      case "$_goa" in
+        *[*?[]*)
+          if _cp8b_cp_doubt "$_gosg"; then
+            _goc="$_goc$_goa"
+            _cp8b_gsr_tip=' TIP: a # comment or an unbalanced quote beside a cp/install glob makes the guard walk every operand: drop the # comment (or the stray quote), or name the files literally. (escape card R25 cp-comment-glob)'
+          fi ;;
+      esac ;;
+    *)          _goc="$_goc$_goa" ;;
+  esac
+  _gor=1
+  # shellcheck disable=SC2086  # deliberate word-split of the candidate list; globbing is off
+  for _got in $_goc; do
+    case "$_got" in
+      *[*?[]*) : ;;
+      *) continue ;;
+    esac
+    _got=$(_cp8b_dequote "$_got")
+    [ -n "$_got" ] || { _gor=0; break; }                    # an empty operand after de-quoting is a fault: deny
+    # design §14 follow-up: a `~` operand is HOME-rooted (any `~user` form denies on doubt), an absolute operand is walked
+    # from `/`; matches are classified by the same suffix patterns a literal absolute path already gets.
+    case "$_got" in
+      '~'|'~/'*) if [ -z "${HOME:-}" ]; then _gor=0; break; fi; _got=$HOME${_got#'~'} ;;
+      '~'*) _gor=0; break ;;
+    esac
+    case "$_got" in
+      /*) if _cp8b_glob_walk "${_got#/}" /; then _gor=0; break; fi; continue ;;
+    esac
+    _got=${_got#./}
+    if [ "${_CP8B_EFF_UNKNOWN:-0}" = 1 ]; then _gor=0; break; fi
+    [ -z "${_CP8B_EFF:-}" ] || _got=$_CP8B_EFF/$_got
+    if _cp8b_glob_walk "$_got"; then _gor=0; break; fi
+  done
+  [ "$_gog" = 1 ] || set +f
+  return $_gor
+}
+
+# E6 — cp/install destination-binding: judge the copy DESTINATION (literal last token, per :1004-1005,
+# OR the composed destination), not "any control-plane token" — so `cp conformance/verify.sh /tmp/b`
+# (copy-OUT) stays ALLOW while `cd conformance && cp /tmp/x verify.sh` denies. Declines to close the
+# open GUARD-CP-HARDLINK-ALIAS row (cp -l aliasing) — leaves it exactly as today, stated not claimed.
+_cp8b_tad_cp_dest_denied() {
+  _cp8b_cp_target_in last "$1" && return 0
+  # design §11: with a whitespace-preceded `#` the composed (cd-relative) operands are judged too.
+  if _cp8b_cp_doubt "$1"; then _cp8b_tad_composed_tok "$1" && return 0; fi
+  _cd=$(printf '%s' "$1" | awk '{for(i=NF;i>=1;i--) if(substr($i,1,1)!="-"){print $i; exit}}') || _guard_fault cp-dest-view
+  _cp8b_composed_is_cp "$_cd" && return 0
+  _cp8b_tad_redir_cp "$1"
+}
+
+# _cp8b_redir_launder_denied "<seg>": GUARD-CP-WRITE-ROUTES Cure 2 outright-deny — a READER / KIT-EXEC
+# segment whose redirect target is NON-LITERAL (glob / $VAR / $(…) / backslash — _redir_targets rc 2)
+# denies OUTRIGHT. Such a launder verb (printf/cat/`sh conformance/verify.sh`) declined recognition
+# above precisely because its target disqualified; when there is ALSO no literal control-plane substring
+# to trip the pathhit trigger (`printf x > hooks/pre-pus*` — a glob the shell would expand onto the real
+# hook), nothing else denies it. This arm is that closer, and it is the disclosed `reader > $OUT`
+# over-deny made real. SCOPED to reader/kit-exec (the disclosed ceiling, not every verb): recognition is
+# re-tested on a redirect-STRIPPED copy, so an ordinary `make > $OUT` is NOT a laundering verb and stays
+# allowed. Reuses the shared _redir_targets disqualifier (K-R1a pins this arm's disqualifier).
+#
+# GUARD-READONLY-FP-RELIEF Arm G(i) — THE CLOSE (this half DENIES MORE). Recognition ran on the
+# segment's own lead, so wrapping the laundering verb in a brace group or subshell moved the redirect
+# into a `}`/`)`-led segment this arm did not recognize, and the whole Cure-2 closure fell to two
+# bytes: `{ printf evil ; } > $VAR/pre-push` and `( printf evil ) > $VAR/pre-push` were both MEASURED
+# ALLOW at the 2026-08-19 probe. `_cp8b_strip_group` peels the group tokens and recognition is
+# re-tested on the residual; a segment that is ONLY a group CLOSE (or has no verb at all — a bare
+# `> $V/pre-push` truncate) is itself the laundering site and denies.
+# DISCLOSED OVER-DENY, fixtured both ways: this is scoped by SEGMENT SHAPE, not by what the group
+# contains — those live in a different segment. So `{ make ; } > $OUT` now denies while the bare
+# `make > $OUT` still allows (the deliberate "not a laundering verb" scope). Spell the target
+# literally, or drop the braces.
+_cp8b_strip_group() {
+  printf '%s' "$1" | sed -E 's/^[[:space:]]*[{(][[:space:]]+//; s/[[:space:]]*[})][[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+# === GUARD-READ-EXEC-LANE (K-3a) fix round 1, security F1 — THE PRE-TIER LEXICON =================
+# ⚠️ THE LAUNDER ARM IS A *DENY-SIDE* CONSUMER OF `_cp8b_tad_is_read`, and that inverts the safety of
+# every narrowing made to the recogniser. This arm denies BECAUSE the lead is read-recognised; faces 1
+# and 3 taught the recogniser to answer "not a read" for an unvetted flag, a `git -c` and `git stash`,
+# and the arm then went SILENT on exactly those. Ten spellings were MEASURED built=ALLOW /
+# pristine=DENY — `rg --pre <exec> x /tmp/y > $V/pre-push`, `column -t /tmp/a > $V/pre-push`,
+# `git stash list > $V/pre-push`, … — i.e. the narrowing OPENED a write route. (The same inversion the
+# vet's HIGH finding named for `_CP8B_RES_POISON`, one function further out.)
+# THE FIX IS TO ASK A DIFFERENT QUESTION HERE. This arm does not need to know whether the segment is a
+# permitted read; it needs to know whether the segment is a LAUNDERING VERB — a verb whose ordinary job
+# is to emit bytes, so that a redirect after it can carry those bytes onto a control-plane path. That
+# question is answered by the PRE-TIER lexicon: the plain read verbs plus the verbs faces 1/3 moved
+# into tiers, and `git` with any read-ish sub including `stash`. Flags are irrelevant to it.
+# K-3a-M8 pins it; `K-3a-C-launder2`…`11` are the ten measured spellings, and `cat`/`grep -n`/`git log`
+# with the same redirect are the liveness controls.
+_CP8B_LAUNDER_GIT_SUBS='stash'
+# ⚠️ THE LEAD IS TAKEN AS THE CALLER ALREADY PREPARED IT — `_cp8b_dequote_lead` upstream — and is NOT
+# re-dequoted here. That is deliberate: re-dequoting would RE-LOCK T8's finding F-4 independently and
+# leave `M-L1` (the mutant that proves the upstream de-quote is load-bearing) reporting "verdict did
+# not change; the leg proves nothing" — measured. A new check must not silently remove an old proof.
+_cp8b_launder_lead() {
+  _lll=$(_cp8b_lead "$1")
+  _cp8b_in_list "$_lll" "$_CP8B_READ_VERBS" && return 0
+  _cp8b_in_list "$_lll" "$_CP8B_READ_VERBS_TIERED" && return 0
+  [ "$_lll" = git ] || return 1
+  _llg=$(_cp8b_git_sub "$1")
+  _cp8b_in_list "$_llg" "$_CP8B_GIT_READ_SUBS" && return 0
+  _cp8b_in_list "$_llg" "$_CP8B_LAUNDER_GIT_SUBS"
+}
+_cp8b_redir_launder_denied() {
+  case "$1" in
+    *'>'*) : ;;
+    *) return 1 ;;
+    esac
+  _redir_targets "$1" >/dev/null && return 1   # rc 0 => every target is a plain literal => not this arm
+  _lnr=$(printf '%s' "$1" | sed -e 's/[0-9]*>>*.*$//')   # drop from the first redirect operator onward
+  # T8 review finding F-3 — TWO VIEWS, and the caller passes the MASKED segment. That is right for the
+  # metachar work above (`case *'>'*`, `_redir_targets`, and this strip): on the masked copy only a
+  # REAL redirect operator is still a `>`. It is WRONG for the lexicon lookups below, which key on the
+  # lead verb: a sentinel byte anywhere in the lead token names no verb, so the arm would fall through
+  # and ALLOW. `_lnu` is the true-byte view for those; `$_lnr` is handed on as the metachar view via
+  # the recognisers' second parameter, so their own redirect bails keep seeing real operators only.
+  _lnu=$(_cp8b_unmask_quoted "$_lnr")
+  # T8 review finding F-4 — and the lead is judged DE-QUOTED, T7's cure one function over. MEASURED at
+  # pristine 4b3debc3 and at 41d4278e: `grep x > .cl*/hooks/gu*` DENIED here while `'grep' x >
+  # .cl*/hooks/gu*` ALLOWED — the raw lead token `'grep'` matched no read verb, this arm declined, and
+  # the glob (which resolves to guard-core.sh ALONE) truncated the guard. One pair of quotes. M-L1
+  # pins it. De-quoting can only ever make this arm recognise MORE laundering verbs, i.e. deny more.
+  _lnd=$(_cp8b_dequote_lead "$_lnu")
+  _cp8b_launder_lead "$_lnd" && return 0                 # K-3a F1: the PRE-TIER question, asked FIRST
+  _cp8b_tad_is_read "$_lnd" "$_lnr" && return 0
+  _cp8b_tad_is_kit_exec "$_lnd" "$_lnr" && return 0
+  _lng=$(_cp8b_dequote_lead "$(_cp8b_strip_group "$_lnu")")
+  case "$_lng" in
+    ''|'}'|')') return 0 ;;
+    esac           # a bare group CLOSE / verbless redirect
+  _cp8b_launder_lead "$_lng" && return 0
+  _cp8b_tad_is_read "$_lng" "$_lnr" && return 0
+  _cp8b_tad_is_kit_exec "$_lng" "$_lnr" && return 0
+  return 1
+}
+
+# _cp8b_target_reason "<segment>" "<trigger>": signpost the composition and name the cheap escape.
+# === GUARD-CWD-CONFIDENCE-UNKNOWN Face B — the disqualifier ====================================
+# _cp8b_rel_operand_in "<seg>": 0 iff the segment carries at least one RELATIVE, NON-FLAG operand
+# after its lead token. This is not target parsing and it must never become target parsing: it asks
+# only "does this write name something whose meaning depends on where we are standing?". An absolute
+# operand is fully determined wherever the shell is, so it is not disqualifying; a flag is not a
+# path. Globbing is disabled around the word-split so a `*` operand cannot expand against the real
+# filesystem (the same discipline _cp8b_cp_target_in uses).
+_cp8b_rel_operand_in() {
+  _rog=0; case "$-" in
+    *f*) _rog=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  [ $# -gt 0 ] && shift        # drop the lead verb
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*|/*|'') : ;;
+      *) [ "$_rog" = 1 ] || set +f; return 0 ;;
+    esac
+    shift
+  done
+  [ "$_rog" = 1 ] || set +f
+  return 1
+}
+
+# _cp8b_group_peel "<seg>": the segment with any leading `(`, `{`, `;` and whitespace stripped.
+# S-H1 (security seat, HIGH). `_cp8b_lead` reports the first token verbatim, so `(sed -i … verify.sh)`
+# leads with `(sed` and `{ sed …; }` leads with `{` — neither is `sed`, and the Face-B dispatch never
+# fired for either. THIS IS A PEEL, NOT A PARSE, and the distinction is the whole of D-240813-3: it
+# removes bytes that can only ever be group punctuation and asks the SAME question of what remains.
+# It cannot resolve anything, cannot fail open, and is the identical shape as the wrapper peels the
+# guard already performs. Nothing downstream sees the peeled copy — it is used ONLY to ADD denies.
+_cp8b_group_peel() { printf '%s' "$1" | sed -E 's/^([[:space:]]*[({;]+[[:space:]]*)+//'; }
+
+# _cp8b_cwd_redir_in "<seg>": 0 iff the segment carries a redirect whose target is RELATIVE, or one
+# whose target cannot be read at all. Reuses the SHARED _redir_targets extractor rather than a second
+# `>`-scan, so the two can never drift: rc 3 is its "non-literal target" answer (a redirect exists and
+# cannot be resolved — fail closed), and its output is the literal targets.
+# AN ABSOLUTE TARGET IS NOT DISQUALIFYING, and that is deliberate rather than an oversight: `> /tmp/x`
+# names the same file wherever the shell is standing, so a lost cwd tells you nothing about it and
+# denying it would be friction bought for nothing.
+_cp8b_cwd_redir_in() {
+  _crc=0; _cri=$(_redir_targets "$1") || _crc=$?
+  [ "$_crc" = 0 ] || return 0   # rc 3 is a non-literal target and any other rc is a fault: both deny-ward (SWAS-583 E7)
+  [ -n "$_cri" ] || return 1
+  # Globbing off around the word-split (the discipline every operand walk in this file uses), and a
+  # split on whitespace: a target containing a space splits into fragments that are EACH tested, and
+  # a relative fragment denies — the fail-closed direction.
+  _crg=0; case "$-" in
+    *f*) _crg=1 ;;
+    esac
+  set -f
+  _crh=1
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  for _crt in $_cri; do
+    case "$_crt" in
+      /*) : ;;
+      *) _crh=0; break ;;
+      esac
+  done
+  [ "$_crg" = 1 ] || set +f
+  return $_crh
+}
+
+# The reason. `trigger=cwd-unknown` is a NEW trigger word, and it is the only new lexicon in this
+# face — every verb, every git subcommand and the redirect extractor are the sets the guard already
+# had. The remedy is spelled out because this deny is, by construction, the one an honest operator
+# hits most: it fires on ORDINARY files whenever the tracker is lost.
+# ⚠️ THE REMEDY SENTENCE WAS FALSE IN ITS FIRST FORM AND WAS GRADED WITH THE GATE (reviewer I1 /
+# security M1). It advised "spell the target repo-root-relative or absolute" — and `_cp8b_rel_operand_in`
+# counts ANY non-flag token, so BOTH of those still deny while lost. Measured:
+#   `cd $DIR && sed -i s/a/b/ /abs/notes.txt`   DENY   (`s/a/b/` is itself an operand)
+#   `cd $DIR && chmod 644 /abs/notes.txt`       DENY   (`644` is itself an operand)
+#   `cd $DIR && sed -i s/a/b/ docs/notes.txt`   DENY
+# The predicate is deliberately NOT narrowed: narrowing means asking which operand of which verb is
+# the target, i.e. a per-verb operand table, which is the `D-240816-1` enumeration trap. THE
+# ALTERNATIVE — a per-verb target-position table — IS THE OWNER'S CALL, not this seat's, and it is
+# named here so the choice is visible at the code rather than only in a design document.
+# What is left is the two escapes that were MEASURED to work, and they are what the message now says.
+_cp8b_cwd_unknown_reason() {
+  _cus=$(printf '%s' "$1" | cut -c1-160)
+  printf '13: a relative write after a directory change the guard could not follow (`cd -`, a bare `cd`, `pushd`/`popd`, a quoted / flagged / glob-bearing / variable / absolute / `~`-rooted `cd`, or a cwd inherited from a PRIOR tool call) cannot be proven to land outside the control plane - denied (fail-closed; trigger=cwd-unknown). Offending segment: [%s]. TIP: while the cwd is unknown EVERY operand is disqualifying, absolute ones included - so use the Edit/Write tool, or put the write in a call whose `cd` the guard CAN follow (one literal relative `cd` from the repo root: no flags, no quotes, no globs, no variables, no `..`). (escape card R11 cwd-unknown)' "$_cus"
+}
+
+# GUARD-READ-EXEC-LANE (K-3a) — the TWO NEW REASON TOKENS, appended by the arm that set them. The
+# verdict is decided elsewhere; this only NAMES the cause and the one retry, which is the DRIFT-2
+# precedent ("signpost the escape, never relax"): a refusal that does not clarify intent is friction.
+# Each is a `trigger=` word of its own because a reader adjudicating a deny log must be able to sort
+# read-lane refusals from the resolved-target denies they otherwise look exactly like.
+_cp8b_lane_tip() {
+  if [ -n "${_CP8B_READ_FLAG_HIT:-}" ]; then
+    # SWAS-301a: R14 is the git GLOBAL option form (`git -c ...`, the hit is `git` then a flag); every other hit is R12.
+    _lt_row='R12 read-flag'
+    case "$_CP8B_READ_FLAG_HIT" in
+      'git -'*) _lt_row='R14 read-flag' ;;
+    esac
+    printf ' trigger=read-flag: `%s` is read-recognised only with VETTED flags, and this one is not on its set - drop the flag, use a vetted spelling (`grep -e A -e B`, `rg -n`, `diff -u`), or read the file with the Read tool. (escape card %s)' "$_CP8B_READ_FLAG_HIT" "$_lt_row"
+  fi
+  # ⚠️ KEYED ON THE *HIT*, NOT ON THE FLAG. The tip must appear exactly when the poison CHANGED the
+  # outcome — i.e. when a poisoned segment skipped one of the five allow-side recognisers. The launder
+  # control (`export PATH=/tmp; cat /tmp/x > $V/pre-push`) denies EARLIER, on `trigger=redir-nonliteral`,
+  # and its reason must stay byte-identical: keying on the flag would have appended noise to it.
+  if [ "${_CP8B_RES_POISON_HIT:-0}" = 1 ]; then
+    printf ' trigger=line-poison: an earlier segment on this line (`%s`) can change what a later verb RESOLVES to, so the read lane is closed for the REST of the line - run the read as its own command (env does not persist across tool calls anyway). (escape card R13 line-poison)' "${_CP8B_RES_POISON_LEAD:-?}"
+  fi
+}
+# K-3a fix round 1, security F6 — THE KILL SWITCH IS NOT AN ANSWER TO A READ-LANE REFUSAL EITHER.
+# The F-h ruling already dropped `Set KIT_GUARD_SELFEDIT=1 …` when the offending segment is read-shaped,
+# for exactly the reason it applies here: the operator wanted to LOOK at a file, and answering "disarm
+# me, globally, for the whole session" trains an escape-hatch reflex for the one class of denial that
+# already has a free escape. A `read-flag` / `line-poison` refusal IS that class, and its lane tip is
+# the whole remedy — so the sentence is suppressed whenever a lane advertisement was printed.
+_cp8b_lane_write_route_hint() {
+  [ -n "${_CP8B_READ_FLAG_HIT:-}" ] && return 0
+  [ "${_CP8B_RES_POISON_HIT:-0}" = 1 ] && return 0
+  _cp8b_write_route_hint "$1" "${_tad_raw:-}"
+}
+_cp8b_target_reason() {
+  _trs=$(printf '%s' "$1" | cut -c1-160)
+  printf '13: writes/executes against a resolved control-plane target (guard / CI gates / conformance) - denied (control-plane integrity; trigger=%s). Offending segment: [%s].%s%s%s%s%s%s' "$2" "$_trs" "$(_cp8b_lane_tip)" "$(_cp8b_message_tip "${_tad_raw:-}" "$1")" "$(_cp8b_trigger_tip "$2")" "${_cp8b_gsr_tip:-}" "$(_cp8b_lane_write_route_hint "$1")" "${_CP8B_G_NOTE:-}"
+}
+
+# C4 Arm 3 (face c) — remote-URL token disqualification for git-lead segments. Replaces each WHOLE
+# url-shaped token with the placeholder `REMOTE-URL`: a remote URL is not a local write target, so its
+# `.git` suffix / any CP substring inside it must not classify. A token is url-shaped iff it is
+# SCHEME-BEARING (https|http|ssh|git ://) or SCP-FORM (user@host:path). `file://` is NEVER masked (a
+# file URL IS a filesystem path — and its `.git` write stays DENY via the raw clone-dest arm). Masking
+# is TOKEN-BOUNDED, never greedy (vet Finding 3, K-G2 pins): `[^[:space:]]*` stops at whitespace, so a
+# following CP destination (`… .git hooks`) is never swallowed. No CP path is scheme-bearing or
+# scp-shaped, so masking url-shaped tokens can never erase a real CP path token.
+_cp8b_mask_remote_urls() {
+  printf '%s' "$1" | sed -E \
+    -e 's#(^|[[:space:]])(https|http|ssh|git)://[^[:space:]]*#\1REMOTE-URL#g' \
+    -e 's#(^|[[:space:]])[A-Za-z0-9._~-]+@[A-Za-z0-9._-]+:[^[:space:]]*#\1REMOTE-URL#g'
+}
+
+# === GUARD-READ-EXEC-LANE (K-3a) face 2 — A POISONED LINE IS NOT A READ ==========================
+# An earlier segment on the SAME line can change what a later verb RESOLVES to. Measured twice on
+# 2026-09-06: `export PATH=/tmp:$PATH; head -1 conformance/verify.sh` ALLOWed, and the `head` that ran
+# was whatever `/tmp` provided. The same-segment prefix forms (`PATH=/tmp cat <cp>`, `env PATH=/tmp cat
+# <cp>`) already deny; only the two-statement spelling was open.
+#
+# WHY A CLOSED SET OF SHELL CONSTRUCTS AND NOT A SET OF VARIABLE NAMES (the boarded stub's proposal,
+# `PATH`/`LD_PRELOAD`/`ENV`/`BASH_ENV`/`IFS`): only an IN-SHELL construct can alter what the same line
+# resolves next — a subprocess cannot change its parent's environment — so this set is bounded by the
+# SHELL GRAMMAR and is closed. The set of variables that some read verb honours as a program (`PAGER`,
+# `GIT_PAGER`, `GIT_EXTERNAL_DIFF`, `RIPGREP_CONFIG_PATH`, `LESSOPEN`, `LD_PRELOAD`,
+# `DYLD_INSERT_LIBRARIES`, …) is OPEN, and enumerating it is the `D-240816-1` trap.
+#
+# ⚠️ `set` AND `exec` ARE DELIBERATELY ABSENT, on the frontier measurement: `set` cannot re-route
+# resolution (`set --` + `"$1"` is already unparseable-denied) and excluding it keeps `set -e; sh
+# conformance/verify.sh` ALLOW; `exec` REPLACES the shell, so no LATER segment runs at all, and
+# `exec 2>/dev/null; cat <cp>` must stay ALLOW. `:` is unnecessary (`${PATH:=…}` cannot assign a set
+# variable, and `unset` is in the set).
+_CP8B_RESOLVE_LEADS='export declare typeset local readonly unset alias unalias hash enable builtin source . eval function shopt trap read mapfile readarray getopts let'
+# The reserved words and wrappers a poisoning lead can HIDE behind (B14-B21). Peeled at most three
+# times, after `_cp8b_group_peel` has taken the `(`/`{` openers off.
+# `if while until` joined the set in fix round 1 (security F3): a poisoning lead sits inside a LOOP or
+# CONDITION head — `until export PATH=/tmp; do :; done; cat <cp>` — where the head is its own segment.
+_CP8B_RES_WRAPPERS='do then else elif ! time command builtin if while until'
+# _cp8b_seg_poisons "<seg>": 0 iff this segment can change what a LATER segment resolves to. Sets
+# `_CP8B_RES_POISON_LEAD` to the peeled, de-quoted lead that decided it, so the deny can name it.
+# _cp8b_seg_all_assign "<seg>": 0 iff EVERY token is a `NAME=value` assignment (so the segment is an
+# assignment STATEMENT and not an assignment PREFIX in front of a command word).
+_cp8b_seg_all_assign() {
+  _aaf=0; case "$-" in
+    *f*) _aaf=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  _aar=1
+  [ $# -gt 0 ] && _aar=0
+  while [ $# -gt 0 ]; do
+    case "$(_cp8b_dequote "$1")" in
+      [A-Za-z_]*=*) shift ;;
+      *) _aar=1; break ;;
+    esac
+  done
+  [ "$_aaf" = 1 ] || set +f
+  return $_aar
+}
+_cp8b_seg_poisons() {
+  _psr=$(_cp8b_group_peel "$1")
+  _psi=0
+  while : ; do
+    _psw=$(_cp8b_lead_word "$_psr")
+    [ -n "$_psw" ] || return 1
+    # A FUNCTION DEFINITION redefines a verb for the rest of the line. `cat(){` has no space, so the
+    # test is "the lead CONTAINS a paren"; the spaced spelling `cat () {` is the second-token test.
+    # ⚠️ THE PATTERN IS NAME-ANCHORED, not a bare `*(*`: a lone `(` is a GROUP OPENER, not a function
+    # definition, and matching it would make the group peel unmutatable (K-3a-M2b measured exactly
+    # that — the leg reported "verdict did not change" while the peel was dead code).
+    # ⚠️ AND AN ASSIGNMENT IS EXCLUDED FIRST: `SELFTEST=$(whoami)` is a name, an `=` and a paren, and
+    # matching it as a function definition made F2-KI2 / F2-KI2b unbindable (measured). A value's
+    # command substitution is already `_cp8b_assign_val_safe`'s subject, not this one's.
+    case "$_psw" in
+      *=*) : ;;
+      [A-Za-z_]*'('*) _CP8B_RES_POISON_LEAD=$_psw; return 0 ;;
+    esac
+    if _cp8b_in_list "$_psw" "$_CP8B_RESOLVE_LEADS"; then
+      _CP8B_RES_POISON_LEAD=$_psw; return 0
+    fi
+    # An ASSIGNMENT STATEMENT — EVERY token an assignment. The pattern covers bash's append form too
+    # (`PATH+=/tmp` matches). ⚠️ IT MUST NOT FIRE ON AN ASSIGNMENT *PREFIX* (`SELFTEST=1 sh <kit>`):
+    # a prefix scopes the variable to the ONE command it leads and cannot reach a later segment, and
+    # the vetted-name allowlist (`_CP8B_VETTED_ASSIGN`, F2 Arm A) already adjudicates it. The first cut
+    # conflated the two and turned nine F2 Arm-A refunds into denials, unbinding three of its mutants.
+    # K-3a fix round 1, security F3 — AN ASSIGNMENT PREFIX HIDES THE POISON LEAD BEHIND IT.
+    # `X=1 export PATH=/tmp; cat <cp>` (and the `source`/`eval`/`.`/`declare -x`/`alias`/`hash -p`
+    # spellings, and `IFS=: read PATH <<< /tmp`) were ALLOW on BOTH cores: the lead is `NAME=value`, the
+    # segment is not purely assignments, so neither the assignment-statement arm nor the wrapper peel
+    # fired. `_cp8b_strip_assigns` is the guard's own existing peel for exactly this shape; strip and
+    # RE-JUDGE the residual lead. K-3a-M11 pins it.
+    case "$_psw" in
+      [A-Za-z_]*=*) if _cp8b_seg_all_assign "$_psr"; then
+                      _CP8B_RES_POISON_LEAD=$_psw; return 0
+                    fi
+                    _psa=$(_cp8b_strip_assigns "$_psr")
+                    if [ -n "$_psa" ] && [ "$_psa" != "$_psr" ]; then
+                      _psr=$(_cp8b_group_peel "$_psa"); continue
+                    fi ;;
+    esac
+    # A `case` HEAD poisons the line outright. Fail-by-disqualification, not a parse: this walk has no
+    # way through `case x in x) … ;; esac` to the statement inside the arm, so it declines to certify
+    # the rest of the line. Disclosed as an over-deny on the escape card and in the CHANGELOG; the
+    # retry is the same as every other R13 retry — run the read as its own tool call.
+    if [ "$_psw" = case ]; then _CP8B_RES_POISON_LEAD=case; return 0; fi
+    _pss=${_psr#"${_psr%%[![:space:]]*}"}; _pss=${_pss#"${_pss%%[[:space:]]*}"}
+    _pss=${_pss#"${_pss%%[![:space:]]*}"}
+    case "$_pss" in
+      '()'*) _CP8B_RES_POISON_LEAD="$_psw ()"; return 0 ;;
+      esac
+    # `printf -v NAME` ASSIGNS a variable. `printf` stays a tier-1 read verb because it writes only to
+    # stdout; the assignment form is a RESOLUTION change, and it belongs here rather than in the
+    # lexicon's disclosure.
+    if [ "$_psw" = printf ]; then
+      case " $_psr " in
+        *' -v '*) _CP8B_RES_POISON_LEAD='printf -v'; return 0 ;;
+        esac
+    fi
+    _cp8b_in_list "$_psw" "$_CP8B_RES_WRAPPERS" || return 1
+    # K-3a fix round 1, reviewer H1 — THE CAP FAILED OPEN. `command command command command export
+    # PATH=/tmp; cat <cp>` and `! ! ! ! export …` were ALLOW: at the cap the walk returned 1 ("no
+    # poison") while the thing it had stopped in front of was still a wrapper, i.e. still unsettled.
+    # Decline on what you cannot settle: past the cap, a lead that is STILL a wrapper POISONS.
+    if [ "$_psi" -ge 3 ]; then _CP8B_RES_POISON_LEAD="$_psw …"; return 0; fi
+    _psr=${_psr#"${_psr%%[![:space:]]*}"}; _psr=${_psr#"${_psr%%[[:space:]]*}"}
+    _psr=$(_cp8b_group_peel "$_psr")
+    _psi=$((_psi + 1))
+  done
+}
+
+# _cp8b_xargs_git_denied "<cmd>": design §12 D, the whole-command half. A pipe into `xargs git` makes the pipe's
+# DATA git's arguments, and a quoted newline in it splits `git push origin⏎HEAD:main` across segments, so no segment
+# holds both the push and the ref. On a raw `… | xargs git …`, a control-plane token or a push-to-main shape in the
+# newline-flattened command denies. Everything else piped into xargs git keeps today's verdict.
+_cp8b_xargs_filefed_denied() {
+  case "$1" in
+    *x*a*r*g*s*) : ;;
+    *) return 1 ;;
+  esac
+  _xfw=$(_cp8b_segments "$1") || _guard_fault xargs-filefed-segments
+  _guard_vanished xargs-filefed-segments "$1" "$_xfw"        # design §16: a vanished split must fault, not read as "nothing to judge"
+  while [ -n "$_xfw" ]; do
+    case "$_xfw" in
+      *"$_cp8b_nl"*) _xfs=${_xfw%%"$_cp8b_nl"*}; _xfw=${_xfw#*"$_cp8b_nl"} ;;
+      *)             _xfs=$_xfw; _xfw='' ;;
+    esac
+    # file-fed = a `<` redirect or xargs' own `-a` / `--arg-file` (design §16 R2); the word match is the de-quoted basename
+    case "$_xfs" in
+      *'<'*|*[[:space:]]-a*|*--arg-file*) : ;;
+      *) _cp8b_xargs_optscan "$_xfs" || continue; _xfs=$_xo_norm ;;     # GSR C4a: `-0a`, `-ra`, `--ar`, `--arg=` (judged in canonical form)
+    esac
+    if _cp8b_xargs_seg_write "$_xfs"; then return 0; fi
+  done
+  return 1
+}
+_cp8b_xargs_git_denied() {
+  case "$1" in
+    *x*a*r*g*s*) : ;;
+    *) return 1 ;;
+  esac
+  _cp8b_piped_interp "$1" || return 1
+  [ "$_cp8b_pi_xargs" = 1 ] || return 1
+  [ "$_cp8b_pi_nonlit" = 0 ] || return 0                      # a write verb fed by data the guard cannot read
+  _xg=$(printf '%s' "$1" | tr '\n' ' ') || _guard_fault xargs-git-view
+  _guard_vanished xargs-git-view "$1" "$_xg"
+  _cp8b_pathhit "$_xg" && return 0
+  _gmq push-main "$_xg" -Eq 'push.*[^a-zA-Z0-9_.-](main|master)([^a-zA-Z0-9_.-]|$)'
+}
+
+# _cp8b_exec_arg_denied "<cmd>": design §12 C. `git rebase -x|--exec <cmd>`, `git bisect run <cmd>` and
+# `git submodule foreach <cmd>` RUN their argument as a command, and a quoted newline inside it splits into
+# a fragment the segment walk reads as a different verb (`cp /tmp/e skills/x" HEAD~1` -> destination `HEAD~1`).
+# Refuse on doubt: on the RAW command, a control-plane token anywhere denies. No quote parse.
+_cp8b_exec_arg_denied() {
+  # design §13 L1: fork-free fast path (no subcommand word, nothing to do), then ANY words between `git` and the
+  # subcommand (global options with or without values) and `--e…` abbreviations of `--exec`. Refuse on doubt.
+  case "$1" in
+    *rebase*|*bisect*|*submodule*) : ;;
+    *) return 1 ;;
+  esac
+  _ea=$(printf '%s' "$1" | tr '\n' ' ') || _guard_fault exec-arg-view
+  _guard_vanished exec-arg-view "$1" "$_ea"
+  _gmq git-exec-arg "$_ea" LC_ALL=C -Eq '(^|[;&|[:space:](])git[[:space:]]+([^;&|]*[[:space:]])?(rebase[[:space:]]+(.*[[:space:]])?(-x|--e)|bisect[[:space:]]+run|submodule[[:space:]]+foreach)' || return 1
+  _cp8b_pathhit "$_ea"
+}
+
+# _cp8b_target_arm_denied "<cmd>": PREDICATE - Parts A+B+C. Prints the reason and returns 0 to deny.
+_cp8b_target_arm_denied() {
+  _tad_raw=$1
+  if _cp8b_exec_arg_denied "$1"; then _cp8b_target_reason "$1" exec-arg; return 0; fi
+  if _cp8b_xargs_filefed_denied "$1"; then _cp8b_target_reason "$1" xargs-filefed; return 0; fi
+  if _cp8b_xargs_git_denied "$1"; then _cp8b_target_reason "$1" xargs-git; return 0; fi
+  # GUARD-READ-LANE-2 T1, half 2 (design §5) — same pre-check, same reason shape as the old arm.
+  if _cp8b_piped_interp_hit "$1"; then _cp8b_target_reason "$_cp8b_pi_seg" pathhit; _cp8b_pi_note; return 0; fi
+  # Arm E: a quoted heredoc BODY is inert data. F-a (T8): and a quoted separator is not a separator.
+  _cp8b_walk_load "$1"   # GUARD-QUOTED-EXEC-INTERMITTENT: faults (exit 2) on a failed/vanished stage
+  # GUARD-CWD-CONFIDENCE-UNKNOWN — the walk starts from the SEED, not from a bare root. With no
+  # `cwd` the seed is '' / confident, which is the pre-slice initialisation byte for byte.
+  _CP8B_EFF=$_CP8B_SEED_EFF
+  _CP8B_EFF_UNKNOWN=$_CP8B_SEED_UNKNOWN
+  # SWAS-77 D1: the clone the walk starts in is the SEED's (D1a), reset per walk; `_cp8b_segn` counts the non-blank segments so
+  # the first-move rule (D1b) can ask "is this the line's first segment". The launder arm never reads `_CP8B_CLONE`.
+  _CP8B_CLONE=${_CP8B_SEED_CLONE:-}
+  _cp8b_segn=0
+  # K-3a face 2 — one more byte of per-LINE state, reset with the others. `_CP8B_RES_POISON` is set by
+  # a segment that can re-route resolution and stays set for the REST of the line.
+  _CP8B_RES_POISON=0
+  _CP8B_RES_POISON_LEAD=''
+  # SWAS-278a (design §3.4, N3): one more fact per LINE. `_CP8B_ENVSET` is set by a segment that changes the environment (any name), and the
+  # grammars read `_CP8B_ENVSET_PRIOR`, its value BEFORE the segment being judged. It is tracked only in clone mode (see the walk below).
+  _CP8B_ENVSET=0
+  _CP8B_ENVSET_PRIOR=0
+  while _cp8b_next_seg; do
+    # fork-free blank test
+    case $_seg in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    # K-3a — the read-lane advertisements are PER SEGMENT. Reset here (not per command) so a flag that
+    # closed the lane on segment 1 can never be printed against segment 3's deny.
+    _CP8B_READ_FLAG_HIT=''
+    _CP8B_G_NOTE=''   # SWAS-278a I1: per segment, like the lane advertisements
+    _CP8B_RES_POISON_HIT=0
+    _segm=$_seg                                      # F-a: see the two-views note in the old arm
+    case "$_seg" in
+      *["$_cp8b_mk_all"]*) _seg=$(_cp8b_unmask_quoted "$_seg") ;;
+      esac
+    _lv=$(_cp8b_lead "$_seg")
+    _cp8b_segn=$((_cp8b_segn + 1))
+    _CP8B_ENVSET_PRIOR=$_CP8B_ENVSET   # SWAS-278a: an environment change on an EARLIER segment (the grammars decline after one)
+    if [ -n "${_CP8B_CLONE:-}" ] && [ "$_CP8B_ENVSET" = 0 ] && _cp8b_seg_envchange "$_seg"; then _CP8B_ENVSET=1; fi
+    # SWAS-77 D1b: ONLY the line's first segment, and only as `cd <abs> &&` (see `_cp8b_first_move`), may restore confidence
+    # at the root or enter a dev clone. Every other `cd` falls through to today's handling below, and clears clone mode.
+    if [ "$_cp8b_segn" = 1 ] && _cp8b_first_move "$_seg" "$_lv"; then continue; fi
+    if [ "$_lv" = cd ]; then _cp8b_eff_update "$_seg"; _CP8B_CLONE=''   # CLONE-CLEAR
+      continue; fi
+    # design §14: a glob in a write-verb operand is matched against the on-disk control-plane paths (see the function).
+    case "$_lv" in
+      cp|install|mv|tee|ln|rsync|touch|rm|rmdir|chmod|chown|truncate|dd|shred|sed)
+        if _cp8b_glob_operand_denied "$_seg" "$_lv"; then _cp8b_target_reason "$_seg" glob-operand; return 0; fi ;;
+    esac
+    # `pushd`/`popd` are a directory change this tracker has never modelled — it keeps the prefix and
+    # walks on, which is why `pushd conformance && sed -i s/a/b/ verify.sh` ALLOWED. Keeping the
+    # prefix is still right (a no-op only ever RETAINS denials); what was missing is the admission.
+    case "$_lv" in
+      pushd|popd) _CP8B_EFF_UNKNOWN=1; _CP8B_CLONE=''   # CLONE-CLEAR
+        continue ;;
+      esac
+    # S-H1 — the PEELED lead, used ONLY to add denies. `_lv` still drives every pre-existing arm
+    # exactly as before; `_lvp` is a second, narrower reading consulted by Face B alone.
+    _lvg=$(_cp8b_group_peel "$_seg") || _guard_fault lead-peel
+    _lvp=$(_cp8b_lead "$_lvg") || _guard_fault lead-peel
+    # A `cd`/`pushd`/`popd` hiding behind a group opener is a directory change this walk cannot
+    # follow, so it ADMITS and FALLS THROUGH — it must NOT `continue` the way the bare forms above
+    # do. Continuing would skip the pathhit/literal/composed triggers that judge this very segment
+    # today (`(cd conformance` denies on its `conformance` substring right now), turning a widening
+    # into a DENY->ALLOW regression. Admit, then let every existing arm run unchanged: monotone.
+    case "$_lv" in
+      cd|pushd|popd) : ;;
+      *) case "$_lvp" in
+        cd|pushd|popd) _CP8B_EFF_UNKNOWN=1; _CP8B_CLONE=''   # CLONE-CLEAR
+          ;;
+        esac ;;
+    esac
+    # SWAS-77 D1b belt: a directory-change WORD anywhere else in the segment (`builtin cd`, `command cd`, `{ cd`, `X=1 cd`, an
+    # `if`/`do` head) is a move this walk cannot follow, so it also ends clone mode. Over-clears on `echo cd x`, which only
+    # costs the clone-exec relief for that line; never an allow.
+    # It judges the DEQUOTED segment (`'cd' sub` is a cd), and a `.` / `source` / `eval` lead can run a cd this walk cannot see,
+    # so those clear too (sec L3). Only forks while a clone is active.
+    if [ -n "${_CP8B_CLONE:-}" ]; then
+      _clb=$(_cp8b_dequote "$_seg")
+      case " $_clb " in
+        *[[:space:]]cd[[:space:]]*|*[[:space:]]pushd[[:space:]]*|*[[:space:]]popd[[:space:]]*) _CP8B_CLONE='' ;;
+      esac
+      case "$(_cp8b_lead "$_clb")" in
+        .|source|eval) _CP8B_CLONE='' ;;
+      esac
+    fi
+    # S-H2 — THE REDIRECT CLAUSE RUNS FIRST, ahead of the read / message-carrier declines below.
+    # `echo`, `printf` and `cat` are recognised as readers/message carriers and DECLINED there, so
+    # `cd -; echo x >> guard-core.sh` never reached Face B's late redirect test at all — measured
+    # ALLOW (security seat, HIGH). A REDIRECT-BEARING ECHO IS NOT A READ: it is the cheapest write
+    # primitive on the box. Reads without a redirect are untouched, which is what keeps the relief
+    # slice's refunds intact — `cd -; echo x` and `cd -; cat notes.txt` still allow.
+    #
+    # ⚠️ TWO CEILINGS AS SHIPPED; THE FIRST IS NOW CLOSED, the second stands.
+    # (1) CLOSED by `GUARD-CLOBBER-REDIRECT-INVISIBLE`: the `>|` CLOBBER operator used to be invisible
+    #     — not to `_redir_targets`, as this comment first said, but to `_cp8b_segments`, which split
+    #     at the `|` before any redirect arm ran. Both segmenters now protect `>|` with `_cp8b_etx`
+    #     and the extractor consumes the `|` with the operator, so `>|` is judged EXACTLY as `>`:
+    #     `cd -; echo x >| verify.sh` denies `trigger=cwd-unknown` and `echo x >| conformance/verify.sh`
+    #     denies from the root. The `K-CWD ceiling ` cell that pinned the hole was re-kinded into
+    #     `K-CLOB cd - then a >| clobber` — the countdown ran out and the delta enumerated the flip.
+    # (2) THE MASK DOES NOT REFUND A QUOTED `>` HERE. `_redir_targets` on `$_segm` still reports a
+    #     redirect for a `>` inside a quoted message, so while lost these DENY (measured):
+    #       `cd -; git commit -m "fix -> thing"` · `cd -; git commit -m "a > b"`
+    #       `cd -; gh pr create --body "a > b"`
+    #     The same commands with NO lost cd are ALLOW, so this is this face's cost, not a
+    #     pre-existing message-carrier defect. Unchanged this round; the standing remedy is the one
+    #     the guard advertises everywhere else — pass the body from a FILE (`-F` / `--body-file`).
+    #     THE OPTIONAL CURE IS THE OWNER'S CALL: exempt a segment that `_cp8b_tad_is_msg_carrier`
+    #     recognises when its ONLY `>` lies inside the mask. It is deliberately not taken here
+    #     because it re-admits the message-carrier recogniser ahead of a write test, which is the
+    #     precise ordering S-H2 had to undo.
+    if [ "${_CP8B_EFF_UNKNOWN:-0}" = 1 ] && _cp8b_cwd_redir_in "$_segm"; then
+      _cp8b_cwd_unknown_reason "$_seg"; return 0
+    fi
+    # === GUARD-READ-EXEC-LANE (K-3a) face 2 — THE POISON TEST AND THE FIVE GUARDED SKIPS ==========
+    # ⚠️⚠️ WHERE THIS LIVES IS A SECURITY PROPERTY (security vet, HIGH). The flag is consulted AT THE
+    # WALK, at the five allow-side `continue` sites below, and NEVER inside `_cp8b_tad_is_read`. The
+    # launder arm (`_cp8b_redir_launder_denied`) calls that recogniser on the DENY side —
+    # `export PATH=/tmp; cat /tmp/x > $V/pre-push` denies BECAUSE `cat` is read-recognised — so a
+    # recogniser that silently answered "not a read" under poison would flip that route to ALLOW.
+    # K-3a-M7 makes exactly that mistake and the launder control flips.
+    # WHY THE WHOLE ALLOW SIDE AND NOT READS ALONE (K-3a-M6 pins it): every recogniser here assumes the
+    # verb is the real binary. A kit-exec under a poisoned `PATH` runs the kit script's internals from
+    # `/tmp`, so exempting it is the same defect one arm over.
+    if [ "$_CP8B_RES_POISON" != 1 ] && _cp8b_seg_poisons "$_seg"; then _CP8B_RES_POISON=1; fi
+    if _cp8b_tad_is_read "$_seg" "$_segm"; then
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    # DELIBERATE ASYMMETRY, fail-closed: `_cp8b_tad_is_read` above gets BOTH views ($_seg and the masked
+    # $_segm) because the mask is what refunds a quoted separator INSIDE a read; kit-exec gets the
+    # UNMASKED view only, so a kit-script segment is judged on its raw bytes and can never be exempted
+    # on the strength of a mask. One argument here is the narrower answer, not a missing one.
+    # design §13 U: a RELATIVE kit script run after a `cd` (or from an uncertain cwd) is the attacker's own script
+    # (`cd /tmp/x && sh scripts/anything.sh`), so kit-exec and the kit-query table apply only at the confident root. The
+    # condition sits at THIS call site, not inside the recognisers: the launder arm calls kit-exec on the DENY side.
+    _kroot=0; [ -z "${_CP8B_EFF:-}" ] && [ "${_CP8B_EFF_UNKNOWN:-0}" = 0 ] && _kroot=1
+    # SWAS-77 D2 note: at the confident root an ABSOLUTE spelling of a root kit script is respelled root-relative BEFORE kit-exec
+    # and kit-query judge it, so `sh <root>/scripts/board.sh show K` is judged exactly as `sh scripts/board.sh show K`. Only
+    # the recognisers see the respelled copy; every later trigger keeps judging `$_seg`.
+    _segk=$_seg
+    if [ "$_kroot" = 1 ]; then   # CANON-ROOT (the case is a fork-free precheck: no `/conformance/` or `/scripts/` byte, nothing to respell)
+      case "$_seg" in
+        */conformance/*|*/scripts/*) _segk=$(_cp8b_canon_root_script "$_seg") ;;
+      esac
+    fi
+    if [ "$_kroot" = 1 ] && _cp8b_tad_is_kit_exec "$_segk"; then
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    if [ "$_kroot" = 1 ] && _cp8b_tad_is_kit_query "$_segk"; then      # Arm A: a DECLARED read-only kit query (see the table)
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    # SWAS-77 D2: a kit script of the DEV CLONE the walk is standing in (D1a seed / D1b first move), whatever `_kroot` is. Same
+    # line-poison accounting as kit-exec above: a poisoned line loses the skip. `_CP8B_CLONE` is read ONLY here (never by the
+    # launder arm, which calls kit-exec on the deny side).
+    if [ -n "${_CP8B_CLONE:-}" ] && _cp8b_tad_is_clone_exec "$_seg"; then   # CLONE-SITE
+      [ "$_CP8B_RES_POISON" = 1 ] || continue   # CLONE-POISON
+      _CP8B_RES_POISON_HIT=1
+    fi
+    # SWAS-278a: the five closed grammars (G1 prepush, G2 --own-tree, G3 class derivation, G4 board verbs, G5 semgrep), clone mode only,
+    # after SWAS-77's recogniser and under the same line-poison accounting. They decline on an earlier environment change (G-ENVSET).
+    if [ -n "${_CP8B_CLONE:-}" ] && _cp8b_tad_is_clone_grammar "$_seg"; then   # CLONE-GRAMMAR-SITE
+      [ "$_CP8B_RES_POISON" = 1 ] || continue   # G-POISON
+      _CP8B_RES_POISON_HIT=1
+    fi
+    if _cp8b_tad_is_test_expr "$_seg"; then      # Arm B: a `test`/`[` metadata expression
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    if _cp8b_tad_is_msg_carrier "$_seg"; then
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    # GUARD-TRAILER-IN-MESSAGE-FP (design §3): `sh scripts/board.sh create` is a carrier, keyed on its LEAD.
+    if _cp8b_tad_is_board_create "$_seg"; then
+      [ "$_CP8B_RES_POISON" = 1 ] || continue
+      _CP8B_RES_POISON_HIT=1
+    fi
+    # === GUARD-CWD-CONFIDENCE-UNKNOWN Face B ===================================================
+    # POSITION IS LOAD-BEARING: this sits AFTER every read / kit-exec / kit-query / test-expr /
+    # message-carrier decline above, so `cd - && cat notes.txt`, `cd - && sh conformance/verify.sh`
+    # and every read the relief slice refunded are untouched. Reads were never the failure direction
+    # and this face must not make them one. It sits BEFORE the literal/composed triggers because
+    # while confidence is lost there is nothing trustworthy to compose against — that is the point.
+    if [ "${_CP8B_EFF_UNKNOWN:-0}" = 1 ] && _cp8b_rel_operand_in "$(_cp8b_group_peel "$_seg")"; then
+      case "$_lvp" in
+        # The mutation-verb set the guard ALREADY dispatches on (:1586-1588's contract, spelled at
+        # the target-arm's own `case`). Not a new list — the same names, consulted under a new
+        # precondition. M-CWD4 mutates this pattern to `*)` and the over-deny it produces is the
+        # measure of how much work this gate is doing.
+        mv|rsync|ln|rm|rmdir|shred|truncate|chmod|chown|tee|patch|dd|sed|cp|install)
+          _cp8b_cwd_unknown_reason "$_seg"; return 0 ;;
+      esac
+      # ⚠️ STRIKABLE HALF B-git (design §3-B). ITS OWN `case` ARM, so the owner's strike is the
+      # deletion of this arm and the re-kinding of the `K-CWD-git ` cells — one edit, nothing else
+      # moves. The subcommand set is `_cp8b_git_write_denied`'s OWN write set, read through the same
+      # `_cp8b_git_sub` helper: no new git lexicon.
+      # ⚠️ DISCLOSED, NOT CLAIMED: `git apply` is NOT in that set (it never was — the design's §3-B
+      # cell named it), so `cd - && git apply p.diff` stays as it is today. Adding `apply` here would
+      # be exactly the second-enumeration the vet's H1 rejected; it is boarded, not smuggled.
+      case "$_lvp" in
+        git)
+          case "$(_cp8b_git_sub "$(_cp8b_group_peel "$_seg")")" in
+            archive|bundle|worktree|init|clone|checkout|restore)
+              _cp8b_cwd_unknown_reason "$_seg"; return 0 ;;
+          esac ;;
+      esac
+      # NO REDIRECT CLAUSE HERE ANY MORE, and its removal is a finding rather than a tidy-up. The
+      # first build tested redirects at THIS point; S-H2 moved that test ABOVE the read/message-carrier
+      # declines (a redirecting `echo` is not a read). The two tests then had the identical predicate
+      # on the identical value, with one strictly earlier — so the late one became unreachable, and
+      # its mutant (M-CWD5) reported `verdict did not change (deny before and after); the leg proves
+      # nothing`. An unreachable branch no mutant can kill is precisely what this file's non-vacuity
+      # discipline refuses to ship, so it is deleted, not kept "for safety". M-CWD7 pins the survivor.
+    fi
+    case "$_lv" in
+      cp|install)
+        if _cp8b_tad_cp_dest_denied "$_seg"; then _cp8b_target_reason "$_seg" cp-dest; return 0; fi
+        continue ;;
+    esac
+    # C4 Arm 3: for a git-lead segment, evaluate the three CP triggers on a recognition-copy in which
+    # url-shaped tokens are masked (a remote URL's `.git` suffix is not a local write target). Reasons
+    # print the ORIGINAL $_seg. The raw clone-DESTINATION arm (_cp8b_git_write_denied :806) and the
+    # push-to-main floor run on the RAW string and are untouched, so `git clone <url> .claude`,
+    # `git clone <url> hooks`, `git push <url> main` stay DENY. K-G pins the git-lead guard.
+    _tad_c=$_seg
+    if [ "$_lv" = git ]; then
+      _tad_c=$(_cp8b_mask_remote_urls "$_seg") || _guard_fault remote-url-mask
+      _guard_vanished remote-url-mask "$_seg" "$_tad_c"
+    fi
+    if _cp8b_tad_pathhit "$_tad_c"; then _cp8b_target_reason "$_seg" pathhit; return 0; fi
+    if _cp8b_tad_literal_tok "$_tad_c"; then _cp8b_target_reason "$_seg" token; return 0; fi
+    if _cp8b_tad_composed_tok "$_tad_c"; then _cp8b_target_reason "$_seg" composed; return 0; fi
+    if _cp8b_redir_link_denied "$_segm"; then _cp8b_target_reason "$_seg" token; return 0; fi   # GSR C9: a redirect THROUGH a symlink to the control plane
+    # GUARD-CP-WRITE-ROUTES Cure 2: last, a reader/kit-exec laundering a non-literal redirect target
+    # (no literal CP substring above to catch it — the pure-glob route) denies outright.
+    # F-a: the LAUNDER arm is a redirect test, so it reads `$_segm` for the same reason the `[<>]` bail
+    # does — `echo "=== DIFF (before -> after) ==="` has no redirect in it, and calling its quoted `->`
+    # a non-literal target is precisely the false positive. A REAL `> $(…)` is untouched: it is outside
+    # every quoted span, so the mask never reached it. The reason still prints the restored `$_seg`.
+    if _cp8b_redir_launder_denied "$_segm"; then _cp8b_target_reason "$_seg" redir-nonliteral; return 0; fi
+  done
+  return 1
+}
+
+# _cp8b_push_main_denied "<cmd>": PREDICATE - the push-to-main rule, SCOPED to a segment.
+# The flat rule is the FLOOR (it denies); this may only ALLOW BACK when no single segment carries both
+# the push and the main/master refspec - i.e. when the flat regex only ever matched by SPANNING a shell
+# separator, which is precisely the false positive:
+#     git push -u origin fix/x && gh pr create --body "... merges to main"
+# This is NOT the rewriting CP-8a forbade: that was splitting the command and REJOINING it with ';',
+# which perturbed the OTHER ~40 rules. Here only this ONE rule's window narrows; every other rule still
+# sees the raw, unsplit string (`curl x | sh` keeps its pipe, `--admin` keeps its end-of-string anchor).
+# design §13 H3: the regex took only `-c <kv>` between `git` and `push`, so `git -C d push origin HEAD:main`, `--git-dir=`,
+# `--no-pager` and `-P` slipped past (and the force-push rule below has the same shape). _CP8B_GITG is a CHAIN of git
+# GLOBAL options (`-C v`, `-c kv`, `--opt=v`, `--opt v` for the value-taking longs, any other flag); the first
+# non-dash word ends it, so `git commit -m "… push …"` is not matched. Unknown shapes fall to the over-deny side.
+# _cp8b_dq_vanished "<label>" "<in>" "<dequoted>": a de-quoted view that came back EMPTY from non-empty input is a fault — unless
+# the input held nothing but quote, backslash and blank bytes (a lone `"` is what a quoted newline leaves behind after a split).
+_cp8b_dq_vanished() {
+  [ -z "$3" ] || return 0
+  case "$2" in
+    *[!\"\'\\[:space:]]*) _guard_fault "$1" ;;
+  esac
+  return 0
+}
+_CP8B_GITG='([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|--(git-dir|work-tree|exec-path|namespace|config-env|super-prefix)[[:space:]=][^[:space:]]+|-[A-Za-z]|--[a-z-]+(=[^[:space:]]*)?))*'
+_cp8b_push_main_denied() {
+  _cp8b_segments_load "$1"
+  while _cp8b_next_seg; do
+    # design §16 R4: also judged on the view with quotes and backslashes deleted (`git "push" …`, `git -C "x" push …`).
+    _pmq=$_seg; _pmc=$_seg
+    case "$_seg" in
+      *'"'*|*"$_cp8b_sq"*|*'\'*)
+        _pmq=$(printf '%s' "$_seg" | tr -d "\"'\\\\") || _guard_fault pushmain-dequote
+        _cp8b_dq_vanished pushmain-dequote "$_seg" "$_pmq"
+        _pmc=$(_cp8b_collapse_quotes "$_seg") || _guard_fault pushmain-collapse ;;   # GSR C5: a quoted value holding whitespace is ONE word
+    esac
+    _pmt=$(printf '%s\n%s\n%s' "$_seg" "$_pmq" "$_pmc") || _guard_fault pushmain-view
+    if _gmq push-main "$_pmt" -Eq 'git'"$_CP8B_GITG"'[[:space:]]+push.*[^a-zA-Z0-9_.-](main|master)([^a-zA-Z0-9_.-]|$)'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# GUARD-READONLY-FP-RELIEF Arm F — the `git config core.hooksPath` READ/WRITE split (cures register
+# face N4; N5 rides along). ***THIS MATCHER IS THE GUARD-DISABLE CROWN JEWEL*** — the same rule that
+# over-denies `git config --get core.hooksPath` (asking what the hooks path IS, a pure read) is the
+# rule that denies `git config core.hooksPath /tmp/evil`, the primary way an agent switches the
+# guard off. So the split is built DEFAULT-DENY (security vet H2): a segment that matches the
+# hooksPath matcher DENIES unless it is POSITIVELY recognized as one of the declared query forms.
+#
+# PER-OCCURRENCE, never per-command: the decision walks segments, so
+# `--get … && git config core.hooksPath /tmp/e` (E5) is judged on the WRITE segment and stays DENY.
+#
+# THE GUARD-DISABLE VECTOR `git config core.hooksPath /tmp/evil` IS HELD BY TWO INDEPENDENT GUARDS,
+# and it takes BOTH to open it (measured — the honest claim, corrected after review I4):
+#   (1) the query-flag-required line `[ -n "$_gcq" ] || return 1` below — with no query flag the
+#       segment is not a read; and
+#   (2) the operand-count bound in the trailing `case "$_gcq"` — a `--get` with a value token exceeds
+#       the bound and denies.
+# `core.hooksPath /tmp/evil` carries no query flag AND two operands, so EACH guard denies it alone: a
+# mutant of ONE survives because the OTHER still fires (defence in depth, not redundancy claimed as
+# coverage). Only the PAIR opens it — that is why the gate-time kill is M-F6 (removes both, flips it),
+# not a single-guard mutant. M-F1 and M-F5 each show one guard alone still holds.
+#
+# NEVER RECOGNIZED AS A READ, by construction (vet H2 + L2): any segment whose second token is not
+# literally `config` — which is what keeps `-c`/`-C`/`--exec-path` carriers off this arm — and any
+# segment carrying an option outside the two declared lists. The PRE-EXISTING inline-`-c` hole
+# (`git -c core.hooksPath=/tmp/evil <subcmd>` ALLOWs today, because the flat matcher below requires
+# `git config` adjacency) is UNCHANGED here and boarded as GUARD-GIT-INLINE-C-HOOKSPATH-HOLE; this
+# arm must never be widened to "recognize" such a segment.
+# DISCLOSED RIDER (probe surprise 9): `--get-regexp` takes a PATTERN, so a key-spelling that matches
+# `core.hooks` without spelling `core.hooksPath` never reaches the flat matcher at all — pre-existing,
+# unchanged, and not claimed closed.
+_CP8B_GITCFG_QUERY='--get --get-all --get-regexp --get-urlmatch --list -l'
+# Read-side scope/output modifiers, each verified to select or format a READ and never to write.
+# `--file`/`--blob`/`--config-env`/`-c` are deliberately ABSENT: default-deny sends them to the deny.
+_CP8B_GITCFG_SCOPE='--global --local --system --worktree --null -z --name-only --show-origin --show-scope'
+_cp8b_gitcfg_is_read() {
+  case "$1" in
+    *'>'*|*'<'*) return 1 ;;
+    esac
+  case "$1" in
+    *'$'*|*'`'*) return 1 ;;
+    esac
+  _gcg=0; case "$-" in
+    *f*) _gcg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  if [ "${1:-}" != git ];    then [ "$_gcg" = 1 ] || set +f; return 1; fi
+  shift
+  if [ "${1:-}" != config ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi
+  shift
+  _gcq=''; _gco=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)
+        if _cp8b_in_list "$1" "$_CP8B_GITCFG_QUERY"; then
+          if [ -n "$_gcq" ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi   # two query flags: unknown
+          _gcq=$1
+        elif _cp8b_in_list "$1" "$_CP8B_GITCFG_SCOPE"; then
+          :
+        else
+          [ "$_gcg" = 1 ] || set +f; return 1                               # DEFAULT-DENY on unknowns
+        fi ;;
+      *) _gco=$((_gco + 1)) ;;
+    esac
+    shift
+  done
+  if [ -z "$_gcq" ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi   # <== THE CROWN-JEWEL LINE (M-F1)
+  case "$_gcq" in
+    --list|-l)      if [ "$_gco" -ne 0 ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi ;;
+    --get-urlmatch) if [ "$_gco" -gt 2 ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi ;;
+    *)              if [ "$_gco" -gt 1 ]; then [ "$_gcg" = 1 ] || set +f; return 1; fi ;;
+  esac
+  [ "$_gcg" = 1 ] || set +f
+  return 0
+}
+# N5 — a commit/PR MESSAGE that merely NAMES the key is data, not a config write. The exemption is
+# narrowed beyond `_cp8b_tad_is_msg_carrier` by a `$`/backtick decline: without it,
+# `git commit -m "$(git config core.hooksPath /tmp/evil)"` would wear the message costume while the
+# substitution ran the real write (measured DENY today; it must stay DENY).
+# ***REVIEW C1 (2026-08-19): the exemption MUST anchor on the LEADING token pair, not a substring.***
+# `_cp8b_tad_is_msg_carrier` is a substring match, so a trailing shell COMMENT
+# (`git config core.hooksPath /tmp/evil # git commit -m x`) put the `git commit` bytes anywhere in the
+# segment and stole the exemption while the REAL lead ran the hooksPath write — measured ALLOW on the
+# branch, DENY on main, a write-path widening this slice opened. A genuine message carrier LEADS with
+# `git commit`/`gh pr`/…, so keying on the first two whitespace-normalized tokens closes it and moves
+# no other verdict (the F3 comment-suffix battery + mutant M-F7 pin it).
+_cp8b_gitcfg_msg_data() {
+  case "$1" in
+    *'$'*|*'`'*) return 1 ;;
+    esac
+  _gmd=$(printf '%s' "$1" | sed -E 's/^[[:space:]]*//; s/[[:space:]]+/ /g' | cut -d' ' -f1,2)
+  case "$_gmd" in
+    "git commit"|"git merge"|"git tag"|"git notes"|"gh pr"|"gh issue"|"gh release") : ;;
+    *) return 1 ;;
+  esac
+  _cp8b_tad_is_msg_carrier "$1"
+}
+
+# _s6_gh_api_admin "<cmd>": 0 (DENY) iff the command is a `gh api` call with a MUTATING method against
+# an ADMIN-ONLY path. This is the REST plumbing UNDERNEATH the S6 arm's `gh pr merge --admin`: that
+# porcelain flag is *implemented* as `PUT /repos/:o/:r/pulls/:n/merge`. GraphQL `mergePullRequest`
+# honours branch protection; the REST endpoint with an admin token and `enforce_admins:false` does not.
+# So denying only the flag left the same bypass one flag-spelling away — reproduced live 2026-08-25 at
+# rc=0, and the #567 unstick (2026-08-19) was that very call (it rode a recorded GO bound to the
+# approved SHA, so the JUDGMENT control held; the speed-bump simply did not exist for that shape —
+# `D-240825-1` (3) records the correction). Same Tier-3 rule as S6 (`D-240813-5`), so it shares S6's
+# `13:` message rather than minting a second one.
+#
+# FAIL-BY-DISQUALIFICATION on the raw unsplit string (guard-FP doctrine, 2026-08-12): a command is
+# denied only when BOTH a mutating method AND a listed admin path are positively recognized; anything
+# unrecognized falls through to ALLOW here and is judged by the other arms.
+#   (b) mutating = an explicit -X/--method PUT|POST|PATCH|DELETE, OR a body flag with no explicit GET
+#       (`gh api` defaults to POST once a body is given). ONE NORMALISATION, COMPUTED FIRST, READ BY
+#       EVERY PROBE (`$_sgn`) — that ordering is load-bearing, not stylistic; see the note on it in
+#       the body. Both the method flag and the GET suppressor
+#       tolerate quotes and a FUSED value (`-XPUT`, `-X "PUT"`, `-X 'PUT'`, `-X P''UT`, `-'X' PUT`,
+#       `-X\ PUT`, `--met''hod PUT`), and a short body flag
+#       (-f/-F) counts only when it carries a FIELD ASSIGNMENT — `-fmerge_method=squash` and
+#       `-f contexts[]=x` do; a `sort -f` or `grep -F` in a later pipe stage does NOT (round 3: that
+#       over-match denied the owner's own A3 read-back commands).
+#       ⚠️ ROUND-1 DEFECT, recorded because it is the whole lesson: the first version anchored the
+#       method with `[[:space:]=]+`, so a single quote or a missing space walked straight past a deny
+#       arm whose plain form worked. Fix the CLASS (normalize, then match), never the instance.
+#   (c) admin path, after NORMALIZATION (below): the pulls/N/merge bypass · ANY branches/*/protection
+#       sub-path · repo or org rulesets · git/refs (a ref PATCH with force=true is a force-push over
+#       the API) · collaborators/* (a PUT mints an admin) · and the repo ROOT under DELETE or PATCH
+#       (a default_branch swap moves protection off the branch everything merges to). The last three
+#       are Tier-3 acts in `D-240813-5`'s own words: force-push, privilege grant, delete.
+#
+# NORMALIZATION, in order, because matching a raw argv string is how round 1 lost: quotes and
+# BACKSLASHES → DELETED (a quote JOINS in the shell, it does not separate — round 2 spaced them and
+# `me''rge` walked through) · `https?://<host>/` → space (ANY host, so a GHES `--hostname` call
+# normalizes identically) · `?` → space (truncate the query string) · `//` → `/`.
+# ONE NORMALISATION, COMPUTED FIRST, READ BY EVERY PROBE. The quote/backslash deletion is `$_sgn`
+# and is computed before the `gh api` probe, before the method loop and before the body-flag test;
+# the path view `$_sga` is derived FROM it. Round 3 computed the deletion late, so the method probes
+# still read raw `$1` and the same joiner bypass simply moved from the path to the method
+# (round 4). If you add a probe to this function, read `$_sgn` — never `$1`.
+# Terminators are then `([[:space:]/]|$)` where a sub-path cannot change the verdict — EXCEPT the repo
+# root, which stays exact-segment, because widening it with `/` would swallow every path under it.
+#
+# THE ONE CARVE-OUT: method POST *and* path `…/protection/required_status_checks/contexts`. That is
+# `scripts/branch-protection-apply.sh --apply`'s own human-run call — ADDITIVE, it strengthens
+# protection, and denying it would break the very script that closes A3. Note the SHAPE: the rule is
+# deny-the-prefix with a method-scoped hole, NOT allow-a-sub-tree. Round 1 had it inverted — it
+# enumerated four weakening sub-resources and let the rest through, so `-X DELETE
+# …/protection/required_status_checks` (which drops every required context at once) was ALLOW.
+# The ALLOW cell for the POST is load-bearing under this shape: delete the carve-out and it reds.
+#
+# ── HONEST CEILING. A SPEED BUMP ON ONE CLIENT, AND ONLY ON PLAINLY-WRITTEN COMMANDS.
+# "Denied" here means "denied when written plainly". Disclosed, NOT closed:
+#   · INDIRECTION — `$VAR`, `$(cat f)`, `xargs`, a `gh alias` that expands to the call: the bytes the
+#     guard scans are not the bytes that run.
+#   · QUOTED WRAPPERS — `sh -c '…'`, `bash -lc '…'`. PRE-EXISTING, NOT introduced here: it blinds the
+#     incumbent `--admin` arm and the porcelain-token arms (measured: `sh -c 'gh pr merge 5 --admin'`
+#     is ALLOW, on the base tree too). **S6R happens to survive it** — measured — because its first
+#     probe matches the wrapped bytes as text and the path normalizer never needed the argv split.
+#     That is LUCK, NOT DESIGN: do not generalise it to the other arms, and do not let it argue the
+#     class is closed. A cell pins S6R's survival so it cannot regress silently; the class is boarded
+#     as GUARD-QUOTED-WRAPPER-BLINDS-COMMAND-ARMS.
+#   · PERCENT-ENCODED SEGMENTS — `repos/o/r/pulls/5/%6Derge` is ALLOW (measured); nothing decodes
+#     `%XX` here. Boarded on GUARD-REST-ADMIN-CURL-SIBLING.
+#   · ANSI-C AND OTHER SHELL-EVALUATED METHOD SPELLINGS — `$'PUT'`, `$"PUT"`, `${M:-PUT}`,
+#     `-X{,}PUT` (brace expansion), `P$()UT`, backticks — are ALLOW (measured): the normalisation
+#     deletes BYTES, it does not EVALUATE. Closed by the positional-extract row together with the
+#     `$VAR` family (GUARD-S6R-POSITIONAL-PATH-EXTRACT), rather than special-cased one spelling at a
+#     time — enumerating expansion syntaxes is the same losing move as enumerating paths.
+#     Every quote/backslash SPLIT form is closed by contrast, including the pathological
+#     `g''h a''pi -''X P''UT re''pos/o/r/pu''lls/5/me''rge`.
+#   · SUBSTRING, NOT ARGV — ⚠️ HALF-RETIRED BY GUARD-ADMIN-ARMS (K-3b face D, 2026-09-09), and the
+#     sentence is rewritten rather than deleted because WHICH half survives is the interesting part.
+#     `gh api`'s operand is now read POSITIONALLY (`_s6_api_endpoint`) and, when that read succeeds,
+#     the endpoint is judged in `exact` mode — so an admin path in a HEADER value, a BODY field or an
+#     `--input` FILENAME is no longer an endpoint, the contexts carve-out is an EQUALITY rather than a
+#     subtraction, and a fragment / dot-segment / percent-encoding / case variant in a mutating
+#     endpoint is DISQUALIFIED instead of walking through. WHAT SURVIVES: the read DECLINES on anything
+#     it cannot settle — an unknown flag, a second operand, an unreadable cluster, any `$` or backtick
+#     — and this substring scan is then still the judge of record for those commands. So the class is
+#     narrowed to "argv the guard cannot read", not closed.
+#   · The body-flag narrowing has its own narrow residual: a downstream `grep -F name=x` (a field
+#     ASSIGNMENT in a later pipe stage) still reads as a body flag. Strictly narrower than round 2,
+#     and it costs a prompt on a read rather than opening a write.
+#   · OTHER CLIENTS — ⚠️ CLOSED BY GUARD-ADMIN-ARMS (K-3b, 2026-09-09), except for the interpreters.
+#     `curl`, `wget`, httpie/`xh`, `/usr/bin/curl`, `command curl`, `$CURL`, `--url`, `--next` and any
+#     renamed binary are judged by `_s6_http_admin` (face C), which asks nothing about the lead and
+#     hands the path to the SAME judge as this scan; the `gh` porcelain verbs (`gh repo delete|edit|
+#     archive|unarchive|rename`, `gh repo deploy-key add|delete`, `gh ssh-key|gpg-key add|delete`) by
+#     `_s6_gh_porcelain_admin` (face A), whose verb set is DERIVED from this judge rather than listed.
+#     `gh ruleset delete` DOES NOT EXIST at gh 2.96.0 (only `check`/`list`/`view`) — that face of the
+#     fold-epic is closed by MEASUREMENT, not by an arm, which is worth more than an arm for a verb
+#     nobody can type. WHAT REMAINS OPEN: `python3 -c "requests.put(…)"` and `node -e "fetch(…)"` — the
+#     interpreter ceiling every arm in this file carries — and absent bytes (`curl -X $M`, `$URL`).
+#   ⚠️ `--hostname` (GHES) is NOT in this list: it DENIES, because the host is normalized away and the
+#     path is what matters. Round 1's comment claimed otherwise; the fixture cells are the truth.
+# And one clause that must not be over-read: GraphQL `mergePullRequest` honouring branch protection is
+# GITHUB-SIDE BEHAVIOUR, not a permission boundary this guard maintains — it is why the REST endpoint
+# is the interesting one, not a reason to trust the GraphQL path.
+# The DURABLE controls remain `D-240813-5`'s human keystroke, the settings allowlist (A2) and
+# server-side branch protection with `enforce_admins:true` once a second human exists (A3/D2).
+# T2 round 1 (GUARD-READ-LANE-2): the REST half inherited the porcelain half's joiner holes, and the
+# seat measured both live — `gh api -X PUT repos/o/r/pulls/5/me$()rge` and a `gh \<nl>api …` line
+# continuation both ALLOWED at 4b9f464f. Same doctrine, same shape as the porcelain arm: JOIN
+# continuations first (grep is line-oriented), then run the WHOLE scan over TWO views — the joined
+# string, and a substitution-stripped twin. Two views, because stripping in a single view would lose
+# the deny on `gh api -X PUT `echo repos/o/r/pulls/5/merge`` , whose bytes live inside the
+# substitution. This wrapper is add-only: it can only ever add a second chance to DENY.
+# T2 round 2: the REST half gets the porcelain half's round-2 precision, because the arm family is
+# ONE arm and the seat measured the same two holes here — `gh api -X PUT …/pulls/5/me\<nl>rge` (an
+# INTRA-TOKEN continuation, which the space-join turned into `me rge`, matching nothing) and
+# `…/me$(<nl>)rge` (a newline the line-oriented sed could not cross). Both ALLOWED at 35a2032f.
+# Four views now, deny on any: space-joined, EMPTY-joined, and each one's fixpoint-stripped twin.
+# Still add-only — every view is a superset match, so no existing deny is lost.
+# ── K-3b 3-0: THE JUDGE, EXTRACTED — `_s6_admin_path_verdict "<method>" "<view>" "<mode>"` ─────────
+# WHAT IT IS. The Tier-3 endpoint FAMILY table, and nothing else: 0 (DENY) iff <view> names one of the
+# families under <method>. It was inlined in `_s6_gh_api_admin_scan` and had exactly one caller; the
+# admin arms of GUARD-ADMIN-ARMS give it four (the REST scan, the porcelain verbs, the other HTTP
+# clients, and the positional endpoint read), so it moves into a function that each of them DERIVES
+# from. That is the whole point of the slice: an enumeration of CLIENTS protects only the names we
+# happened to have, so every face asks the SAME question — "is this the endpoint?" — of the SAME table.
+# A later family is then added once, here, rather than four times.
+#
+# WHY IT IS AN EXTRACTION AND NOT A REWRITE. The six incumbent rules are carried over VERBATIM in
+# `substring` mode: same regexes, same order, same method sets, same carve-out shape. The mode picks
+# the ANCHORS and nothing else, and in `substring` mode every anchor expands to the bytes that were
+# already there — so the 75 S6R cells and the M-R mutants cannot move. Verify that claim by diffing the
+# expansions, not by trusting this paragraph.
+#
+# THE TWO MODES.
+#   `substring` — <view> is the WHOLE normalised command string (`$_sga`), which is what the incumbent
+#                 scan has always matched against ("SUBSTRING, NOT ARGV"). A path anywhere in the
+#                 string counts. Over-denies on a decoy; that is today's behaviour and today's price.
+#   `exact`     — <view> is ONE endpoint, already normalised by the positional read (face D). The
+#                 anchors tighten to the whole string.
+# ⚠️ EXACT-MODE ANCHORING IS NOT `^…$` ON THE PREFIX (security design vet, S-3, and it would have been
+# a live REGRESSION). A SUB-TREE family — protection, rulesets, collaborators, git/refs, keys, contents,
+# the account key mints, the org grants — anchors `^<prefix>(/.*)?$`. Anchor the prefix alone and
+# `DELETE repos/o/r/branches/main/protection/required_status_checks` — a call that drops every required
+# context at once, and an EXISTING deny with its own cell — would have flipped to ALLOW the moment face
+# D started certifying endpoints. The repo ROOT stays exact-segment with an optional trailing slash
+# (widening it with `/` would swallow every path under it — the incumbent's own note), the merge bypass
+# is an exact ENDPOINT, and the contexts carve-out is asked as an EQUALITY rather than by subtraction.
+# `K-3b-M16` is the mutant that pins the sub-tree suffix.
+#
+# WHAT STAYS IN THE CALLER, deliberately: the GET suppression and the "no method, so a body is what
+# makes it a write" gate. Both are questions about the COMMAND, not about the endpoint, and a face that
+# has already established its method (face C reads it off the client's flags) must not have to
+# re-litigate them. The caller therefore always hands a NON-EMPTY method, mapping "no method + a body"
+# to `post` — which is what `gh api` and `curl` both do — so the `''` arms of the incumbent method sets
+# collapse with no verdict moving.
+#
+# THE FAMILIES, and why each is Tier 3 (`D-240813-5`: privilege grant, delete, force, protection move):
+#   1  the merge bypass `pulls/:n/merge`      the REST implementation of `gh pr merge --admin`
+#   2  `branches/*/protection` (sub-tree)     with the ONE carve-out: POST to `…/required_status_checks/
+#                                             contexts`, `branch-protection-apply.sh --apply`'s own
+#                                             human-run ADDITIVE call
+#   3  repo or org `rulesets` (sub-tree)      the same class as protection
+#   4  `git/refs` (sub-tree)                  `-f force=true` on a ref IS a force-push over the API
+#   5  `collaborators/*`                      a PUT mints an admin (PATCH is NOT in the set — today's
+#                                             method list, carried over unchanged)
+#   6  the repo ROOT under DELETE or PATCH    deletion, or a `default_branch` swap that moves protection
+#                                             off the branch everything merges to
+#   7  `repos/:o/:r/keys` (sub-tree)          a write-enabled DEPLOY KEY is a credential mint — the
+#                                             collaborators class, and the endpoint `gh repo deploy-key
+#                                             add` implements
+#   8  `user/keys`, `user/ssh_signing_keys`, `user/gpg_keys`   ACCOUNT-scoped credential mints (vet
+#                                             S-6): a key added here authenticates as the human
+#   9  `repos/:o/:r/transfer`                 repo LOSS — the delete class by another name (vet S-6)
+#  10  `orgs/:o/memberships/*` and `orgs/:o/teams/*/repos/*`   org privilege grants (vet S-6)
+#  11  `branches/*/rename`                    the default-branch swap by another name
+#  12  `merges` and `contents/*` under PUT/POST/DELETE   the REST twins of `git push origin main`
+#                                             (`POST …/merges` merges a head into a branch server-side;
+#                                             `PUT …/contents/*` commits to a branch — the DEFAULT
+#                                             branch when `branch` is omitted), which this guard already
+#                                             speed-bumps locally. Owner decision 4, 2026-09-09.
+#  13  `statuses/:sha` and `check-runs` under POST/PATCH   a required context posted from a session is
+#                                             the merge gate bypassed by FICTION, and this kit already
+#                                             retired every API-posted context to a real job
+#                                             (`REQUIRED-CHECK-POSTED-VIA-API-NOT-MATCHED`). Owner
+#                                             decision 9d, 2026-09-09.
+# The method sets are deliberately WIDER than GitHub's current routing table (the incumbent's own
+# reasoning): "that verb 405s today" is a fact about GitHub's implementation, not a property this guard
+# should rest on. No legitimate agent traffic writes to any of these paths, so the width costs nothing.
+_s6_admin_path_verdict() {
+  _apm=$1; _apv=$2
+  # THE ANCHORS ARE THE ONLY THING THE MODE CHOOSES. Four of them, because four SHAPES of family exist
+  # and collapsing them is how the vet's S-3 regression would come back: `_apt` a sub-tree, `_ape` one
+  # endpoint, `_apr` the repo root, `_aps` the "at least one more byte" tail of `collaborators/`.
+  if [ "$3" = exact ]; then
+    _apl='^';                    _apt='(/.*)?$'; _ape='$';                 _apr='/?$';                 _aps='.*$'
+  else
+    _apl='(^|[[:space:]]|/)';    _apt='([[:space:]/]|$)'; _ape='([[:space:]/]|$)'; _apr='/?([[:space:]]|$)'; _aps=''
+  fi
+  # The contexts path, REMOVED — see the carve-out below. Computed once, here, so the carve-out can
+  # be a question about what REMAINS rather than about what is merely present somewhere.
+  # ONE process on a here-document: an EMPTY `_apc` reads as "no protection path survives", i.e. the carve-out
+  # applies and a protection POST is allowed — so a failed fork must be a fault, and cannot be told from a
+  # legitimately blank result by value (the contexts path alone leaves a space).
+  _apc=$(_s6_hd_sed "$_apv" -E 's#(^|[[:space:]]|/)repos/[^/[:space:]]+/[^/[:space:]]+/branches/[^/[:space:]]+/protection/required_status_checks/contexts([[:space:]/]|$)# #g') || _guard_fault http-path-contexts
+
+  _apr2=1
+  # 1 — the merge bypass itself (the REST implementation of `gh pr merge --admin`).
+  if _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/pulls/[0-9]+/merge${_ape}"; then
+    _apr2=0
+  # 2 — branch protection: DENY the whole sub-tree, with the single POST-to-contexts carve-out.
+  # ⚠️ THE CARVE-OUT IS POSITIONAL-BY-SUBTRACTION in substring mode, not a presence test. Round 2 of
+  # the incumbent asked "does the contexts path appear anywhere?", so a DECOY IN A FILENAME took the
+  # exemption and opened the entire protection subtree under POST (measured ALLOW at 5ada56d9). Now:
+  # strip every contexts occurrence and ask whether a protection path SURVIVES. In `exact` mode the
+  # subtraction is unnecessary and would be wrong — there is exactly one endpoint — so the carve-out is
+  # asked as the EQUALITY it always meant.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/branches/[^/[:space:]]+/protection${_apt}"; then
+    if [ "$_apm" = post ] \
+       && ! _s6_apc_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/branches/[^/[:space:]]+/protection${_apt}"; then
+      _apr2=1
+    else
+      _apr2=0
+    fi
+  # 3 — repo or org rulesets (same class as protection).
+  elif _s6_apv_has "${_apl}(repos/[^/[:space:]]+/[^/[:space:]]+|orgs/[^/[:space:]]+)/rulesets${_apt}"; then
+    _apr2=0
+  # 4 — git/refs: `-f force=true` on a ref IS a force-push (Tier 3).
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/git/refs${_apt}"; then
+    case "$_apm" in
+      patch|delete|post|put) _apr2=0 ;;
+      esac
+  # 5 — collaborators: minting or revoking access is a privilege grant (Tier 3).
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/collaborators/[^[:space:]]${_aps}"; then
+    case "$_apm" in
+      put|delete|post) _apr2=0 ;;
+      esac
+  # 7 — repository DEPLOY KEYS. `POST …/keys` with `read_only:false` mints a WRITE credential that
+  # outlives the session; `gh repo deploy-key add --allow-write` is its porcelain. Same class as 5.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/keys${_apt}"; then
+    case "$_apm" in
+      put|delete|post|patch) _apr2=0 ;;
+      esac
+  # 8 — ACCOUNT credential mints (vet S-6). Not repo-scoped at all: a key here authenticates as the
+  # human everywhere. `gh ssh-key add` / `gh gpg-key add` are the porcelain (face A).
+  elif _s6_apv_has "${_apl}user/(keys|ssh_signing_keys|gpg_keys)${_apt}"; then
+    case "$_apm" in
+      put|delete|post|patch) _apr2=0 ;;
+      esac
+  # 9 — repo TRANSFER (vet S-6): the repository leaves. The delete class with a different verb.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/transfer${_ape}"; then
+    case "$_apm" in
+      put|delete|post|patch) _apr2=0 ;;
+      esac
+  # 10 — ORG privilege grants (vet S-6): a membership role, or a team's permission ON a repository.
+  elif _s6_apv_has "${_apl}orgs/[^/[:space:]]+/(memberships/[^/[:space:]]+|teams/[^/[:space:]]+/repos/[^/[:space:]]+/[^/[:space:]]+)${_apt}"; then
+    case "$_apm" in
+      put|delete|post|patch) _apr2=0 ;;
+      esac
+  # 11 — branch RENAME: the default-branch swap by another name. Renaming `main` moves every protection
+  # rule keyed on the old name and re-points the default branch in one call.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/branches/[^/[:space:]]+/rename${_ape}"; then
+    case "$_apm" in
+      put|delete|post|patch) _apr2=0 ;;
+      esac
+  # 12 — the PUSH TWINS (owner decision 4). `POST …/merges` merges a head INTO a branch server-side and
+  # `PUT/DELETE …/contents/*` commits to a branch by API — the DEFAULT branch when `branch` is omitted.
+  # Both are the REST spelling of `git push origin main`, which this guard already denies locally.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/(merges${_ape}|contents/[^[:space:]]${_aps})"; then
+    case "$_apm" in
+      put|post|delete) _apr2=0 ;;
+      esac
+  # 13 — FORGED GREEN CHECKS (owner decision 9d). A required context posted from a session satisfies
+  # the merge gate with a fiction. POST/PATCH only: a GET of a status is an ordinary read.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+/(statuses/[^[:space:]]${_aps}|check-runs${_apt})"; then
+    case "$_apm" in
+      post|patch) _apr2=0 ;;
+      esac
+  # 6 — the repo ROOT under DELETE (repo deletion) or PATCH (a default_branch swap moves protection
+  # off the branch everything merges to). EXACT SEGMENT plus an optional TRAILING slash: `/?` before
+  # the terminator accepts `repos/o/r/` without widening to `repos/o/r/anything`.
+  # ⚠️ IT IS LAST, AND THAT IS LOAD-BEARING: every family above is a path UNDER the root, and the chain
+  # is an if/elif precisely so the more specific rule (with its own method set) is the one that answers.
+  elif _s6_apv_has "${_apl}repos/[^/[:space:]]+/[^/[:space:]]+${_apr}"; then
+    case "$_apm" in
+      delete|patch) _apr2=0 ;;
+      esac
+  fi
+
+  # Two exit paths rather than one more captured variable — see the same note on `_cp8b_gh_order`.
+  if [ "$_apr2" = 0 ]; then
+    unset _apm _apv _apl _apt _ape _apr _aps _apc _apr2 2>/dev/null || :
+    return 0
+  fi
+  unset _apm _apv _apl _apt _ape _apr _aps _apc _apr2 2>/dev/null || :
+  return 1
+}
+
+# ── K-3b FACE D — `_s6_api_endpoint "<view>"`: THE POSITIONAL READ OF `gh api`'s ONE OPERAND. ──────
+# WHAT IT FIXES, IN BOTH DIRECTIONS — and it is the only face in this slice that REFUNDS.
+# `_s6_gh_api_admin_scan` matches every admin path as a SUBSTRING of the whole normalised string
+# ("SUBSTRING, NOT ARGV", the incumbent's own disclosed residual). That is wrong twice over:
+#   OVER-DENY — an admin path in a HEADER value, a BODY field or an `--input` FILENAME denies a
+#     harmless call. `gh api -X POST repos/o/r/issues/1/comments -f body="see …/protection"` is a
+#     COMMENT, and it denied. Four such shapes are refunded here (`K-3b-R`), and one more the design
+#     did not name (`-X PUT repos/o/r/issues/1/lock -H "X: …/rulesets/7"`) with them.
+#   UNDER-DENY — a fragment, a dot-segment, a percent-encoding or a case variant in a MUTATING
+#     endpoint walked straight through, because none of them spells the path the substring wants.
+#     `gh api -X PUT repos/o/r/pulls/5/merge#frag` and `…/pulls/5/%6Derge` were complete admin merges.
+# The cure is the same one for both: read the ENDPOINT positionally, and when the read succeeds judge
+# it in `exact` mode. The contexts carve-out then stops being a subtraction trick and becomes what it
+# always meant — "the endpoint EQUALS the contexts path".
+#
+# ⚠️ IT DECLINES RATHER THAN GUESSES (`D-240813-3`, fail by DISQUALIFICATION). On ANY byte it cannot
+# settle the walk returns 1 and the caller runs TODAY'S substring scan, whose verdict therefore stands
+# unchanged — so this face can never LOSE a deny. It declines on an unknown `-`-leading token, a
+# SECOND non-flag token, an unreadable cluster, and any token containing `$` or a backtick. That is
+# what keeps `gh api -X PUT --bogus-flag …/merge`, `… /merge extra`, `… /merge >/dev/null 2>&1` and
+# `sh -c 'gh api -X PUT …/merge'` denying exactly as they do today, and `gh api -X PUT $P` allowing
+# exactly as it does today (the absent-bytes ceiling — D12, unchanged).
+#
+# ⚠️ AN EXACT-MODE ALLOW IS NOT A CERTIFICATION THAT THE CALL IS HARMLESS (fix round 2, C-4, LOW —
+# disclosed, not closed). `exact` mode anchors the whole endpoint, so a shape `gh api` itself cannot
+# reach ALLOWS here where the old substring scan denied it: `localhost/repos/…`, `[::1]/repos/…`,
+# `//api.github.com/repos/…`, a bare `x/repos/…`, and a trailing segment on a real endpoint
+# (`…/pulls/5/merge/x`). Each is a 404 from `gh` rather than a request, so the movement is allow-ward
+# on strings that do not reach GitHub — but that is an argument about gh's routing, not a property this
+# function establishes, so it is written down rather than claimed. If a later `gh` starts resolving one
+# of these, the anchoring is where to look.
+# ⚠️ THE SAME DISCLOSURE COVERS THE ENCODED HEAD (fix round 4, D-2). The scheme/host strip, the
+# dot-first-segment strip and `api/v3/` run ONLY on the operand as written, never on what the decode
+# produced — so `https%3A%2F%2Fapi.github.com%2Frepos%2F…`, `api.github.com%2Frepos/…` and
+# `api%2Fv3%2Frepos/…` ALLOW. They also ALLOW at the pristine core, so nothing regressed; each is a
+# 404 from `gh`, which PREFIXES its own host and never treats an encoded scheme as one. A SECOND
+# head-strip pass is deliberately NOT added: it would be a normalisation whose only subjects are
+# strings that do not reach GitHub, and the C-4 rule applies unchanged — an exact-mode ALLOW on a host
+# shape gh itself 404s is DISCLOSED, not certified. The TAIL is different and is fixed rather than
+# disclosed (C-5, C-6), because there the decode produced bytes that changed a REAL endpoint's answer.
+# THE FLAG TABLE IS PINNED TO `gh 2.96.0`, beside `_CP8B_API_READONLY_FLAGS` and with the same
+# re-measure note: this is a CLI surface, not a protocol one, so a later `gh` that gives a flag a new
+# arity silently changes what "the first non-flag token" is. Re-measure when the pinned version moves.
+# A SHORT CLUSTER is read letter by letter (vet S-2): boolean letters consume nothing, the FIRST value
+# letter takes the rest of the cluster as its fused value or, if nothing follows it, the next token
+# (`-iXPUT`, `-iX PUT`). A cluster whose letters are not all in the table DECLINES — the K-3a-M1b
+# lesson, where judging a cluster on its first letter alone admitted an exec flag glued on behind.
+_CP8B_API_VALUE_FLAGS='-X --method -f --raw-field -F --field -H --header --input -q --jq -t --template --cache --hostname -p --preview'
+_CP8B_API_BOOL_FLAGS='-i --include --paginate --silent --slurp --verbose'
+_CP8B_API_VALUE_LETTERS='XfFHqtp'
+_CP8B_API_BOOL_LETTERS='i'
+# `_cp8b_api_tokens "<view>"`: one shell WORD per line, quotes consumed as the shell consumes them.
+# The same awk walk `_cp8b_api_expansion_indicator` uses, and for the same measured reason: a POSIX
+# `for` loop over `$1` cannot see quotes, so `-H "A: repos/…"` would word-split into two tokens and the
+# path inside a HEADER would look like an operand — which is the exact over-deny this face refunds.
+_cp8b_api_tokens() {
+  printf '%s\n' "$1" | awk '
+    { buf = buf $0 " " }
+    END {
+      q = ""; tok = ""; started = 0; L = length(buf)
+      for (i = 1; i <= L; i++) {
+        c = substr(buf, i, 1)
+        if (q != "") { if (c == q) { q = "" } else { tok = tok c } ; started = 1; continue }
+        if (c == "\047" || c == "\042") { q = c; started = 1; continue }
+        if (c == "\\") { i++; if (i <= L) { tok = tok substr(buf, i, 1) } ; started = 1; continue }
+        if (c == " " || c == "\t") { if (started) { print tok; tok = ""; started = 0 } ; continue }
+        tok = tok c; started = 1
+      }
+      if (started) print tok
+    }'
+}
+# `_s6_pct_decode "<s>"`: ONE percent-decoding pass, `%XX` -> the byte, everything else untouched.
+# ⚠️ NO `strtonum`, DELIBERATELY: that is a gawk extension and this hook runs under BSD awk on macOS
+# and mawk on Debian CI. The hex map is four lines and portable everywhere; a helper that works on the
+# author's box and dies on the adopter's is worse than no helper. A malformed `%` (not two hex digits)
+# is left ALONE, so it survives to the caller's fixpoint check and disqualifies there.
+_s6_pct_decode() {
+  printf '%s' "$1" | awk '
+    BEGIN { hx = "0123456789abcdef" }
+    function hex2(h,   a, b) {
+      a = index(hx, substr(tolower(h), 1, 1)) - 1
+      b = index(hx, substr(tolower(h), 2, 1)) - 1
+      return a * 16 + b
+    }
+    { s = $0; out = ""; L = length(s)
+      for (i = 1; i <= L; i++) {
+        c = substr(s, i, 1)
+        if (c == "%" && i + 2 <= L) {
+          h = substr(s, i + 1, 2)
+          if (h ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { out = out sprintf("%c", hex2(h)); i += 2; continue }
+        }
+        out = out c
+      }
+      printf "%s", out
+    }'
+}
+# Returns: 0 and PRINTS the normalised endpoint · 1 = DECLINE (caller keeps today's substring verdict)
+# · 2 = DISQUALIFIED (the endpoint carries a byte that makes it uncertifiable under a mutating method,
+# so the caller denies outright without consulting the judge).
+# `_s6_api_norm_tail "<endpoint>"`: the five normalisations that must hold of the FINAL endpoint —
+# query/fragment truncation, whitespace trim, `//+` collapse, leading and trailing `/` strip.
+# ⚠️ ONE DEFINITION, TWO CALL SITES, and that is the point (fix round 3, C-5). It runs once on the
+# operand as written and AGAIN on whatever the percent-decode produced, because a decode can create
+# every byte this removes: `%2F` is `/`, `%3F` is `?`, `%20` and `%09` are whitespace. Spelling it
+# twice inline would be two rules that drift; as one helper, `K-3b-M29` kills both call sites at once.
+# ⚠️ THE TWO END STRIPS ARE ONE CHARACTER CLASS, NOT FOUR ORDERED PASSES (fix round 4, security C-6),
+# and the fix is one line because the defect was one ordering. It used to trim whitespace and THEN
+# strip a single `/`, so a MIXED tail survived: `repos/o/r%20%2F` decodes to `repos/o/r /`, the trim
+# found no trailing space (the `/` was last), the `/` strip removed it, and `repos/o/r ` was left —
+# which matches no family. DENY at the pristine core, ALLOW here: an allow-ward mover, the one
+# direction this slice may not have. Two calls only bought two levels; `merge / / ` needed three.
+# ★ WHEN A STRIP CAN REVEAL ANOTHER STRIP'S SUBJECT, ORDERED SINGLE PASSES ARE A FIXPOINT PROBLEM
+# WEARING A DISGUISE. Stripping the RUN `[[:space:]/]+` at each end settles every interleaving in one
+# pass, with no loop to bound — the third pipeline-order lesson in this slice, cured by removing the
+# order rather than by adding a pass. `//+` collapses FIRST so an interior `//` is gone before the ends
+# are considered. The helper stays the single holder, so `K-3b-M29` still kills both call sites.
+_s6_api_norm_tail() {
+  printf '%s' "$1" | sed -E -e 's/[?#].*$//' \
+                            -e 's#//+#/#g' \
+                            -e 's#^[[:space:]/]+##' -e 's#[[:space:]/]+$##'
+}
+# `_s6_api_dotseg "<endpoint>"`: 0 iff the endpoint carries a `.` or `..` SEGMENT.
+# ⚠️ A FUNCTION, NOT A PATTERN VARIABLE, and the first cut of this fix got it wrong in a way worth
+# recording: `case "$x" in $PATLIST)` does NOT give alternation. A `case` pattern's `|` separators are
+# SYNTAX, parsed before expansion, so an expanded variable containing `|` is ONE pattern with a literal
+# bar in it — the test silently matched nothing and two existing denies (`repos/o/r/../r/…/merge`,
+# `./repos/…`) flipped to ALLOW. Caught by re-running the fix round's own RED probe, which is why the
+# probe is run again after every cure rather than only at the end. One function, two call sites, one
+# mutant (`K-3b-M12`) that kills both.
+_s6_api_dotseg() {
+  case "$1" in
+    .|..|./*|../*|*/./*|*/../*|*/.|*/..) return 0 ;;
+  esac
+  return 1
+}
+_s6_api_endpoint_walk() {
+  _aeg=0; _aea=0; _aeend=0; _aeep=''; _aen=0; _aepend=''
+  _aeout=$(_cp8b_api_tokens "$1") || _guard_fault api-endpoint
+  while [ -n "$_aeout" ]; do
+    case "$_aeout" in
+      *"$_cp8b_nl"*) _aet=${_aeout%%"$_cp8b_nl"*}; _aeout=${_aeout#*"$_cp8b_nl"} ;;
+      *)             _aet=$_aeout; _aeout='' ;;
+    esac
+    # (1) find the `gh api` ADJACENCY. It stays adjacency, deliberately and by measurement: `gh` REJECTS
+    # a hoisted global flag before `api` (`gh -R o/r api …` exits "unknown shorthand flag" at 2.96.0
+    # and never reaches the endpoint), so there is no real invocation to widen for and widening would
+    # only manufacture over-denies.
+    if [ "$_aea" = 0 ]; then
+      if [ "$_aeg" = 1 ] && [ "$_aet" = api ]; then _aea=1; _aeg=0; continue; fi
+      _aegl=$(printf '%s' "$_aet" | tr 'A-Z' 'a-z')
+      case "$_aegl" in
+        gh|*/gh) _aeg=1 ;;
+        *) _aeg=0 ;;
+        esac
+      continue
+    fi
+    # An expansion byte ANYWHERE in a token after `api` means the argv the shell builds is not the argv
+    # here, so no position can be trusted. Decline; today's verdict stands.
+    case "$_aet" in
+      *'$'*|*'`'*) return 1 ;;
+      esac
+    # A pending value-flag swallows this token whatever it looks like — that is the whole refund.
+    if [ -n "$_aepend" ]; then _aepend=''; continue; fi
+    if [ "$_aeend" = 0 ]; then
+      if [ "$_aet" = '--' ]; then _aeend=1; continue; fi
+      case "$_aet" in
+        --*)
+          _aefl=${_aet%%=*}
+          if _cp8b_in_list "$_aefl" "$_CP8B_API_BOOL_FLAGS"; then continue; fi
+          if _cp8b_in_list "$_aefl" "$_CP8B_API_VALUE_FLAGS"; then
+            case "$_aet" in
+              *=*) : ;;
+              *) _aepend=1 ;;
+              esac
+            continue
+          fi
+          return 1 ;;
+        -?*)
+          # THE CLUSTER, letter by letter. The first VALUE letter takes the rest of the cluster as its
+          # fused value; if nothing follows it, the next token. Any letter outside the two tables
+          # declines the whole read (K-3a-M1b: a cluster judged on its first letter admits what is
+          # glued behind it).
+          _aecl=${_aet#-}
+          _aebad=0
+          while [ -n "$_aecl" ]; do
+            _aec=${_aecl%"${_aecl#?}"}; _aecl=${_aecl#?}
+            case "$_CP8B_API_VALUE_LETTERS" in
+              *"$_aec"*) if [ -z "$_aecl" ]; then _aepend=1; fi; _aecl='' ;;
+              *) case "$_CP8B_API_BOOL_LETTERS" in
+                *"$_aec"*) : ;;
+                *) _aebad=1; _aecl='' ;;
+                esac ;;
+            esac
+          done
+          [ "$_aebad" = 0 ] || return 1
+          continue ;;
+        -)  : ;;                     # a bare `-` is stdin, an OPERAND, not a flag
+      esac
+    fi
+    # (2) the FIRST non-flag token is the endpoint; a SECOND one means the argv is not what this walk
+    # thinks it is, so decline.
+    _aen=$((_aen + 1))
+    [ "$_aen" = 1 ] || return 1
+    _aeep=$_aet
+  done
+  [ "$_aen" = 1 ] || return 1
+  # (3) NORMALISE exactly as the substring path does — scheme+host (any host), `api/v3/`, `//`, then
+  # the leading and trailing `/` and any surrounding whitespace a quoted operand may carry
+  # (`gh api -X PUT "repos/o/r/pulls/5/merge "` denies today and must keep denying). The QUERY and
+  # FRAGMENT are TRUNCATED rather than disqualifying: truncation is what the substring scan already
+  # does to `?`, it is what makes `…/pulls/5/merge?x=1` keep its existing DENY, and it is what keeps
+  # `…/issues/1/comments?x=1` an ALLOW instead of manufacturing an over-deny out of a query string.
+  # ⚠️ THE SCHEME-LESS HOST STRIP IS A POST-BUILD FIX, and it is recorded as one because it was an
+  # ALLOW-WARD REGRESSION this face introduced and only an out-of-battery probe found it.
+  # `gh api -X PUT api.github.com/repos/o/r/pulls/5/merge` DENIED at 7a5255c3 (the substring scan sees
+  # `/repos/…` wherever it sits) and ALLOWED once `exact` mode anchored `^repos/…`, because the
+  # `https?://` strip has no scheme to match. ★ An anchoring change is a NARROWING, and a narrowing
+  # must be measured against the denies it used to make — the round-4 lesson of the arm above, relearnt
+  # here. The strip is safe because NO GitHub API route root contains a dot (`repos`, `orgs`, `user`,
+  # `users`, `teams`, `gists`, `search`, `graphql`, `notifications`, `rate_limit`, `meta`, …), so a
+  # dot-bearing FIRST segment can only be a host — and it requires at least one byte before the dot, so
+  # a leading `./` is left alone for the dot-segment disqualifier below to refuse.
+  _aeep=$(printf '%s' "$_aeep" \
+    | sed -E -e 's#[Hh][Tt][Tt][Pp][Ss]?://[^/[:space:]]*/# #g' \
+             -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+             -e 's#^[^/[:space:]]+\.[^/[:space:]]*/##' \
+             -e 's#api/v3/##g') || _guard_fault api-endpoint
+  _aeep=$(_s6_api_norm_tail "$_aeep") || _guard_fault api-endpoint
+  # (4) NORMALISE, THEN JUDGE — it used to DISQUALIFY, and that was an over-deny with the loudest
+  # possible message (fix round 1, S-4). `%` and any capital letter were treated as "not certified",
+  # i.e. denied outright under the merge-bypass reason. But a capital is ORDINARY in the two segments
+  # that carry human names — this repo's own owner is `SeaBrad72` — and `%20` is ordinary in a label:
+  #   gh api -X POST repos/SeaBrad72/sparkwright/issues/1/comments -f body=hi   DENIED, measured
+  #   gh api -X POST repos/MyOrg/my-repo/issues -f title=x                      DENIED
+  #   gh api -X DELETE repos/o/r/issues/1/labels/Bug                            DENIED
+  #   gh api -X PATCH repos/o/r/labels/bug%20fix -f color=fff                   DENIED
+  # ★ A DISQUALIFIER IS THE RIGHT SHAPE ONLY WHERE THE GUARD CANNOT KNOW THE ANSWER. Here it can:
+  # GitHub case-folds route words and percent-decodes the path, so the guard can do both and then ask
+  # the ordinary question. Deny-side normalisation beats refusal-to-certify whenever the normal form
+  # is computable — and it keeps the closure, because `%6Derge`, the double-encoded `%256Derge` and
+  # `PULLS/5/MERGE` all normalise ONTO the merge family and still deny.
+  #   · case-FOLD first, so a `%6D` and a `%6d` decode identically.
+  #   · percent-DECODE to a FIXPOINT, at most three passes — `%25` is `%`, so one pass is not enough
+  #     (`%256Derge` needs two) and an unbounded loop on hostile input is not a thing a hook does.
+  #   · a `%` that SURVIVES the fixpoint is not decodable and stays a disqualifier: fail-closed.
+  #   · the `.`/`..` disqualifier is kept AND re-asked after decoding, because `%2E` is a dot.
+  # The dot-segment test is ONE helper read by BOTH call sites (the M-R1 / `_s6_dequote` shape): it has
+  # to run before AND after decoding, because `%2E` is a dot, and two spellings of one rule is how a
+  # mutant ends up killing half of it while the other half quietly covers.
+  _s6_api_dotseg "$_aeep" && return 2
+  _aei=0
+  while [ "$_aei" -lt 3 ]; do
+    case "$_aeep" in
+      *%*) : ;;
+      *) break ;;
+      esac
+    _aeprev=$_aeep
+    _aeep=$(_s6_pct_decode "$_aeep") || _guard_fault api-endpoint
+    _guard_vanished api-endpoint "$_aeprev" "$_aeep"   # a decode never turns a non-empty endpoint into nothing
+    [ "$_aeep" != "$_aeprev" ] || break
+    _aei=$((_aei + 1))
+  done
+  # ⚠️ AND THE NORMALISATION RUNS AGAIN AFTER THE DECODE (fix round 3, security C-5, MED) — the same
+  # "pipeline order is a rule" argument as C-3, one step further along. Fix round 2 ran the normalising
+  # tail BEFORE the decode and nothing after it, so bytes the decode PRODUCED were never normalised and
+  # an encoded spelling of a literal deny allowed: `repos/o/r%2F%2F` decodes to `repos/o/r//`, which
+  # the incumbent substring scan denies and which THIS face let through — an allow-ward mover against
+  # the pristine core, which is the one direction this slice may not have. `merge%2F`, `merge%3F`,
+  # `merge%23`, `merge%20`, `merge%09`, `pulls%2F%2F5/merge` and `%2Frepos/…` are the same defect in
+  # seven spellings. ★ A NORMALISATION THAT RUNS ONLY BEFORE A DECODE PROTECTS ONLY THE BYTES THAT WERE
+  # ALREADY THERE — the round-4 lesson of the arm above ("a normalisation that runs after some probes
+  # have read the raw string protects only the probes that come after it"), arriving here as its mirror
+  # image. One helper, called at both points, so a mutant kills both and the two can never drift.
+  _aeep=$(_s6_api_norm_tail "$_aeep") || _guard_fault api-endpoint
+  # ⚠️ THE FOLD RUNS **AFTER** THE DECODE, AND THE ORDER IS THE WHOLE RULE (fix round 2, security C-3).
+  # Fix round 1 folded first and decoded second, which folds bytes that are not yet route words: the
+  # hex escape `%4D` is not an uppercase `M` until it is decoded, so `…/pulls/5/%4D%45%52%47%45` was
+  # judged as the literal string `%4d%45…`, matched no family, and the merge bypass walked. Six
+  # spellings ALLOWED at 626103a7 — the fully hex-encoded route word, its lowercase-hex twin, the
+  # partial `M%45RGE`, `%50ULLS`, the DOUBLE-encoded `%254D…`, and `%53TATUSES`. ★ A normalisation
+  # PIPELINE has an order, and the order is a rule: fold what the decode produced, never what it
+  # consumed. (The decoder itself is hex-case-insensitive, so `%4d` and `%4D` were never the issue.)
+  _aeep=$(printf '%s' "$_aeep" | tr 'A-Z' 'a-z') || _guard_fault api-endpoint
+  case "$_aeep" in
+    *%*) return 2 ;;
+    esac
+  _s6_api_dotseg "$_aeep" && return 2
+  printf '%s' "$_aeep"
+  return 0
+}
+# `_s6_api_endpoint "<view>"`: the walk above, with every `_ae*` name torn down on the way out
+# (fix round 1, R-6). The walk has eight exit points and unsetting at each is how one gets forgotten;
+# more to the point, a caller that does NOT use a command substitution would otherwise inherit them.
+# The wrapper makes the guarantee independent of the call site, which is what a reviewer can check.
+_s6_api_endpoint() {
+  if _aeo=$(_s6_api_endpoint_walk "$1"); then _aerc=0; else _aerc=$?; fi
+  unset _aeg _aea _aeend _aeep _aen _aepend _aeout _aet _aegl _aefl _aecl _aec _aebad _aei _aeprev 2>/dev/null || :
+  printf '%s' "$_aeo"
+  case "$_aerc" in
+    0) unset _aeo _aerc 2>/dev/null || :; return 0 ;;
+    2) unset _aeo _aerc 2>/dev/null || :; return 2 ;;
+  esac
+  unset _aeo _aerc 2>/dev/null || :
+  return 1
+}
+
+_s6_gh_api_admin() {
+  # Reset the disqualification marker on every call: it is read by the S6 site to pick the reason, and
+  # a stale 1 from an earlier command would mislabel the next deny.
+  _S6_API_DQ=0
+  _sgj=$(_cp8b_joinlines "$1") || _guard_fault api-joinlines
+  _guard_vanished api-joinlines "$1" "$_sgj"
+  _sge=$(_cp8b_joinlines_empty "$1") || _guard_fault api-joinlines-empty
+  _guard_vanished api-joinlines-empty "$1" "$_sge"
+  # The two `_cp8b_strip_subst` twins below are fault sites too: a capture that fails faults, like the two views above.
+  _sgt1=$(_cp8b_strip_subst "$_sgj") || _guard_fault gh-api-subst
+  _sgt2=$(_cp8b_strip_subst "$_sge") || _guard_fault gh-api-subst
+  for _sgv in "$_sgj" "$_sge" "$_sgt1" "$_sgt2"; do
+    if _s6_gh_api_admin_scan "$_sgv"; then unset _sgj _sge _sgv 2>/dev/null || :; return 0; fi
+  done
+  unset _sgj _sge _sgv 2>/dev/null || :
+  return 1
+}
+
+_s6_gh_api_admin_scan() {
+  # ── ONE NORMALISATION, COMPUTED FIRST, READ BY EVERY PROBE. ─────────────────────────────────────
+  # ⚠️ THIS ORDERING IS THE FIX, AND ITS ABSENCE WAS A LIVE BYPASS TWICE RUNNING.
+  # Quotes and backslashes are deleted because in the shell a quote is a JOINER, not a boundary:
+  # adjacent fragments concatenate, so `me''rge` executes as `merge`. Round 3 established that and
+  # applied it — to the PATH only, computing the cleaned string AFTER the method and body-flag probes
+  # had already read raw `$1`. So the identical trick simply moved to the METHOD: `-X P''UT`,
+  # `-X PU\T`, `--met''hod PUT`, and — the one that matters most — `-f 'merge_method=squash'`, which
+  # is not an evasion at all but the ORDINARY way a human quotes a shell argument. All ALLOW at
+  # 670e9205; `PUT /pulls/N/merge` takes an empty body, so `-X P''UT …/merge` was a complete admin
+  # merge. ★ A normalisation that runs after some probes have read the raw string protects only the
+  # probes that come after it. Every probe below reads `$_sgn`; nothing reads `$1` again.
+  # GUARD-QUOTED-EXEC-INTERMITTENT: every extraction in this function is ONE process on a here-document (see
+  # `_s6_hn_has`), so a failed fork is a non-zero status and never an empty value that reads "not gh api / no
+  # method / no body / no path" (all allow-ward). grep rc 1 stays a legitimate "no match".
+  _sgn=$(_s6_hd_tr "$1" "'\"\\\\") || _guard_fault gh-api-norm
+
+  # THE LEAD TOKEN IS CASE-FOLDED — `[Gg][Hh]`, never `pr`/`api`/a flag. T2 round 5, and it is a
+  # ROUND-4 MISS, recorded because the miss is the lesson: round 4 folded the lead in the porcelain
+  # SHAPE greps and in the order walk and shipped under the subject "GH lead case-folded", while THIS
+  # gate — the entry to the arm that denies the REST MUTATIONS — kept comparing `gh` case-sensitively.
+  # So `GH pr merge 5 --admin` denied and `GH api -X PUT repos/o/r/pulls/5/merge` (the same bypass one
+  # spelling down, and the exact call that unstuck #567) ALLOWED, on a case-insensitive filesystem
+  # where `GH` really resolves. Six spellings measured ALLOW at 07928fc1 AND at cec9bce4. A fold
+  # applied arm-by-arm is not a fold; every gh-anchored DENY matcher in this file now folds its lead,
+  # and each spelling has its own T2R5 cell so a future partial fold cannot pass as a whole one.
+  # ⚠️ NOT FOLDED, DELIBERATELY: the message-carrier and heredoc-consumer arms that key on `gh pr` /
+  # `gh issue` / `gh release`. Those are EXEMPTIONS — folding them would hand the exemption to a
+  # capitalised lead, i.e. widen a hole rather than close one. The fold only ever runs deny-side.
+  _s6_sgn_has -Eq '[Gg][Hh][[:space:]]+api' || { unset _sgn; return 1; }
+
+  # (b1) The explicit method, if any. Fixed probe order; `put` cannot match `-X POST` and `get`
+  # cannot match `-X DELETE`, so the order only decides which wins when two methods are present.
+  # ⚠️ K-3b (vet S-2): THE PROBE IS CLUSTER-TOLERANT, AND THE WIDENING IS ADD-ONLY BY CONSTRUCTION.
+  # A short flag CLUSTER hides the method in plain sight: `gh api -iXPUT repos/o/r/pulls/5/merge` and
+  # `gh api -iX PUT …` both ALLOWED at 7a5255c3, because `-iXPUT` contains no `-X`. `X` is `gh api`'s
+  # ONLY short letter that takes a method, so a `-`-led run of letters ending in `X` can be nothing
+  # else — the widening can only ever ADD a deny. It is written as a THIRD alternative rather than by
+  # loosening `-X`, so the incumbent's own two spellings are byte-identical to what they were, and the
+  # cluster form is anchored on whitespace so it cannot fire inside a word. `K-3b-M14` pins it.
+  _sgm=''
+  for _sgx in put post patch delete get; do
+    if _s6_sgn_has -Eiq "(-X|(^|[[:space:]])-[A-Za-z]*X|--method)[[:space:]=]*$_sgx"; then _sgm=$_sgx; break; fi
+  done
+  # (b2) A body flag, which must carry a FIELD ASSIGNMENT (`name=`) to count.
+  # ⚠️ ROUND-2 DEFECT, and it hurt the READ side: matching a bare whitespace-anchored `-f`/`-F`
+  # anywhere in the raw string meant a LATER PIPE STAGE supplied the "body" — `gh api …/protection |
+  # grep -F required_status_checks` and `… | sort -f` both DENIED. Those are the owner's own A3
+  # read-back commands out of RUNBOOK §5. A guard that blocks the command the runbook prescribes is
+  # one people learn to route around, which costs more than the rule buys.
+  # The bracket expression is POSIX-ordered on purpose: `]` FIRST, `-` LAST, `[` in the middle. A
+  # backslash inside an ERE bracket expression is a LITERAL backslash, so `\[\]` would NOT have
+  # escaped anything — it would have added `\` to the set and dropped the brackets.
+  # `-f contexts[]=x` (the legitimate apply call) must keep matching; a selftest cell pins it.
+  # K-3b (vet S-2), body side: the same cluster tolerance, as a THIRD probe rather than a loosening of
+  # the two above. `-sfmerge_method=x` carries a body flag; `-sf` alone does not, because the FIELD
+  # ASSIGNMENT requirement is kept verbatim — that requirement is what refunded the owner's own A3
+  # read-back (`… | grep -F required_status_checks`) and nothing here may cost it back.
+  _sgb=0
+  if _s6_sgn_has -Eq '(^|[[:space:]])(-f|-F)[[:space:]]*[A-Za-z_][]A-Za-z0-9_.[-]*=' \
+     || _s6_sgn_has -Eq '(^|[[:space:]])-[A-Za-z]*[fF][[:space:]]*[A-Za-z_][]A-Za-z0-9_.[-]*=' \
+     || _s6_sgn_has -Eq '(^|[[:space:]])(--field|--raw-field|--input)([[:space:]]|=)'; then
+    _sgb=1
+  fi
+
+  case "$_sgm" in
+    put|post|patch|delete) : ;;
+    get)                   unset _sgn _sgm _sgb _sgx; return 1 ;;
+    *)  [ "$_sgb" = 1 ] || { unset _sgn _sgm _sgb _sgx; return 1; } ;;
+  esac
+  # (`_sgpost` used to be computed here — DEAD since the judge was extracted, because the caller now
+  # maps "no method + a body" to `post` and hands that over, so the carve-out reads the METHOD instead.
+  # Deleted in fix round 1, R-6: a variable nothing reads is a claim nothing checks.)
+
+  # The PATH view, derived from the SAME `$_sgn` the probes above read — quotes and backslashes are
+  # already gone (round 2 mapped them to SPACES instead, which is backwards: a space-normalizing
+  # guard saw `me''rge` as two short tokens and matched neither — six live ALLOWs at 5ada56d9).
+  # Deleting loses nothing, because the whitespace around a quoted argument already bounds it.
+  # What is added here is URL/query/slash flattening, which only the path tests need.
+  _sga=$(_s6_hd_sed "$_sgn" -E -e 's#[Hh][Tt][Tt][Pp][Ss]?://[^/[:space:]]*/# #g' -e 's/\?/ /g' -e 's#//+#/#g') || _guard_fault gh-api-path
+
+  # K-3b 3-0: THE FAMILY TABLE MOVED OUT (see `_s6_admin_path_verdict` above). What was an if/elif
+  # chain here is now the judge's, called in `substring` mode — the mode whose anchors expand to the
+  # exact bytes this chain used to spell, so no verdict of the incumbent's moves. The method handed
+  # over is never empty: the gate above has already established that an absent method plus a body IS a
+  # POST, which is what `gh api` does, so the judge never has to re-ask a question about the COMMAND.
+  _sgmj=$_sgm
+  [ -n "$_sgmj" ] || _sgmj=post
+  # K-3b FACE D: the POSITIONAL read first, today's SUBSTRING scan as the fallback. The ordering is the
+  # refund and the fail-direction in one line — a successful read is judged `exact` (so a path in a
+  # header, a body field or a filename is no longer an endpoint), and a DECLINE hands the decision
+  # straight back to the scan that has always made it, so nothing this face cannot read can lose a
+  # deny. `$1` is the QUOTE-PRESERVING view (`$_sgj`/`$_sge` and their twins), which the tokeniser
+  # needs; `$_sga` is the de-quoted, flattened one the substring scan needs. Two views, two jobs.
+  # The `if` around the assignment is not style: a command substitution whose command exits non-zero
+  # aborts under `set -e` outside a condition position.
+  # rc 2 from `_s6_api_endpoint` is its "disqualified" answer, which denies; a fault inside the walk (`_guard_fault`
+  # exits 2 in its capture) therefore also lands on a deny, because every capture in the walk faults on an error.
+  if _sgep=$(_s6_api_endpoint "$1"); then _sgerc=0; else _sgerc=$?; fi
+  # ⚠️ EACH BRANCH IS WRITTEN AS AN `if`, NOT AS `_sgr=$?`, for the same `set -e` reason.
+  if [ "$_sgerc" = 2 ]; then
+    # DISQUALIFIED: a dot-segment, or a `%` that survived the decode fixpoint, in a MUTATING endpoint.
+    # The caller has already established the method is mutating, so this is a deny outright — the
+    # guard never asks what the byte would have resolved to.
+    # ⚠️ IT SETS ITS OWN MARKER (fix round 1, S-4). Without it the deny printed the bare S6
+    # merge-bypass message, which tells an adopter their `gh api` call was a merge bypass when the real
+    # objection is that the ENDPOINT could not be read. A reason that names the wrong act teaches the
+    # wrong retry, and the retry here is "spell the endpoint plainly", not "ask the owner to merge".
+    _S6_API_DQ=1
+    _sgr=0
+  elif [ "$_sgerc" = 0 ]; then
+    if _s6_admin_path_verdict "$_sgmj" "$_sgep" exact; then _sgr=0; else _sgr=1; fi
+  else
+    if _s6_admin_path_verdict "$_sgmj" "$_sga" substring; then _sgr=0; else _sgr=1; fi
+  fi
+  unset _sgep _sgerc 2>/dev/null || :
+
+  unset _sgn _sga _sgm _sgmj _sgb _sgx
+  return "$_sgr"
+}
+
+# ================================================================================================
+# GUARD-DENY-LOG (D-240828-4, V1-REPAIR-PROGRAM PR 4a) — THE CLOSURE INSTRUMENT.
+#
+# WHY IT EXISTS. Every false-positive count in this program ("≥ 9", "3-11 per session") was a HUMAN
+# TALLY FROM CHAT, because the guard writes no deny record: `_cp8b_deny_reason` prints and the caller
+# exits. That is the actual defect behind "no read lane has a closure criterion" — there is no
+# instrument. This function is the instrument: one NDJSON line per deny, so a harvest reads a FILE.
+#
+# WHAT IT IS NOT. It is an OBSERVATION, never a CONTROL (THREAT-MODEL T5). The log is agent-writable,
+# agent-deletable and unauthenticated; it can be forged or truncated by anything that can run in the
+# repo. Nothing may ever gate on it. Its ONLY job is to make "did the read lanes get better" a
+# measured number instead of an anecdote.
+#
+# THE FAIL-SAFE, and it is the load-bearing property: LOGGING CAN NEVER CHANGE A VERDICT. Every
+# operation here is failure-swallowed and the function ALWAYS returns 0, so a full disk, a read-only
+# `.kit-run`, a missing `date` or an unresolvable repo root can never turn a DENY into an ALLOW (or
+# an ALLOW into a deny). Callers invoke it AFTER the decision is made, never as part of it.
+#
+# WHAT IS NEVER WRITTEN: the full command. A command line can carry a secret (a token in a `curl -H`,
+# a password in a `psql` URL), and a local plaintext file of every command an agent tried to run is a
+# credential store nobody asked for. Only the guard's own OFFENDING SEGMENT is recorded, already
+# truncated to 160 bytes by the reason builder and re-truncated here, with control bytes stripped.
+#
+# HOME: `<repo-root>/.kit-run/guard-denials.ndjson` — the runaway killswitch's run directory
+# (docs/operations/runaway-killswitch.md), already in .gitignore and never exported. Owner design GO
+# 2026-08-29 chose this home; it is also the answer GUARD-BYPASS-UNLOGGED was waiting for ("where the
+# trace lives, and who may read it": local, gitignored, owner-readable, never pushed).
+#
+# DISABLE: `KIT_GUARD_LOG=0`. Documented in docs/operations/runtime-guards.md.
+#
+# POSIX sh, no jq: the JSON is hand-built by one printf over eight fixed fields, so `--denials` can
+# read it with awk and the kit takes on no new runtime dependency.
+_GUARD_DENY_LOG_REL='.kit-run/guard-denials.ndjson'
+# JSON-safe a value for a double-quoted string: strip control bytes, then escape backslash and
+# double-quote. Backslash FIRST — the other order would double-escape the backslashes the quote rule
+# introduces.
+# ⚠️ SECURITY M1 (review round 1): the first cut spared \011 \012 \015. A TAB or CR is not legal
+# literal JSON inside a string, and a raw NEWLINE in a segment SPLIT ONE RECORD INTO TWO — a log
+# forgery primitive (an attacker-influenced segment could synthesise a whole extra NDJSON line).
+# The whole C0 range plus DEL now goes, unconditionally.
+_guard_log_json() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+# _guard_log_redact "<segment>" — mask common secret shapes BEFORE the segment is written.
+# ⚠️ SECURITY H1 (review round 1), and the honest framing: for a ONE-SEGMENT command the offending
+# segment IS the command, so "we never log the command" was too strong a claim. Measured leaks:
+# `TOKEN=ghp_… sed -i …`, `curl -H 'Authorization: Bearer …'`, `psql postgres://user:pw@host`.
+# This is BEST-EFFORT MASKING, NOT A GUARANTEE — an unrecognised secret shape still lands in the
+# file. The prose in THREAT-MODEL.md, RUNBOOK.md §4 and docs/operations/runtime-guards.md says so in
+# those words; do not re-strengthen it here or there.
+# ORDER MATTERS: `Bearer`/`Basic` run BEFORE `Authorization:`, so the scheme rule has already eaten
+# the credential and the Authorization rule only tidies the remainder.
+# _guard_log_jsonkey <key-bracket-pattern> <label> — build ONE sed rule masking a JSON
+# `"key": "value"` pair, tolerating BACKSLASH-ESCAPED quotes (a JSON body inside a shell command
+# arrives as `\"token\": \"…\"`, which is how it actually shows up in a segment).
+# ⚠️ ONE RULE PER KEY, deliberately: BSD/macOS `sed` has NO `\|` alternation in BRE, so the combined
+# four-key rule this replaces MATCHED NOTHING AT ALL on macOS — it read as working and redacted
+# zero JSON secrets. Measured. Four rules cost nothing and work on both seds.
+_guard_log_jsonkey() {
+  printf 's/\\\\\\{0,1\\}"%s\\\\\\{0,1\\}"[[:space:]]*:[[:space:]]*\\\\\\{0,1\\}"[^"\\\\]*\\\\\\{0,1\\}"/"%s": "<redacted>"/g' "$1" "$2"
+}
+_guard_log_redact() {
+  # ⚠️ MED-3 (review round 2) widened this list. The FIRST rule used to mask only the FIRST
+  # assignment, so `A=x TOKEN=ghp_… sed -i …` leaked: the loop below re-runs the leading-assignment
+  # rule until it stops changing anything, which walks the whole leading assignment RUN. Bounded at
+  # 8 iterations — a leading run longer than that is not a shape worth chasing, and an unbounded
+  # loop inside the deny path is exactly the kind of thing that turns a logger into a hang.
+  # ONE idempotent sed applied to a FIXPOINT: it skips any already-masked assignments at the head
+  # and masks the next unmasked one, so iterating it walks the whole leading run. Locals are reset
+  # every call — an accumulator that survived between calls would bleed one command's prefix into
+  # the next one's log line.
+  _glr_s=$1
+  _glr_i=0
+  while [ "$_glr_i" -lt 8 ]; do
+    _glr_n=$(printf '%s' "$_glr_s" | LC_ALL=C sed 's/^\(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*=<redacted>\)*\)\([[:space:]]*\)\([A-Za-z_][A-Za-z0-9_]*\)=[^[:space:]]*/\1\3\4=<redacted>/')
+    [ "$_glr_n" != "$_glr_s" ] || break
+    _glr_s=$_glr_n
+    _glr_i=$((_glr_i + 1))
+  done
+  printf '%s' "$_glr_s" | LC_ALL=C sed \
+    -e 's/[Bb]earer[[:space:]][^[:space:]]*/Bearer <redacted>/g' \
+    -e 's/[Bb]asic[[:space:]][^[:space:]]*/Basic <redacted>/g' \
+    -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]*/Authorization: <redacted>/g' \
+    -e 's/[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]:[[:space:]]*[^[:space:]]*/x-api-key: <redacted>/g' \
+    -e 's/[Aa][Pp][Ii]-[Kk][Ee][Yy]:[[:space:]]*[^[:space:]]*/api-key: <redacted>/g' \
+    -e 's/[Tt][Oo][Kk][Ee][Nn]=[^[:space:]\&]*/token=<redacted>/g' \
+    -e 's/[Aa][Pp][Ii][-_]*[Kk][Ee][Yy]=[^[:space:]\&]*/api_key=<redacted>/g' \
+    -e 's/[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=[^[:space:]\&]*/password=<redacted>/g' \
+    -e 's/[Ss][Ee][Cc][Rr][Ee][Tt]=[^[:space:]\&]*/secret=<redacted>/g' \
+    -e 's/-u[[:space:]][^[:space:]]*:[^[:space:]]*/-u <redacted>/g' \
+    -e 's/-u[^[:space:]]*:[^[:space:]]*/-u<redacted>/g' \
+    -e 's/-p[[:space:]][^-][^[:space:]]*/-p <redacted>/g' \
+    -e 's/-p[^-[:space:]][^[:space:]]*/-p<redacted>/g' \
+    -e "$(_guard_log_jsonkey '[Tt][Oo][Kk][Ee][Nn]' token)" \
+    -e "$(_guard_log_jsonkey '[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]' password)" \
+    -e "$(_guard_log_jsonkey '[Ss][Ee][Cc][Rr][Ee][Tt]' secret)" \
+    -e "$(_guard_log_jsonkey '[Aa][Pp][Ii][-_]*[Kk][Ee][Yy]' api_key)" \
+    -e 's#://[^/:@[:space:]]*:[^@[:space:]]*@#://<redacted>@#g'
+}
+# guard_log_deny <surface> <reason> [tool] — append one NDJSON line. ALWAYS returns 0.
+#   surface = pretooluse | kit-guard   tool = Bash/Write/... or `-`
+guard_log_deny() {
+  case "${KIT_GUARD_LOG:-1}" in
+    0|no|off|false) return 0 ;;
+    esac
+  _gld_surface=${1:-'-'}; _gld_reason=${2:-}; _gld_tool=${3:-'-'}
+  [ -n "$_gld_tool" ] || _gld_tool='-'
+  # Repo root: the hook's authoritative PROTECTED_ROOT when the caller has one (guard.sh resolves it
+  # from its own path and it is unforgeable), else the cwd's toplevel, else give up silently.
+  _gld_root=${PROTECTED_ROOT:-}
+  if [ -z "$_gld_root" ] || [ ! -d "$_gld_root" ]; then
+    # NO `git` SUBPROCESS HERE (shim-coverage.sh measured it): this runs on the DENY path, and under the
+    # install-shims harness `git` IS the shim under test — a `git rev-parse` from inside the logger
+    # executed the real binary on a denied command. Walk up to the nearest `.git` (dir or worktree
+    # file) in pure shell instead; an unresolvable root skips logging, never the verdict.
+    _gld_root=$(pwd -P 2>/dev/null || printf '')
+    while [ -n "$_gld_root" ] && [ "$_gld_root" != / ] && [ ! -e "$_gld_root/.git" ]; do
+      _gld_root=${_gld_root%/*}; [ -n "$_gld_root" ] || _gld_root=/
+    done
+    [ -e "$_gld_root/.git" ] || _gld_root=''
+  fi
+  [ -n "$_gld_root" ] && [ -d "$_gld_root" ] || return 0
+  # arm = the reason's leading numeric tag (`13: ...`). All-digits or it is not a tag.
+  _gld_arm=${_gld_reason%%:*}
+  case "$_gld_arm" in
+    ''|*[!0-9]*) _gld_arm='-' ;;
+    esac
+  # trigger = the `trigger=<token>` the target arm carries; `-` when the reason has none.
+  _gld_trigger=$(printf '%s' "$_gld_reason" | sed -n 's/.*trigger=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*/\1/p' 2>/dev/null || printf '')
+  [ -n "$_gld_trigger" ] || _gld_trigger='-'
+  # segment = the text inside the reason's `segment: [...]`.
+  # ⚠️ L1 (review round 1): this anchored on the FIRST `[` in the reason, which is WRONG — the sed
+  # tip contains a literal `[,<m>|,$]`, so a tipped reason logged a fragment of the TIP as the
+  # segment. Anchor on the `segment: [` label both reason builders emit ("offending segment: [" and
+  # "Offending segment: [" — the suffix is common to both, so one pattern serves).
+  _gld_seg=''
+  _gld_rs=0
+  case "$_gld_reason" in
+    *'segment: ['*)
+      _gld_seg=${_gld_reason#*'segment: ['}; _gld_seg=${_gld_seg%%]*}
+      # read_shaped, DERIVED FROM THE REASON — reviewer H1/H2, round 1. The first cut RE-DECIDED the
+      # predicate by calling `_cp8b_seg_read_shaped` on the already-`]`-truncated segment and without
+      # the raw command, so it disagreed with the guard's own judgment in both directions (measured:
+      # `cat 'x]y' > conformance/verify.sh` — a WRITE — logged 1, and a loop head the tier HAD judged
+      # read logged 0). The reason already carries the answer: `_cp8b_write_route_hint` appends
+      # `escape card R30 cp-write` IFF the segment was NOT read-shaped (SWAS-301a: it appended the override
+      # sentence before). So read it off, never recompute it — the log and the deny text cannot disagree BY
+      # CONSTRUCTION. THE WRITE-ROUTE SET, enumerated and not inferred: R30 cp-write, R29 dev-clone-grammar (a
+      # clone deny 278a's grammar declined; R30 is suppressed there) and `trigger=cwd-unknown` (R11, whose reason
+      # always carried the sentence, reads included: today's bit is kept on purpose). It is read from the
+      # segment-FREE view: the span the agent controls (the echoed segment, up to its FIRST `]`) is cut out first. That stops a
+      # command that merely quotes a marker, but NOT one whose segment contains a `]` before the marker: the text after that
+      # `]` is read as reason text and can move the bit. OPEN, boarded as SWAS-331 (design 301 §8 M7); the log is an
+      # observation (T5), never a control. The R29 marker is also counted as a write marker unconditionally (review L2).
+      _gld_head=${_gld_reason%%'segment: ['*}
+      _gld_rest=${_gld_reason#*'segment: ['}; _gld_rest=${_gld_rest#*]}
+      case "$_gld_head$_gld_rest" in
+        *'escape card R30 cp-write'*|*'escape card R29 dev-clone-grammar'*|*'trigger=cwd-unknown'*) _gld_rs=0 ;;
+        *) _gld_rs=1 ;;
+      esac
+      ;;
+  esac
+  # ⚠️ THE `else` IS DELIBERATE AND IS NOT WHAT THE REVIEW ASKED FOR VERBATIM. Applying the
+  # sentence-absent rule to EVERY reason would mark the destructive matrix read-shaped: reasons like
+  # `13: rm of a glob … can be irreversible - human-gated.` carry no SELFEDIT sentence because they
+  # come from arms that have no offending segment at all, and they are unambiguously WRITES. The bit
+  # is therefore derived only where a segment exists (i.e. where the two-tier read judgment actually
+  # ran); a segment-less deny is 0. Flagged to the reviewer rather than silently widened.
+  # Redact BEFORE truncating: truncating first could cut a secret in half and leave the prefix.
+  _gld_seg=$(_guard_log_redact "$_gld_seg" 2>/dev/null || printf '')
+  # ⚠️ M2 (review round 1): `cut -c1-160` counts CHARACTERS, and a multibyte segment produced a
+  # 448-byte line against a field documented as "≤160 bytes". LC_ALL=C makes the count bytes, which
+  # is what the claim says. Only the LOG site is byte-clamped; the reason string keeps its own cut.
+  _gld_seg=$(printf '%s' "$_gld_seg" | LC_ALL=C cut -c1-160 2>/dev/null || printf '')
+  # ⚠️ MED-1 (review round 2): the byte clamp above can cut THROUGH a multibyte character, and the
+  # resulting line is not valid UTF-8 — at which point macOS awk ABORTS (exit 2, empty stdout) the
+  # moment `--denials` reads the file. One truncated `é` therefore voided the ENTIRE harvest, while
+  # the reader's own comment promised "counted as malformed, never silently dropped". So the clamp
+  # is walked back to a character boundary: strip a trailing sequence ONLY IF it is truncated (a
+  # 2-byte lead alone; a 3-byte lead with 0-1 continuations; a 4-byte lead with 0-2). A COMPLETE
+  # trailing character is left alone, and pure ASCII is untouched. Result is ≤160 bytes and always
+  # valid UTF-8, so the field's documented claim and the reader's robustness both hold.
+  _gld_seg=$(printf '%s' "$_gld_seg" | LC_ALL=C sed \
+    -e "s/[$(printf '\300')-$(printf '\337')]\$//" \
+    -e "s/[$(printf '\340')-$(printf '\357')][$(printf '\200')-$(printf '\277')]\{0,1\}\$//" \
+    -e "s/[$(printf '\360')-$(printf '\367')][$(printf '\200')-$(printf '\277')]\{0,2\}\$//" \
+    2>/dev/null || printf '%s' "$_gld_seg")
+  _gld_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '')
+  # session: an explicit KIT_SESSION_ID when the runtime sets one, else the PARENT pid (the agent
+  # process / invoking shell), which groups a run's denials without identifying anything. `$$` is the
+  # last resort for a shell that does not export PPID.
+  _gld_sess=${KIT_SESSION_ID:-${PPID:-$$}}
+  _gld_dir="$_gld_root/.kit-run"
+  _gld_log="$_gld_root/$_GUARD_DENY_LOG_REL"
+  mkdir -p "$_gld_dir" 2>/dev/null || return 0
+  # ⚠️⚠️ SECURITY C1 + C2 (review round 1) — THE PLANTED-NODE REFUSAL. Two live findings, both
+  # reproduced: (C1) `mkfifo .kit-run/guard-denials.ndjson` is ALLOWED by the guard, and the next
+  # deny then BLOCKED FOREVER inside the `>>` open — a hang of the PreToolUse hook, i.e. a denial-of-
+  # service on the agent's own tool loop, reachable by one allowed command. (C2) a SYMLINK at the log
+  # path turned the logger into an APPEND PRIMITIVE onto any file the process can write —
+  # attacker-influenced bytes appended to, say, a governance record.
+  # So: write only when `.kit-run` is a real directory (not a symlink) and the log path is either
+  # ABSENT or a REGULAR NON-SYMLINK file. Anything else — FIFO, socket, device, symlink (dangling
+  # included: `-L` is tested before `-e`, which follows), or a symlinked directory — declines.
+  # ⚠️ HONEST CEILING: this is TOCTOU-imperfect. It is aimed at a PLANTED NODE sitting at the path,
+  # not at an attacker racing the check between the test and the open. Closing the race needs an
+  # O_NOFOLLOW open, which POSIX sh does not have. Stated, not hidden.
+  if [ -L "$_gld_dir" ] || [ ! -d "$_gld_dir" ]; then return 0; fi
+  if [ -L "$_gld_log" ]; then return 0; fi
+  if [ -e "$_gld_log" ] && [ ! -f "$_gld_log" ]; then return 0; fi
+  # ⚠️ MED-2 (review round 2) — A HARDLINK DEFEATS BOTH TESTS ABOVE. `ln <victim> .kit-run/
+  # guard-denials.ndjson` is ALLOWED for a non-control-plane victim, and the result is a REGULAR,
+  # NON-SYMLINK file that passes `-f` and fails `-L` — so the append landed in the victim (measured).
+  # Same primitive as C2, one syscall over. A hardlinked file has link count > 1; a freshly created
+  # log has exactly 1. GNU `stat -c %h` first, then macOS `stat -f %l` (see below). ⚠️ ON FAILURE WE DEFAULT TO
+  # 1, i.e. we WRITE: logging is best-effort and must never become the reason a platform without
+  # `stat` silently loses its whole harvest. Refusing is the safe direction only when we KNOW.
+  # GNU form FIRST, then BSD — the order this file's own _hl_link_count uses (:541): `stat -c` ERRORS on
+  # BSD so the fallback is reached, but `stat -f %l` SUCCEEDS on GNU (there `-f` is FILESYSTEM stat and
+  # %l is the max filename length), so the reversed order silently refused every log write on Linux
+  # (measured on the first CI run of #597: every log cell read an empty field).
+  if [ "$(stat -c %h "$_gld_log" 2>/dev/null || stat -f %l "$_gld_log" 2>/dev/null || echo 1)" = 1 ]; then :; else return 0; fi
+  # ⚠️ reviewer M1 (round 1): `2>/dev/null` on a simple command does NOT suppress the shell's own
+  # "cannot create" diagnostic for a failed `>>` REDIRECT — that is emitted before the command runs.
+  # An unwritable .kit-run therefore leaked a shell error onto the hook's stderr. The subshell makes
+  # the redirect failure interior to a command whose stderr IS redirected.
+  # HIGH-2 (review round 2): `umask 077` so a FIRST-CREATE lands 0600, not the 0644 the process
+  # umask gave it. The file can hold redacted-but-not-guaranteed-clean command segments, so it should
+  # not be world-readable on a shared host. Scoped to this subshell — it never touches the caller's
+  # umask. It applies to CREATION only: an existing log keeps whatever mode it already has.
+  ( umask 077
+    printf '{"ts":"%s","surface":"%s","tool":"%s","arm":"%s","trigger":"%s","segment":"%s","read_shaped":%s,"session":"%s"}\n' \
+      "$(_guard_log_json "$_gld_ts")" "$(_guard_log_json "$_gld_surface")" "$(_guard_log_json "$_gld_tool")" \
+      "$(_guard_log_json "$_gld_arm")" "$(_guard_log_json "$_gld_trigger")" "$(_guard_log_json "$_gld_seg")" \
+      "$_gld_rs" "$(_guard_log_json "$_gld_sess")" \
+      >> "$_gld_log" ) 2>/dev/null || :
+  return 0
+}
+
+# === GUARD-QUOTED-EXEC-INTERMITTENT — a failed fork must never read as "nothing dangerous" ===========
+# THE DEFECT CLASS. Under per-user process exhaustion a `$(…)` that cannot fork yields "", and an empty
+# derived value (a tool name, a command, the segment list) reads as "nothing to judge", so every decision
+# layer returned "not denied" and the guard reached ALLOW. The fix is a FAULT, not a deny-by-value: the
+# chokepoints below treat a failed substitution, and an empty result from a non-empty input, as an
+# internal fault and exit 2 (the #730 contract: Claude Code blocks on 2 and on nothing else).
+# `_guard_fault <site>`: the one fault exit. Order is the security property, as in guard.sh's emit_deny:
+# the sentence goes to stderr FIRST (a builtin write, no fork), the log attempt is an observation
+# that swallows every failure (`|| :`), and `_GUARD_DECIDED` is deliberately NEVER set here. So if the
+# logger's own forks fail, or dash aborts the shell mid-fault, or `exit` is somehow not reached, the
+# adapter's EXIT trap still sees an undecided hook and exits 2. No path from here ends in 0.
+# ⚠️ `exit` inside `$(…)` or a `( … )` body leaves only that subshell. Call this from the MAIN shell
+# (or from a subshell whose caller maps a non-zero rc / an empty result to a fault of its own — see
+# `_guard_vanished`); inside guard_check_command's own `$(…)` an exit 2 reads as a DENY at guard.sh.
+# REACHING THE MAIN SHELL. The fault usually fires deep inside a `$(…)`, where `exit 2` ends only that
+# subshell and the caller reads the non-zero rc as "not denied" (measured: the fault fired and the guard
+# still allowed). So when the adapter has armed its USR1 trap (`_GUARD_USR1=1`, guard.sh), the fault also
+# runs `kill -USR1 $$`: `kill` is a builtin (no fork) and `$$` is the MAIN shell's pid even inside `$(…)`
+# and `( … )`. The main shell runs the trap as soon as the foreground substitution returns — before its next
+# command, so before any allow — and the handler exits 2. The kill is sent BEFORE the log attempt: it is a
+# builtin and the main shell only ACTS on the signal once the current substitution returns, so the log still
+# gets written, and if the logger's own forks abort the shell the signal is already pending.
+# CEILING (POSIX): a shell started with USR1 IGNORED, or BLOCKED in the inherited signal mask, cannot trap it,
+# and then only the in-main-shell faults, the vanished-result checks and the allow-time probe remain.
+# Surfaces without the trap (pre-push, kit-guard) skip the kill: their non-zero exit already blocks.
+# Two sentences: the sites that report a malformed or empty TOOL INPUT (not a failed fork) get their own, so the
+# operator is not told to stop a battery for a problem that is the input's.
+_guard_fault() {
+  case "${1:-unknown}" in
+    command-read-empty|input-read|input-type)
+      _gf_msg="agent-guard: internal fault at $1 - the tool input was empty or malformed; denying fail-closed" ;;
+    grep-path-read|grep-glob-read)   # the adapter's input reads for the Grep and Glob tools: a failed fork, not a matcher
+      _gf_msg="agent-guard: internal fault at $1 - a command substitution failed (usually the process limit: stop the sibling battery or other heavy job, then retry); denying fail-closed" ;;
+    mcp-policy)
+      _gf_msg="agent-guard: internal fault at $1 - the MCP policy could not be read; denying fail-closed" ;;
+    grep-*)
+      _gf_msg="agent-guard: internal fault at $1 - an internal matcher errored; denying fail-closed" ;;
+    *)
+      _gf_msg="agent-guard: internal fault at ${1:-unknown} - a command substitution failed (usually the process limit: stop the sibling battery or other heavy job, then retry); denying fail-closed" ;;
+  esac
+  printf '%s\n' "$_gf_msg" >&2 || :
+  if [ -n "${_GUARD_USR1:-}" ]; then kill -USR1 $$ 2>/dev/null || :; fi
+  guard_log_deny pretooluse "$_gf_msg" "${TOOL:--}" || :
+  exit 2
+}
+# The checked matchers. A matcher that cannot answer must never read as "no match" (SWAS-583): rc 0 is a match, rc 1 is none, and
+# anything else faults. <rule> names the rule it serves (it shows in the fault text as grep-<rule>), <text> is what is matched, and
+# the rest is the matcher's own arguments, passed through untouched. An optional LC_ALL=C first argument pins the locale for that one
+# call without leaving it set in the caller. `_gmq` feeds the text as it is (printf '%s'), `_gmqn` adds the trailing newline
+# (printf '%s\n'), and both send the matcher's output to /dev/null; `_gmo` feeds it as `_gmq` does and KEEPS the output for a caller
+# that consumes it. Inside a `$(…)` or a `( … )` body the fault leaves only that subshell, so the caller maps a non-zero rc.
+_gmq() {
+  _gmh_s=$1; _gmh_t=$2; shift 2; _gmh_rc=0
+  if [ "${1:-}" = LC_ALL=C ]; then
+    shift; printf '%s' "$_gmh_t" | LC_ALL=C grep "$@" >/dev/null || _gmh_rc=$?
+  else
+    printf '%s' "$_gmh_t" | grep "$@" >/dev/null || _gmh_rc=$?
+  fi
+  [ "$_gmh_rc" -le 1 ] || _guard_fault "grep-$_gmh_s"
+  return "$_gmh_rc"
+}
+_gmqn() {
+  _gmh_s=$1; _gmh_t=$2; shift 2; _gmh_rc=0
+  if [ "${1:-}" = LC_ALL=C ]; then
+    shift; printf '%s\n' "$_gmh_t" | LC_ALL=C grep "$@" >/dev/null || _gmh_rc=$?
+  else
+    printf '%s\n' "$_gmh_t" | grep "$@" >/dev/null || _gmh_rc=$?
+  fi
+  [ "$_gmh_rc" -le 1 ] || _guard_fault "grep-$_gmh_s"
+  return "$_gmh_rc"
+}
+_gmo() {
+  _gmh_s=$1; _gmh_t=$2; shift 2; _gmh_rc=0
+  if [ "${1:-}" = LC_ALL=C ]; then
+    shift; printf '%s' "$_gmh_t" | LC_ALL=C grep "$@" || _gmh_rc=$?
+  else
+    printf '%s' "$_gmh_t" | grep "$@" || _gmh_rc=$?
+  fi
+  [ "$_gmh_rc" -le 1 ] || _guard_fault "grep-$_gmh_s"
+  return "$_gmh_rc"
+}
+# `_guard_has_content "<s>"`: 0 iff <s> holds a byte that is not whitespace, a command separator (`;` `&` `|`)
+# or a backslash — i.e. something the segment transforms must keep. FORK-FREE (a `case` pattern): this test
+# runs exactly when forks are failing, so it cannot itself depend on one.
+_guard_has_content() {
+  case $1 in
+    # the members `;&|\` are single-quoted inside the bracket: semgrep's tree-sitter-bash rejects escaped operators there (same set)
+    *[![:space:]';&|\']*) return 0 ;;
+  esac
+  return 1
+}
+# `_guard_vanished "<site>" "<in>" "<out>"`: fault when a transform mapped a non-empty input to an empty
+# output. These transforms never legitimately do that; a whitespace-only (or separator-only) input maps to
+# empty legitimately and does not fault. FORK-FREE; call it from the main shell.
+_guard_vanished() {
+  _guard_has_content "$2" || return 0
+  case $3 in
+    *[![:space:]]*) return 0 ;;
+  esac
+  _guard_fault "$1"
+}
+# `_cp8b_walk_load "<cmd>"`: set $_walk to the segment list the CP arms walk — strip quoted heredoc
+# bodies, mask quoted separators, split. Replaces the nested `$(…$(…$(…)))` so each stage's failure is
+# visible to ITS caller. The mask's exit status is informational (1 = declined) so it is judged by its
+# result only; the other two by rc AND result.
+_cp8b_walk_load() {
+  # rc 0 or 1 is legitimate (a decline prints the input unchanged); only rc >= 2 is a fault, and the vanished-
+  # result check below still catches a decline that printed nothing. The M2 rule (ambiguity -> not excluded ->
+  # scanned) lives inside the callee and is untouched.
+  _wl_rc=0; _wl_h=$(_cp8b_strip_heredocs "$1") || _wl_rc=$?
+  [ "$_wl_rc" -le 1 ] || _guard_fault walk-strip-heredocs
+  _guard_vanished walk-strip-heredocs "$1" "$_wl_h"
+  # GUARD-TRAILER-IN-MESSAGE-FP (design §3): the carrier join sits HERE, between heredoc strip and mask,
+  # so every walk that loads through this function (target arm, older CP walk) sees the joined bytes.
+  # R6: a fork-free newline precheck, so the common one-line command pays no subshell for the join.
+  case "$_wl_h" in
+    *"$_cp8b_nl"*) _wl_j=$(_cp8b_carrier_join "$_wl_h") || : ;;
+    *) _wl_j=$_wl_h ;;
+  esac
+  _guard_vanished walk-carrier-join "$_wl_h" "$_wl_j"
+  _wl_m=$(_cp8b_mask_quoted "$_wl_j") || :
+  _guard_vanished walk-mask-quoted "$_wl_j" "$_wl_m"
+  _walk=$(_cp8b_segments "$_wl_m") || _guard_fault walk-segments
+  _guard_vanished walk-segments "$_wl_m" "$_walk"
+}
+# `_cp8b_segments_load "<cmd>"`: the same for a raw (unmasked) split — sets $_walk.
+_cp8b_segments_load() {
+  # GUARD-TRAILER-IN-MESSAGE-FP (design §3): the hooksPath and push-main arms load here, so they see the join too.
+  case "$1" in
+    *"$_cp8b_nl"*) _sl_j=$(_cp8b_carrier_join "$1") || : ;;   # R6: fork-free newline precheck
+    *) _sl_j=$1 ;;
+  esac
+  _guard_vanished segments-carrier-join "$1" "$_sl_j"
+  _walk=$(_cp8b_segments "$_sl_j") || _guard_fault segments
+  _guard_vanished segments "$_sl_j" "$_walk"
+}
+
+# ================================================================================================
+# KIT-BASE-SHARED (design §11.1) — the raw-git routes INTO the shared kit-base. ADD-ONLY: it can only turn an
+# ALLOW into a DENY (the same monotone shape as the claims arm), and it fails CLOSED on doubt.
+#
+# WHY. `kit-base` is imported VERIFIED by `kit-update --from` (every chain commit is checked against the exports of
+# its Kit-Source before one compare-and-swap writes it). `refs/kit/base` sits outside branch protection, so anyone with
+# push access can write it, and every `kit-update --from` runs the base's own scripts/incept.sh. MEASURED BEFORE THIS
+# ARM: `git fetch origin refs/kit/base:refs/heads/kit-base`, `git update-ref`, `git branch -f` and `git push` onto
+# those names were all ALLOW — the unverified route stayed open beside the verified one.
+#
+# WHAT IS DENIED: any CREATION or MOVE of a ref named `kit-base`, `kit-base/…` or `refs/kit/…`, whatever the verb or flags
+# (any case; quotes, backslashes and `$` stripped first, as the claims arm does): `update-ref` / `symbolic-ref` (any form,
+# deletes included; also when the ref is unresolvable; `update-ref --stdin` ALWAYS, whatever the text names), `push` /
+# `send-pack`, `fetch`/`pull` whose `:` destination names them OR is a glob outside refs/remotes/ (`+refs/*:refs/*`),
+# `branch` unless it is a list/read (so a plain `git branch kit-base <x>` denies), `tag` unless it is a list/read (a plain
+# `git tag kit-base/…` denies), `checkout`/`switch`/`worktree add` that creates a branch (-b -B -c -C), and `git config`
+# writing a `remote.*` key that names them. READS stay allowed: log, show, rev-parse, ls-remote, archive, diff, cat-file,
+# for-each-ref, `fetch` with no destination.
+# The kit's own scratch namespaces under refs/kit/ are carved out, EXACTLY these three prefixes: `refs/kit/claim-*`
+# (board-claim.sh), `refs/kit/notes-remote-*` and `refs/kit/promotions-presync-*` (promotion-verify.sh's ledger sync);
+# kit-update reads only refs/kit/base, which stays denied. `sh scripts/kit-update.sh ...` is allowed:
+# its own git calls are not hook-visible, and it is the verified route. UNDER `kit-guard install-shims` they ARE graded
+# (every child git passes this arm) and kit-update's own ref writes are denied: run kit-update without the shim dir on
+# PATH. A front-door pass is row KIT-BASE-SHIMS-FRONT-DOOR.
+#
+# HONEST CEILING (stated, not implied closed): a text guard has spelling residuals (GUARD-CP-READONLY-SANDBOX). NOT
+# covered: a glob spelling of the name (`kit-b?se`), a ref assembled from a variable the arm cannot see (`push`,
+# `fetch`, `branch` and `tag` only; `update-ref` fails closed), a bare `git pull`/`fetch`/`push` that relies on a refspec
+# ALREADY configured (the config write is denied, an existing one is not read), an alias defined elsewhere, `git checkout
+# kit-base` then a commit on it, an interpreter or another tool writing the ref file, and an actor at a plain terminal.
+# It narrows the default route; it does not close the channel.
+# The name test is at REF-COMPONENT boundaries (`kit-base`, `kit-base/…`,
+# `…/kit-base`, after `: + ^ ~ = ,`, `refs/kit[/…]`), so `feature/kit-base-shared` is not it; `checkout`/`switch`/`worktree add`/
+# `clone -b` of kit-base deny unless `--detach` (a checked-out kit-base is a branch every later commit moves); `pull` naming it
+# denies; skipped `-c`/`--config-env` values are scanned (a `remote.*.fetch` refspec, an `alias.`); a subcommand that does not
+# resolve on the original text to a CLEAN word (quotes, `(`, backticks, an unknown global) is judged FLAT; `branch -v/-a/-r` no
+# longer count as list reads; `update-ref --stdin` is denied unconditionally; a glob refspec whose destination is outside
+# refs/remotes/ (fetch, pull, push, send-pack, `config remote.*`) is denied, so the default `+refs/heads/*:refs/remotes/o/*`
+# stays; `fetch --mirror` / `remote … --mirror` deny; `xargs git <writer>` denies when the command names the refs;
+# `git replace` naming them denies. STATED RESIDUALS (not chased): `checkout kit-base` THEN any history-moving command
+# (commit, merge, reset, pull); `push --mirror/--all/--prune` deleting the REMOTE refs/kit/base (a DoS only: import verification
+# binds); `git config alias.x` set in a separate command; short-name resolution (`fetch kit/base:refs/q/x` then a local push);
+# a `refs/replace/` ref by sha (kit-update runs with GIT_NO_REPLACE_OBJECTS=1); N3 two-token `git --config-env alias.x=VAR x`;
+# N4 `xargs -a <file> git update-ref` (ref names from a file); N5 `git stash branch kit-base`, `git fast-import` with a file
+# body, `@{-N}` / `git checkout -`, a shell alias or function for git. `checkout`/`switch`/`worktree add` deny with -b/-c/--track
+# (`--no-guess` is not a detach) or without `--detach`.
+# N6 over-denies, accepted: a repo DIRECTORY named kit-base (`git -C ../kit-base …`), `git -P log kit-base`, prose in a gh body
+# that names `git checkout kit-base`.
+# Over-deny (accepted): `git -c k=v checkout kit-base`, `git checkout kit-base -- <path>`, a wrapper (`sh -c`, `env`, `xargs`)
+# text that merely names a verb beside the name.
+_kbs_tip='13: raw git writes to the shared kit-base refs (refs/heads/kit-base, refs/tags/kit-base/*, refs/kit/*) are denied: an unverified fetch into kit-base is a code-execution channel (every kit-update --from runs the base'"'"'s own scripts/incept.sh). kit-base is imported VERIFIED by `sh scripts/kit-update.sh --from <vendor>` and published by `sh scripts/kit-update.sh --publish-base`. Reads (log, show, rev-parse, ls-remote, archive, diff, cat-file, for-each-ref, fetch with no `:` destination) stay allowed. This deny is a narrowing, not a seal; its ceiling is stated in the escape-card row. (escape card R22 kit-base-write)'
+
+# _kbs_seg_denied "<one segment: quotes/backslash/$ stripped, lowercased, claim-scratch carved out>" "<git sub or ''>" "<1 if unparseable>"
+# PREDICATE: returns 0 (deny) or 1. A resolved subcommand that is not a write verb is allowed on that binding alone (so a
+# commit MESSAGE naming both is not judged); an unresolved one (a wrapper lead, an unknown global) is judged flat.
+_kbs_seg_denied() {
+  _kbs_sub=$2; _kbs_unp=$3; _kbs_cmdn=$4; _kbs_lead=${5##*/}
+  _kbs_pg=0; case "$-" in
+    *f*) _kbs_pg=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  _kbs_git=0; _kbs_names=0; _kbs_colon=0; _kbs_ds=0; _kbs_td=0; _kbs_cb=0; _kbs_rd=0; _kbs_trd=0; _kbs_seen=0; _kbs_skip=0
+  _kbs_alias=0; _kbs_stdin=0; _kbs_glob=0; _kbs_rem=0; _kbs_det=0; _kbs_mir=0; _kbs_glany=0; _kbs_cfe=0
+  _kbs_v=' '
+  for _kbs_t in "$@"; do
+    # ANALYSIS of every token, a skipped `-c`/`-C` operand included (`git -c remote.origin.fetch=+refs/kit/base:refs/heads/kit-base fetch`):
+    # does it name the shared refs, carry a `src:dst` refspec, a glob whose destination is outside refs/remotes/, an alias?
+    if _kbs_nm "$_kbs_t"; then
+      _kbs_names=1
+      case "$_kbs_t" in
+        *:*) _kbs_colon=1 ;;
+        esac
+    fi
+    case "$_kbs_t" in
+      alias.*|*[=]alias.*) _kbs_alias=1 ;;
+      --config-env*)
+        case "$_kbs_t" in
+          *remote.*|*alias.*) _kbs_cfe=1 ;;
+          esac ;;
+    esac
+    case "$_kbs_t" in
+      -*) : ;;
+      *'*'*|*'?'*|*'['*) _kbs_glany=1 ;;
+    esac
+    case "$_kbs_t" in
+      *:*)
+        _kbs_src=${_kbs_t%%:*}; _kbs_dst=${_kbs_t#*:}
+        case "$_kbs_dst" in
+          refs/remotes/*) : ;;
+          *)
+            case "$_kbs_src$_kbs_dst" in
+              *'*'*|*'?'*|*'['*) _kbs_glob=1 ;;
+              esac ;;
+        esac ;;
+    esac
+    if [ "$_kbs_skip" = 1 ]; then _kbs_skip=0; continue; fi
+    # CLASSIFICATION of the unskipped tokens: the verbs and the flags that decide what a verb does
+    case "$_kbs_t" in
+      git|*/git) _kbs_git=1 ;;
+      update-ref|symbolic-ref|replace|push|send-pack|fetch|pull|branch|tag|checkout|switch|worktree|config|clone|remote) _kbs_v="$_kbs_v$_kbs_t "; _kbs_seen=1 ;;
+      --stdin) _kbs_stdin=1 ;;
+      remote.*) _kbs_rem=1 ;;
+      -c|-C) if [ "$_kbs_git" = 1 ] && [ "$_kbs_seen" = 0 ]; then _kbs_skip=1; else _kbs_ds=1; _kbs_cb=1; fi ;;
+      --force|--delete) _kbs_ds=1; _kbs_td=1 ;;
+      --move|--copy) _kbs_ds=1 ;;
+      --force-create|--orphan|--branch|--branch=*) _kbs_cb=1 ;;
+      --detach) _kbs_det=1 ;;
+      --mirror|--mirror=*) _kbs_mir=1 ;;
+      --list|--contains|--merged|--no-merged|--points-at|--show-current) _kbs_rd=1; _kbs_trd=1 ;;
+      --*) : ;;
+      -*)
+        _kbs_cl=${_kbs_t#-}
+        case "$_kbs_cl" in
+          *[fmcd]*) _kbs_ds=1 ;;
+          esac
+        case "$_kbs_cl" in
+          *[fd]*) _kbs_td=1 ;;
+          esac
+        case "$_kbs_cl" in
+          *[bc]*) _kbs_cb=1 ;;
+          esac
+        case "$_kbs_cl" in
+          *d*) _kbs_det=1 ;;
+          esac
+        case "$_kbs_cl" in
+          *l*) _kbs_rd=1 ;;
+          esac
+        case "$_kbs_cl" in
+          *[lnv]*) _kbs_trd=1 ;;
+          esac ;;
+    esac
+  done
+  [ "$_kbs_pg" = 1 ] || set +f
+  [ "$_kbs_git" = 1 ] || return 1
+  [ "$_kbs_cfe" = 0 ] || return 0
+  # a wrapper that FEEDS a git ref writer (`echo refs/heads/kit-base | xargs git update-ref HEAD`): the names ride the pipe
+  if [ "$_kbs_lead" = xargs ] && [ "$_kbs_cmdn" = 1 ]; then _kbs_names=1; fi
+  # THE VERB. A resolved, CLEAN subcommand binds on its own (so a commit MESSAGE naming a verb and the name is not judged);
+  # one the caller could not resolve, or one an alias in the segment could redefine, is judged FLAT: every verb token counts,
+  # and a `git` led segment that names the refs and resolves to nothing is denied outright.
+  if [ -n "$_kbs_sub" ] && [ "$_kbs_alias" = 0 ]; then
+    case "$_kbs_sub" in
+      update-ref|symbolic-ref|replace|push|send-pack|fetch|pull|branch|tag|checkout|switch|worktree|config|clone|remote) _kbs_v=" $_kbs_sub " ;;
+      *) return 1 ;;
+    esac
+  else
+    if [ "$_kbs_lead" = git ] && [ "$_kbs_names" = 1 ]; then return 0; fi
+    if [ "$_kbs_alias" = 1 ] && [ "$_kbs_names" = 1 ]; then return 0; fi
+  fi
+  case "$_kbs_v" in
+    *" update-ref "*|*" symbolic-ref "*)
+      # any form; `--stdin` carries its ref names in a body this walk cannot see, so it is denied unconditionally (kit-update's
+      # own writes are not hook-visible); an unresolvable ref fails closed
+      if [ "$_kbs_names" = 1 ] || [ "$_kbs_unp" = 1 ] || [ "$_kbs_stdin" = 1 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" fetch "*|*" pull "*|*" clone "*|*" remote "*|*" config "*)
+      # a refspec whose destination could be kit-base / refs/kit/* (a glob outside refs/remotes/, or a token naming them)
+      if [ "$_kbs_glob" = 1 ]; then return 0; fi
+      if [ "$_kbs_names" = 1 ] && [ "$_kbs_colon" = 1 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" fetch "*|*" remote "*) if [ "$_kbs_mir" = 1 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" push "*|*" send-pack "*) if [ "$_kbs_glany" = 1 ] || [ "$_kbs_glob" = 1 ]; then return 0; fi ;;
+  esac
+  [ "$_kbs_names" = 1 ] || return 1
+  case "$_kbs_v" in
+    *" push "*|*" send-pack "*|*" pull "*|*" remote "*|*" replace "*) return 0 ;;
+  esac
+  case "$_kbs_v" in
+    *" branch "*) if [ "$_kbs_ds" = 1 ] || [ "$_kbs_rd" = 0 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" tag "*) if [ "$_kbs_td" = 1 ] || [ "$_kbs_trd" = 0 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" checkout "*|*" switch "*|*" worktree "*)
+      # N1: `--no-guess` is NOT a detach (it still creates with -b/-c/--track). Deny a creating form, or any non-detached one;
+      # git rejects --detach beside -b/-B/-c/-C/--orphan, so no legitimate form is lost.
+      if [ "$_kbs_cb" = 1 ] || [ "$_kbs_det" = 0 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" clone "*) if [ "$_kbs_cb" = 1 ]; then return 0; fi ;;
+  esac
+  case "$_kbs_v" in
+    *" config "*) if [ "$_kbs_rem" = 1 ]; then return 0; fi ;;
+  esac
+  return 1
+}
+
+# SWAS-795 - raw git writes to refs/local-claims/* (the local claims area board-claim.sh writes before any remote exists).
+# _lc795_denied "<cmd>" "<the cmd, quotes/backslash/$ stripped>": PREDICATE (0 = deny). R18's shape over the same stripped view,
+# flat across the command: a git invocation, a WRITE verb, and a destination naming the namespace. One statement per line, each
+# ending in a marker the selftest mutants address. READS are untouched (for-each-ref, rev-parse, cat-file, show, log, a fetch with
+# no `:` destination). An update-ref / symbolic-ref operand that cannot be read ({ $ or a backtick after the verb) fails closed.
+# The caller already tested selfedit_allowed and the KIT_CLAIM_FRONT_DOOR sentinel (process environment only, as R18's is).
+_lc795_denied() {
+  # Both views are read with NEWLINES FOLDED to spaces, so a backslash-newline or a bare newline between the verb and its operand
+  # (or inside a push) cannot split the text the patterns read. An unreadable operand sets _lc795_unread so the sentence can say so.
+  _lc795_unread=0
+  _lc_fv=$(printf '%s' "$2" | tr '\n' ' ') || _guard_fault lc-fold   # 795-FOLDV
+  # The THIRD view is the raw command with ONLY the quote and backslash bytes deleted ({ $ and the backtick are kept), so a split verb
+  # (`upd''ate-ref`, `update\-ref`) is joined for the unreadable-operand tests while the expansion bytes stay visible.
+  _lc_fu=$(printf '%s' "$1" | tr -d '"\\'"'" | tr '\n' ' ') || _guard_fault lc-fold   # 795-FOLDU
+  case "$1" in
+    *[!\"\'\\[:space:]]*) _guard_vanished lc-view "$1" "$_lc_fu" ;;
+  esac
+  set -- "$1" "$_lc_fv" "$_lc_fu"
+  _gmq lc-git "$2" -Eq -- '(^|[^[:alnum:]_])git([[:space:]]|$)' || return 1   # 795-GIT
+  if _gmq lc-refverb "$2" -Eq -- '(^|[^[:alnum:]_])(update-ref|symbolic-ref)([[:space:]]|$)'; then   # 795-REFVERB
+    if _gmq lc-unres "$3" -Eq -- '(update-ref|symbolic-ref)[[:space:]].*[{$`]'; then _lc795_unread=1; return 0; fi   # 795-UNRES
+    if _gmq lc-ns "$2" -Eiq -- '(^|[^[:alnum:]_])[^[:alnum:]]*refs/local-claims(/|$)'; then return 0; fi   # 795-NS
+  fi
+  _lc_w=0
+  if _gmq lc-cfgverb "$2" -Eq -- '(^|[^[:alnum:]_])(config|remote)([[:space:]]|$)'; then _lc_w=1; fi   # 795-CFGVERB
+  if _gmq lc-spec "$2" -Eq -- '(^|[^[:alnum:]_])(fetch|pull|push|send-pack)([[:space:]]|$)'; then   # 795-SPEC
+    _lc_w=1
+    if _gmq lc-dest "$2" -Eiq -- ':[^[:alnum:]]*refs/local-claims(/|$)'; then return 0; fi   # 795-DEST
+    if _gmq lc-bare "$2" -Eiq -- '(push|send-pack)[[:space:]]+([^;&|]*[[:space:]])?[^[:alnum:]]*refs/local-claims(/|$)'; then return 0; fi   # 795-BARE
+  fi
+  # A refspec verb (fetch, pull, push, send-pack, remote, config) with a `:` AND a { $ or backtick anywhere: the destination cannot be read.
+  if [ "$_lc_w" = 1 ]; then
+    if _gmq lc-unref "$3" -Eq -- '(:.*[{$`])|([{$`].*:)'; then _lc795_unread=1; return 0; fi   # 795-UNREF
+  fi
+  if _gmq lc-cfg "$2" -Eiq -- '(^|[^[:alnum:]_])config[[:space:]]+([^;&|]*[[:space:]])?remote\.[^[:space:]=]*\.(fetch|push)[[:space:]=][^;&|]*refs/local-claims(/|$)'; then return 0; fi   # 795-CFG
+  return 1
+}
+
+# SWAS-192 slice A - raw git writes to the CHECKOUT LEASE (scripts/checkout-lease.sh): its refs (refs/local-lease/*, refs/local-lease-log/*, and the
+# origin namespaces refs/leases/*, refs/leases-log/* a later slice writes) and the `kit.checkoutLease` key that turns the lease on. R795's shape,
+# over the same stripped view: a git invocation, a WRITE verb, a destination naming the namespace; one statement per line, each ending in a marker
+# the selftest mutants address. Two legs, two sentences (_cl192_kind = ref | key):
+#   * THE KEY is never exempt: no verb writes it (a human opts a checkout in or out in their own terminal), so the sentinel does not open it. Any `git config`
+#     naming the key is denied unless the whole command is the plain read (`git config [--local|--get|--bool]... kit.checkoutLease`, an optional `2>/dev/null`).
+#     So `git config --unset kit.checkoutLease`, `--replace-all`, `--add`, `-f <file>`, `--remove-section kit` and a chained read-then-write all deny.
+#   * THE REFS: denied unless KIT_LEASE_FRONT_DOOR=1 is in the guard's own PROCESS environment (the verb's own writes; text never carries it). The
+#     unreadable-operand cases (a brace, `$` or backtick in an update-ref, symbolic-ref or refspec operand) are already denied fail-closed by _lc795_denied
+#     above, whatever the namespace, so this predicate does not repeat them. READS are untouched: for-each-ref, rev-parse, cat-file, show, log.
+# The caller already tested selfedit_allowed. A drift control, not a boundary: a forged sentinel, an alias, a rewrite command, an interpreter wrapper and
+# a plain terminal are not covered (escape card R38). THE SENTINEL IS FORGEABLE, as KIT_CLAIM_FRONT_DOOR is: it is honoured from the guard's PROCESS
+# environment, so any process that can set that environment (the launch environment, a harness `env` block, and under shims a shell rc, `.envrc`,
+# `BASH_ENV` or an `export` before an `sh` script) opens the REF legs. That makes the ref legs a SEATBELT against a drifting agent's raw write, never a
+# boundary against a process that means to. The key leg takes no sentinel, but a plain terminal and `git config --edit` are not graded.
+_cl192_denied() {
+  _cl192_kind=ref
+  _cl_v=$(printf '%s' "$2" | tr '\n' ' ') || _guard_fault cl192-fold   # 192-FOLDV
+  # THE PLAIN-READ TEST reads the RAW command (newlines folded), never the quote-stripped view: with quotes deleted, `git config kit.checkoutLease ""`
+  # (which writes an empty value, turning the lease off) would read as the plain read. A quoted spelling of a real read is therefore refused too (priced, R38).
+  _cl_raw=$(printf '%s' "$1" | tr '\n' ' ') || _guard_fault cl192-fold   # 192-FOLDR
+  _gmq cl-git "$_cl_v" -Eq -- '(^|[^[:alnum:]_])git([[:space:]]|$)' || return 1   # 192-GIT
+  if _gmq cl-key "$_cl_v" -Eiq -- 'kit\.checkoutlease'; then   # 192-KEYNAME
+    if _gmq cl-cfgverb "$_cl_v" -Eq -- '(^|[^[:alnum:]_])config([[:space:]]|$)'; then   # 192-CFGVERB
+      if ! _gmq cl-read "$_cl_raw" -Eiq -- '^[[:space:]]*git[[:space:]]+config([[:space:]]+(--get|--local|--bool))*[[:space:]]+kit\.checkoutlease[[:space:]]*(2>/dev/null)?[[:space:]]*$'; then _cl192_kind=key; return 0; fi   # 192-KEYWRITE
+    fi
+  fi
+  if _gmq cl-rmsec "$_cl_v" -Eiq -- '(^|[^[:alnum:]_])config[[:space:]]+([^;&|]*[[:space:]])?(--remove-section|--rename-section)[[:space:]]+kit([[:space:].]|$)'; then _cl192_kind=key; return 0; fi   # 192-RMSEC
+  [ "${KIT_LEASE_FRONT_DOOR:-}" != "1" ] || return 1   # 192-SENT
+  if _gmq cl-refverb "$_cl_v" -Eq -- '(^|[^[:alnum:]_])(update-ref|symbolic-ref)([[:space:]]|$)'; then   # 192-REFVERB
+    if _gmq cl-ns "$_cl_v" -Eiq -- '(^|[^[:alnum:]_])[^[:alnum:]]*(refs/)?(local-lease(-log)?|leases(-log)?)(/|$)'; then return 0; fi   # 192-NS
+  fi
+  if _gmq cl-spec "$_cl_v" -Eq -- '(^|[^[:alnum:]_])(fetch|pull|push|send-pack)([[:space:]]|$)'; then   # 192-SPEC
+    # `refs/` is OPTIONAL in a destination: git resolves a short name (`local-lease/checkout`) to an existing refs/local-lease/checkout (A1)
+    if _gmq cl-dest "$_cl_v" -Eiq -- ':[^[:alnum:]]*(refs/)?(local-lease(-log)?|leases(-log)?)(/|$)'; then return 0; fi   # 192-DEST
+    if _gmq cl-bare "$_cl_v" -Eiq -- '(push|send-pack)[[:space:]]+([^;&|]*[[:space:]])?[^[:alnum:]]*(refs/)?(local-lease(-log)?|leases(-log)?)(/|$)'; then return 0; fi   # 192-BARE
+  fi
+  if _gmq cl-cfg "$_cl_v" -Eiq -- '(^|[^[:alnum:]_])config[[:space:]]+([^;&|]*[[:space:]])?remote\.[^[:space:]=]*\.(fetch|push)[[:space:]=][^;&|]*refs/(local-lease(-log)?|leases(-log)?)(/|$)'; then return 0; fi   # 192-CFG
+  return 1
+}
+
+# SWAS-842 - the LEASED-DELETE ADMISSION. _lda842_admitted "<cmd>": rc 0 iff the whole command is the one compare-and-swap delete the kit's own verbs make:
+#   git [-C <dir>] push [-q|--quiet] --force-with-lease=<ref>:<full sha> <remote> :<ref>      (options in any order; board-claim.sh and checkout-lease.sh differ)
+# with <ref> = refs/leases/<name> under KIT_LEASE_FRONT_DOOR=1, or refs/claims/<ROW> under KIT_CLAIM_FRONT_DOOR=1, each sentinel read from the guard's PROCESS
+# environment only (text never carries it) and each opening only its own namespace. It is consulted by ONE rule, the force-push rule below, which it lets skip its
+# deny for this form; there is no early return, so push-to-main and every later rule still run. Pure `case` tests over tokens (no matcher, no regex fork); a
+# subshell, so `set -f` and the positionals do not leak; any other rc, a failed fork included, means NOT admitted and today's refusal stands. One statement per rule,
+# each ending in a marker the mutants address. Rule A: the raw text holds only [A-Za-z0-9._/@:%=-] and single spaces (no leading, trailing or double space, so an empty
+# argv element, which the shim joins into a double space, is never admitted; no `+`, `~`, quote or metacharacter). Rule B: the token walk. Rule C: the sentinel pairing.
+# CEILING, stated: the sentinel is FORGEABLE under the shims (a process that sets the guard's environment, as for R18 and R38), and an absolute-path git skips the shim
+# altogether; the plain unconditional delete under the sentinel is already admitted by R18 and R38 (the force-push rule never matched it) - SWAS-852 narrows that.
+_lda842_admitted() (
+  set -f; LC_ALL=C; export LC_ALL
+  _l8_c=$1
+  # explicit letter lists, never a letter range: a range widens under a UTF-8 locale in bash 3.2 (the range-bytes lock)
+  case "$_l8_c" in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:%=' '-]*) return 1 ;;   # 842-LIT
+  esac
+  case "$_l8_c" in
+    ' '*|*' '|*'  '*) return 1 ;;   # 842-SPACE
+  esac
+  # the split is by parameter expansion, with no word splitting and no IFS: runs of spaces collapse and no other byte splits, as a space-only split would
+  _l8_rest=$_l8_c
+  set --
+  while :; do
+    _l8_rest=${_l8_rest#"${_l8_rest%%[! ]*}"}
+    [ -n "$_l8_rest" ] || break
+    _l8_tok=${_l8_rest%% *}
+    set -- "$@" "$_l8_tok"
+    [ "$#" -le 16 ] || return 1   # 842-CAP
+    _l8_rest=${_l8_rest#"$_l8_tok"}
+  done
+  [ "${1:-}" = git ] || return 1   # 842-LEAD
+  shift
+  if [ "${1:-}" = -C ]; then
+    case "${2:-}" in
+      ''|-*|*=*) return 1 ;;   # 842-GLOBAL
+    esac
+    shift 2
+  fi
+  [ "${1:-}" = push ] || return 1   # 842-VERB
+  shift
+  _l8_lease=''; _l8_nl=0; _l8_nq=0; _l8_n=0; _l8_rem=''; _l8_spec=''
+  for _l8_t in "$@"; do
+    case "$_l8_t" in
+      --force-with-lease=*)
+        _l8_nl=$((_l8_nl + 1)); _l8_lease=${_l8_t#--force-with-lease=} ;;
+      -q|--quiet)
+        _l8_nq=$((_l8_nq + 1)) ;;
+      -*)
+        return 1 ;;   # 842-OPT
+      *)
+        _l8_n=$((_l8_n + 1))
+        [ "$_l8_n" != 1 ] || _l8_rem=$_l8_t
+        [ "$_l8_n" != 2 ] || _l8_spec=$_l8_t ;;
+    esac
+  done
+  [ "$_l8_nl" = 1 ] && [ "$_l8_nq" -le 1 ] || return 1   # 842-ONE
+  [ "$_l8_n" = 2 ] || return 1   # 842-POS
+  case "$_l8_rem" in
+    ''|-*|:*) return 1 ;;
+  esac
+  case "$_l8_lease" in
+    *:*:*|*:|:*|'') return 1 ;;
+    *:*) : ;;
+    *) return 1 ;;
+  esac
+  _l8_ref=${_l8_lease%%:*}; _l8_sha=${_l8_lease#*:}
+  case "$_l8_sha" in
+    *[!0123456789abcdef]*|'') return 1 ;;   # 842-SHA
+  esac
+  case ${#_l8_sha} in
+    40|64) : ;;
+    *) return 1 ;;   # 842-SHA
+  esac
+  [ "$_l8_spec" = ":$_l8_ref" ] || return 1   # 842-EQ
+  case "$_l8_ref" in
+    refs/leases/*) _l8_nm=${_l8_ref#refs/leases/}; _l8_k=lease ;;   # 842-NS
+    refs/claims/*) _l8_nm=${_l8_ref#refs/claims/}; _l8_k=claim ;;   # 842-NS
+    *) return 1 ;;
+  esac
+  if [ "$_l8_k" = lease ]; then
+    _l8_cs=abcdefghijklmnopqrstuvwxyz0123456789-; _l8_fc=abcdefghijklmnopqrstuvwxyz; _l8_max=32
+    _l8_sv=${KIT_LEASE_FRONT_DOOR:-}   # 842-PAIR
+  else
+    _l8_cs=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-; _l8_fc=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789; _l8_max=64
+    _l8_sv=${KIT_CLAIM_FRONT_DOOR:-}   # 842-PAIR
+  fi
+  case "$_l8_nm" in
+    ''|*[!$_l8_cs]*) return 1 ;;
+  esac
+  case "$_l8_nm" in
+    [$_l8_fc]*) : ;;
+    *) return 1 ;;
+  esac
+  [ "${#_l8_nm}" -le "$_l8_max" ] || return 1
+  [ "$_l8_sv" = 1 ] || return 1   # 842-SENT
+  return 0
+)
+
+# SWAS-883 - the FIRST-PUSH ADMISSION. _fp883_admitted "<cmd>" "<cwd>": rc 0 iff the whole command is `git [-C <P>] push [-u|--set-upstream] <R> main` AND P is a
+# plain kit repository whose pre-push hook and guard core are byte-identical to the running guard's own, whose effective config cannot turn that hook off or reroute the
+# push, and whose every push URL is https, ssh or scp-form; the guard's own environment must carry none of the git/kit override names. It is consulted by ONE rule, the
+# push-to-main deny below, which skips its deny for this one segment; the force-push rule and every later rule still run. The decision on the remote is NOT made here: git
+# runs the kit's pre-push hook at push time, and the hook admits only the creation of a main that is absent. This function only proves that hook will run. Local reads
+# only (rev-parse, config, remote get-url, cmp): no ls-remote, no fetch, no network. A near miss (the grammar matched, a later condition failed) leaves the failed
+# condition's NAME in _FP883_WHY (grammar, repository, hook, core, config, URL or environment), never a path, URL or config value. The work is _fp883_run, a subshell
+# function (so `set -f` and the positionals do not leak); it prints the name on a miss, and any other failure, a failed fork included, is a miss. The checks
+# that carry a marker are the mutants' targets. A credential helper is read with `git config -z --show-scope` (a NUL-free form of the output is parsed; a value holding a newline, \001 or \002 declines in the parse;
+# any other byte declines through the exact-match list): at any scope but global or system a non-empty value declines (an empty value is a list reset); at global or system scope only an empty value, exactly
+# `!<absolute path ending /gh> auth git-credential` (MUT-883-GHFORM) or one of the words osxkeychain, store, manager is admitted. core.askPass at any scope, a submodule setting, .gitmodules or .git/modules, and
+# push.gpgSign decline; an askPass, alias, include or credential read that fails other than rc 1 declines. Design: docs/architecture/2026-11-14-guard-first-push-883-design.md.
+# CEILING, stated: the window between this check and git's hook lookup (a parallel config write or hook swap), and GIT_EXEC_PATH replacing git, are residuals (design 4); see threat-model R2 (the profile-snapshot class), R6 and R8.
+_fp883_run() (
+  set -f; LC_ALL=C; export LC_ALL
+  _fp_c=$1; _fp_cwd=${2:-}
+  _fp_al='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  _fp_nl='
+'
+  # 3.1 the whole command: explicit letter lists, never a range; one segment, single spaces only (no quote, $, backtick, backslash, ; & | < > or newline can appear)
+  case "$_fp_c" in
+    ''|*[!$_fp_al._/:' '-]*) return 1 ;;   # 883-LIT
+  esac
+  case "$_fp_c" in
+    ' '*|*' '|*'  '*) return 1 ;;   # 883-SPACE
+  esac
+  _fp_rest=$_fp_c
+  set --
+  while :; do
+    _fp_rest=${_fp_rest#"${_fp_rest%%[! ]*}"}
+    [ -n "$_fp_rest" ] || break
+    _fp_tok=${_fp_rest%% *}
+    set -- "$@" "$_fp_tok"
+    [ "$#" -le 8 ] || return 1   # 883-CAP
+    _fp_rest=${_fp_rest#"$_fp_tok"}
+  done
+  [ "${1:-}" = git ] || return 1   # 883-LEAD
+  shift
+  _fp_p=''
+  if [ "${1:-}" = -C ]; then
+    _fp_p=${2:-}
+    [ -n "$_fp_p" ] || { printf grammar; return 1; }
+    shift 2
+  fi
+  [ "${1:-}" = push ] || { printf grammar; return 1; }
+  shift
+  case "${1:-}" in
+    -u|--set-upstream) shift ;;
+  esac
+  [ "$#" = 2 ] || { printf grammar; return 1; }
+  _fp_r=$1; _fp_ref=$2
+  [ "$_fp_ref" = main ] || { printf grammar; return 1; }   # MUT-883-REFSPEC
+  case "$_fp_r" in
+    [$_fp_al]*) : ;;
+    *) printf grammar; return 1 ;;
+  esac
+  case "$_fp_r" in
+    *[!$_fp_al._-]*) printf grammar; return 1 ;;
+  esac
+  # P is the -C value, else the payload cwd (an empty cwd declines). Absolute, plain characters, no `//`, `.` or `..` component.
+  if [ -z "$_fp_p" ]; then _fp_p=$_fp_cwd; _fp_pw=repository; else _fp_pw=grammar; fi
+  [ -n "$_fp_p" ] || { printf repository; return 1; }
+  case "$_fp_p" in
+    /*) : ;;
+    *) printf '%s' "$_fp_pw"; return 1 ;;
+  esac
+  case "$_fp_p" in
+    *[!$_fp_al._/-]*|*//*|*/./*|*/../*|*/.|*/..) printf '%s' "$_fp_pw"; return 1 ;;
+  esac
+  # 3.5 the environment seatbelt: set, even empty, declines. A seatbelt only: the guard cannot see the Bash tool's own shell (design 3.8 makes the main decision independent of it).
+  if [ -n "${KIT_GUARD_CORE+x}${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}${GIT_EXEC_PATH+x}${GIT_CONFIG_PARAMETERS+x}${GIT_CONFIG_COUNT+x}${GIT_CONFIG_GLOBAL+x}${GIT_CONFIG_SYSTEM+x}${GIT_CONFIG_NOSYSTEM+x}${GIT_SSH+x}${GIT_SSH_COMMAND+x}${GIT_ASKPASS+x}${SSH_ASKPASS+x}" ]; then   # 883-ENV
+    printf environment; return 1
+  fi
+  _fp_git() { git -C "$_fp_p" -c core.fsmonitor=false "$@" </dev/null; }
+  _fp_bool_off() {   # <key>: rc 0 iff the key is unset or a false boolean (an unparsable value, or a bare key, declines)
+    _fb_rc=0; _fb_v=$(_fp_git config --bool --get "$1" 2>/dev/null) || _fb_rc=$?
+    [ "$_fb_rc" = 1 ] && return 0
+    [ "$_fb_rc" = 0 ] && [ "$_fb_v" = false ]
+  }
+  _fp_ghform() {   # <value starting with !>: rc 0 iff it is exactly !<absolute path ending /gh, plain characters, no // /./ /../> auth git-credential
+    _fg_w=${1#!}
+    _fg_p=${_fg_w% auth git-credential}
+    [ "$_fg_p" != "$_fg_w" ] || return 1
+    case "$_fg_p" in
+      /gh|/*/gh) : ;;
+      *) return 1 ;;
+    esac
+    case "$_fg_p" in
+      *[!$_fp_al._/-]*|*//*|*/./*|*/../*) return 1 ;;
+    esac
+    return 0
+  }
+  # 3.2 a plain repository at its own root: P/.git a real directory (no symlink, no gitfile), not bare, --show-toplevel equal to P physically
+  { [ -d "$_fp_p/.git" ] && [ ! -L "$_fp_p/.git" ]; } || { printf repository; return 1; }   # MUT-883-PLAIN
+  _fp_bare=$(_fp_git rev-parse --is-bare-repository 2>/dev/null) || _fp_bare=''
+  [ "$_fp_bare" = false ] || { printf repository; return 1; }   # MUT-883-PLAIN
+  _fp_t=$(_fp_git rev-parse --show-toplevel 2>/dev/null) || _fp_t=''
+  _fp_tp=''
+  [ -z "$_fp_t" ] || _fp_tp=$(CDPATH='' cd "$_fp_t" 2>/dev/null && pwd -P) || _fp_tp=''
+  _fp_pp=$(CDPATH='' cd "$_fp_p" 2>/dev/null && pwd -P) || _fp_pp=''
+  [ -n "$_fp_tp" ] && [ "$_fp_tp" = "$_fp_pp" ] || { printf repository; return 1; }   # MUT-883-PLAIN
+  [ -n "$_fp_pp" ] || { printf repository; return 1; }
+  _fp_git config --get "remote.$_fp_r.url" >/dev/null 2>&1 || { printf repository; return 1; }
+  # 3.3 the hook git will run: P/.git/hooks/pre-push or P/hooks/pre-push physically, a regular executable file, byte-identical to the one beside the running guard's core
+  [ -n "${PROTECTED_ROOT:-}" ] || { printf hook; return 1; }
+  _fp_h=$(_fp_git rev-parse --git-path hooks/pre-push 2>/dev/null) || _fp_h=''
+  case "$_fp_h" in
+    '') printf hook; return 1 ;;
+    /*) : ;;
+    *) _fp_h="$_fp_p/$_fp_h" ;;
+  esac
+  _fp_hd=$(CDPATH='' cd "${_fp_h%/*}" 2>/dev/null && pwd -P) || _fp_hd=''
+  case "$_fp_hd/${_fp_h##*/}" in
+    "$_fp_pp/.git/hooks/pre-push"|"$_fp_pp/hooks/pre-push") : ;;
+    *) printf hook; return 1 ;;
+  esac
+  { [ -f "$_fp_h" ] && [ ! -L "$_fp_h" ] && [ -x "$_fp_h" ]; } || { printf hook; return 1; }
+  cmp -s "$_fp_h" "$PROTECTED_ROOT/hooks/pre-push" || { printf hook; return 1; }   # MUT-883-HOOKCMP
+  # 3.4 the kit's core in place: a regular file (no symlinked directory above it), byte-identical to the running core
+  _fp_k="$_fp_p/.claude/hooks/guard-core.sh"
+  { [ ! -L "$_fp_p/.claude" ] && [ ! -L "$_fp_p/.claude/hooks" ] && [ -f "$_fp_k" ] && [ ! -L "$_fp_k" ]; } || { printf core; return 1; }
+  cmp -s "$_fp_k" "$PROTECTED_ROOT/.claude/hooks/guard-core.sh" || { printf core; return 1; }   # MUT-883-CORECMP
+  # 3.5 the effective config (never --local): nothing may turn the hook off or reroute the push
+  _fp_hv=$(_fp_git config --get-all core.hooksPath 2>/dev/null) || _fp_hv=''
+  if [ -n "$_fp_hv" ]; then
+    case "$_fp_hv" in
+      *"$_fp_nl"*) printf config; return 1 ;;
+      /*) : ;;
+      *) _fp_hv="$_fp_p/$_fp_hv" ;;
+    esac
+    _fp_hvp=$(CDPATH='' cd "$_fp_hv" 2>/dev/null && pwd -P) || _fp_hvp=''
+    [ "$_fp_hvp" = "$_fp_pp/hooks" ] || { printf config; return 1; }
+  fi
+  _fp_rc=0; _fp_git config --get-regexp '^(include|includeif)\.' >/dev/null 2>&1 || _fp_rc=$?
+  [ "$_fp_rc" = 1 ] || { printf config; return 1; }   # MUT-883-INCLUDE
+  _fp_bool_off "remote.$_fp_r.mirror" || { printf config; return 1; }
+  if _fp_git config --get-all "remote.$_fp_r.receivepack" >/dev/null 2>&1; then printf config; return 1; fi
+  if _fp_git config --get-all "remote.$_fp_r.vcs" >/dev/null 2>&1; then printf config; return 1; fi
+  if _fp_git config --get-all core.sshCommand >/dev/null 2>&1; then printf config; return 1; fi
+  # core.askPass at any scope (a read that fails other than rc 1 declines)
+  _fp_rc=0; _fp_git config --get-all core.askPass >/dev/null 2>&1 || _fp_rc=$?
+  [ "$_fp_rc" = 1 ] || { printf config; return 1; }   # MUT-883-ASKPASS
+  # an alias named credential-<word> runs in place of a missing git-credential-<word> program (measured), so any such key at any scope declines
+  _fp_rc=0; _fp_git config --get-regexp '^alias\.credential-' >/dev/null 2>&1 || _fp_rc=$?
+  [ "$_fp_rc" = 1 ] || { printf config; return 1; }   # MUT-883-ALIAS
+  # submodules and signing: each unset or a false boolean; no .gitmodules (any type) and no .git/modules
+  _fp_bool_off push.recurseSubmodules || { printf config; return 1; }
+  _fp_bool_off submodule.recurse || { printf config; return 1; }
+  _fp_bool_off push.gpgSign || { printf config; return 1; }
+  if [ -e "$_fp_p/.gitmodules" ] || [ -L "$_fp_p/.gitmodules" ]; then printf config; return 1; fi   # MUT-883-SUBMOD
+  if [ -e "$_fp_p/.git/modules" ] || [ -L "$_fp_p/.git/modules" ]; then printf config; return 1; fi
+  # 3.5 the credential helpers. A shell variable cannot hold NUL, so the -z output goes through tr, which maps NUL to \001 and any \001 already in a value to \002 (a value holding \002 then
+  # declines); the exit status rides in a trailing `rcN` line after the records. MEASURED -z --show-scope layout: each entry is <scope> NUL <key> NL <value> NUL, so after the
+  # tr the records alternate scope, then key-newline-value, each ended by \001. A different layout (a scope token holding a newline or a tab, a bare key with no newline, a value holding a
+  # newline) makes the parse decline: on doubt, decline. The exit status is captured with `|| _fp_x=$?` because the guard runs under `set -eu` (guard.sh): a bare `$?` after a git that exits 1
+  # (no helper at any scope) never printed, and every first push declined. rc 0 and rc 1 parse; any other rc declines.
+  _fp_so=$(printf '\001'); _fp_sx=$(printf '\002'); _fp_tb=$(printf '\t')
+  _fp_cr=$({ _fp_x=0; _fp_git config -z --show-scope --get-regexp '^credential\.(.*\.)?helper$' 2>/dev/null || _fp_x=$?; printf 'rc%s\n' "$_fp_x"; } | tr '\001\000' '\002\001')
+  _fp_rcw=${_fp_cr##*"$_fp_so"}
+  case "$_fp_rcw" in
+    rc0|rc1) : ;;
+    *) printf config; return 1 ;;
+  esac
+  _fp_rest=${_fp_cr%"$_fp_rcw"}
+  case "$_fp_rest" in
+    *"$_fp_sx"*) printf config; return 1 ;;
+  esac
+  _fp_sc=''
+  while [ -n "$_fp_rest" ]; do
+    case "$_fp_rest" in
+      *"$_fp_so"*) : ;;
+      *) printf config; return 1 ;;
+    esac
+    _fp_l=${_fp_rest%%"$_fp_so"*}; _fp_rest=${_fp_rest#*"$_fp_so"}
+    if [ -z "$_fp_sc" ]; then
+      case "$_fp_l" in
+        ''|*"$_fp_nl"*|*"$_fp_tb"*) printf config; return 1 ;;
+      esac
+      _fp_sc=$_fp_l
+      continue
+    fi
+    case "$_fp_l" in
+      *"$_fp_nl"*) : ;;
+      *) printf config; return 1 ;;
+    esac
+    _fp_k=${_fp_l%%"$_fp_nl"*}; _fp_v=${_fp_l#*"$_fp_nl"}
+    case "$_fp_v" in
+      *"$_fp_nl"*) printf config; return 1 ;;
+    esac
+    case "$_fp_k" in
+      *.helper) : ;;
+      *) printf config; return 1 ;;
+    esac
+    _fp_s=$_fp_sc; _fp_sc=''
+    case "$_fp_s" in
+      global|system) : ;;
+      *) [ -z "$_fp_v" ] && continue; printf config; return 1 ;;   # MUT-883-HELPERSCOPE
+    esac
+    [ -n "$_fp_v" ] || continue
+    if [ "${_fp_v#!}" != "$_fp_v" ]; then
+      _fp_ghform "$_fp_v" || { printf config; return 1; }   # MUT-883-GHFORM
+      continue
+    fi
+    _fp_wl=no
+    case "$_fp_v" in
+      osxkeychain|store|manager) _fp_wl=yes ;;   # MUT-883-HELPERLIST
+    esac
+    [ "$_fp_wl" = yes ] || { printf config; return 1; }
+  done
+  [ -z "$_fp_sc" ] || { printf config; return 1; }
+  # 3.5 every PUSH url (after insteadOf and pushInsteadOf): https://, ssh:// or scp-form user@host:path. A helper (`x::`), ext::, fd::, file:// or a bare path declines, an empty answer too.
+  _fp_u=$(_fp_git remote get-url --push --all "$_fp_r" 2>/dev/null) || _fp_u=''   # MUT-883-PUSHURL
+  [ -n "$_fp_u" ] || { printf URL; return 1; }
+  _fp_rest=$_fp_u
+  while [ -n "$_fp_rest" ]; do
+    case "$_fp_rest" in
+      *"$_fp_nl"*) _fp_l=${_fp_rest%%"$_fp_nl"*}; _fp_rest=${_fp_rest#*"$_fp_nl"} ;;
+      *) _fp_l=$_fp_rest; _fp_rest='' ;;
+    esac
+    case "$_fp_l" in
+      https://*) : ;;
+      ssh://*)
+        # ssh://[user@]host[:port]/path: host and user lead with a letter or digit; a port is digits only; the path is non-empty
+        _fp_ur=${_fp_l#ssh://}
+        case "$_fp_ur" in
+          */*) _fp_au=${_fp_ur%%/*}; _fp_up=${_fp_ur#*/} ;;
+          *) printf URL; return 1 ;;
+        esac
+        [ -n "$_fp_up" ] || { printf URL; return 1; }
+        case "$_fp_au" in
+          *@*) _fp_us=${_fp_au%%@*}; _fp_ah=${_fp_au#*@}
+            case "$_fp_us" in
+              ''|[!$_fp_al]*|*[!$_fp_al._-]*) printf URL; return 1 ;;
+            esac ;;
+          *) _fp_ah=$_fp_au ;;
+        esac
+        case "$_fp_ah" in
+          *:*) _fp_uh=${_fp_ah%%:*}; _fp_po=${_fp_ah#*:}
+            case "$_fp_po" in
+              ''|*[!0-9]*) printf URL; return 1 ;;
+            esac ;;
+          *) _fp_uh=$_fp_ah ;;
+        esac
+        case "$_fp_uh" in
+          ''|[!$_fp_al]*|*[!$_fp_al.-]*) printf URL; return 1 ;;
+        esac ;;
+      *@*:*)
+        _fp_us=${_fp_l%%@*}; _fp_ur=${_fp_l#*@}; _fp_uh=${_fp_ur%%:*}; _fp_up=${_fp_ur#*:}
+        case "$_fp_us" in
+          ''|[!$_fp_al]*|*[!$_fp_al._-]*) printf URL; return 1 ;;
+        esac
+        case "$_fp_uh" in
+          ''|[!$_fp_al]*|*[!$_fp_al.-]*) printf URL; return 1 ;;
+        esac
+        case "$_fp_up" in
+          ''|/*) printf URL; return 1 ;;
+        esac ;;
+      *) printf URL; return 1 ;;
+    esac
+    : # MUT-883-ALLURLS
+  done
+  return 0
+)
+_fp883_admitted() {
+  _FP883_WHY=''
+  _fp883_w=$(_fp883_run "$1" "${2:-}") && return 0
+  case "$_fp883_w" in
+    grammar|repository|hook|core|config|URL|environment) _FP883_WHY=$_fp883_w ;;
+  esac
+  return 1
+}
+# the one clause the near-miss refusal adds: a fixed word per failed condition, nothing taken from the command, the repository or its config
+_fp883_clause() {
+  [ -n "${_FP883_WHY:-}" ] || return 0
+  printf ' (first-push admission: the %s check failed)' "$_FP883_WHY"
+}
+
+# _kbs_nm "<token>": 0 iff it names kit-base, kit-base/…, refs/kit or refs/kit/… at a REF-COMPONENT boundary — after `/`,
+# `:`, `+`, `^`, `~`, `=` or `,` — never as a substring (`feature/kit-base-shared` is not it). The token is already
+# lowercased, quote-stripped and claim-scratch-carved.
+_kbs_nm() {
+  case "$1" in
+    kit-base|kit-base/*|kit-base[~^@:]*|*/kit-base|*/kit-base/*|*/kit-base[~^@:]*) return 0 ;;
+    *[:+^~=,]kit-base|*[:+^~=,]kit-base/*|*[:+^~=,]kit-base[~^@:]*) return 0 ;;
+    refs/kit|refs/kit/*|*/refs/kit|*/refs/kit/*|*[:+^~=,]refs/kit|*[:+^~=,]refs/kit/*) return 0 ;;
+  esac
+  return 1
+}
+
+# _kitbase_ref_denied "<cmd>" "<the cmd, quotes/backslash/$ stripped>": PREDICATE (0 = deny, prints the tip). The cheap
+# `kit` gate is fork-free; only a command that mentions it pays for the segment walk.
+_kitbase_ref_denied() {
+  # the stripped view (built once for the claims arm) must not have VANISHED: an empty one beside a non-empty command is a
+  # failed fork (#738), not "nothing here" — fault, never allow
+  case "$1" in
+    *[[:alnum:]]*) _guard_vanished kitbase-view "$1" "$2" ;;
+  esac
+  case "$2" in
+    *[Kk][Ii][Tt]*|*[Gg][Ii][Tt]*) : ;;
+    *) return 1 ;;
+  esac
+  # does the WHOLE command name kit-base / refs/kit (for a wrapper that feeds a git ref writer through a pipe)?
+  _kbs_cn=0
+  case "$2" in
+    *[Kk][Ii][Tt]*)
+      _kbs_cl=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]') || _guard_fault kitbase-lower
+      case "$2" in
+        *[[:alnum:]]*) _guard_vanished kitbase-lower "$2" "$_kbs_cl" ;;
+      esac
+      case "$_kbs_cl" in
+        *kit-base*|*refs/kit*) _kbs_cn=1 ;;
+      esac
+      # pinned twin (SWAS-717): a `tr` that maps I->dotless-i under a Turkish locale folds KIT-BASE to k-dotless-i-t-base; the byte
+      # fold cannot. Both run, deny if EITHER names it — the locale fold above is kept (it folds Kelvin / dotted I).
+      _kbs_cp=$(printf '%s' "$2" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault kitbase-lower-c
+      case "$2" in
+        *[[:alnum:]]*) _guard_vanished kitbase-lower-c "$2" "$_kbs_cp" ;;
+      esac
+      case "$_kbs_cp" in
+        *kit-base*|*refs/kit*) _kbs_cn=1 ;;
+      esac ;;
+  esac
+  _cp8b_walk_load "$1"   # faults (exit 2) on a failed/vanished stage, as the CP arms do
+  while _cp8b_next_seg; do
+    case $_seg in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    case "$_seg" in
+      *["$_cp8b_mk_all"]*)
+        _kbs_um=$(_cp8b_unmask_quoted "$_seg") || _guard_fault kitbase-unmask
+        case "$_seg" in
+          *[[:alnum:]]*) _guard_vanished kitbase-unmask "$_seg" "$_kbs_um" ;;
+        esac
+        _seg=$_kbs_um ;;
+    esac
+    _kbs_pl=$(_cp8b_group_peel "$_seg") || _guard_fault kitbase-peel
+    # (a punctuation-only segment — `(`, `{`, `)`, `}` of a newline-separated block — peels to nothing, legitimately)
+    case "$_seg" in
+      *[[:alnum:]]*) _guard_vanished kitbase-peel "$_seg" "$_kbs_pl" ;;
+    esac
+    _kbs_lead=$(_cp8b_lead "$_kbs_pl") || _guard_fault kitbase-lead
+    # the subcommand is trusted ONLY when it resolves on the ORIGINAL text and is a clean word: a quote, a backslash, a
+    # `$`, a backtick or a `(` in it means the guard and the shell may disagree about it -> unresolved -> judged flat
+    _kbs_sub=''
+    if [ "$_kbs_lead" = git ]; then
+      _kbs_sub=$(_cp8b_git_sub "$_kbs_pl") || _guard_fault kitbase-sub
+      case "$_kbs_sub" in
+        *[!abcdefghijklmnopqrstuvwxyz-]*) _kbs_sub='' ;;
+      esac
+    fi
+    _kbs_unp=0; if _cp8b_unparseable "$_seg"; then _kbs_unp=1; fi
+    # strip quoting (`"` `'` `\` `$`), turn `(` `)` and the backtick into blanks so `x=$(git …)` / `(git …)` expose `git`,
+    # lowercase (a case-insensitive filesystem), carve out board-claim's scratch refs
+    _kbs_s=$(printf '%s' "$_seg" | tr -d '"$\\'"'" | tr '()`' '   ' | tr '[:upper:]' '[:lower:]' | sed -e 's#refs/kit/claim-[a-z0-9_.-]*#claimscratch#g' -e 's#refs/kit/notes-remote-[a-z0-9_.-]*#claimscratch#g' -e 's#refs/kit/promotions-presync-[a-z0-9_.-]*#claimscratch#g') || _guard_fault kitbase-seg
+    # (a segment with no letter or digit — the `)"` left after a heredoc `$(cat <<'EOF' … EOF)` — legitimately strips to blanks)
+    case "$_seg" in
+      *[[:alnum:]]*) _guard_vanished kitbase-seg "$_seg" "$_kbs_s" ;;
+    esac
+    if _kbs_seg_denied "$_kbs_s" "$_kbs_sub" "$_kbs_unp" "$_kbs_cn" "$_kbs_lead"; then printf '%s' "$_kbs_tip"; return 0; fi
+    # pinned twin (SWAS-717): the same pipeline with the byte fold and a byte-range sed; deny if EITHER denies
+    _kbs_sc=$(printf '%s' "$_seg" | LC_ALL=C tr -d '"$\\'"'" | LC_ALL=C tr '()`' '   ' | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C sed -e 's#refs/kit/claim-[a-z0-9_.-]*#claimscratch#g' -e 's#refs/kit/notes-remote-[a-z0-9_.-]*#claimscratch#g' -e 's#refs/kit/promotions-presync-[a-z0-9_.-]*#claimscratch#g') || _guard_fault kitbase-seg-c
+    case "$_seg" in
+      *[[:alnum:]]*) _guard_vanished kitbase-seg-c "$_seg" "$_kbs_sc" ;;
+    esac
+    if _kbs_seg_denied "$_kbs_sc" "$_kbs_sub" "$_kbs_unp" "$_kbs_cn" "$_kbs_lead"; then printf '%s' "$_kbs_tip"; return 0; fi
+  done
+  return 1
+}
+
+# guard_check_command "<cmd>" ["<cwd>"]: print reason + return 1 if denied, else return 0.
+# GUARD-CWD-CONFIDENCE-UNKNOWN Face C: the OPTIONAL second argument is the directory the command will
+# run in — the harness's truth, not the model's (the model authors `tool_input`; `cwd` is a sibling of
+# `tool_name` on PreToolUse stdin). Omitted or empty ⇒ the repo root, i.e. exactly today.
+guard_check_command() {
+  cmd=$1
+  _fp883_cwd=${2:-}   # SWAS-883: the payload cwd, kept for the first-push admission below (read there, not as $2, so a positional reset in between cannot change it)
+  _cp8b_seed_from_cwd "${2:-}"
+  # design §15: the glob-walk budget is per COMMAND. Every walk draws on this one count (the target arm that runs them is a
+  # single `$(…)` per command, so its segments share the subshell's counter and no per-operand cap is needed).
+  _gwq=0
+  # design §13 L3: the segmenter maps a backslash-newline to a SPACE but the shell DELETES it (`SKI\<nl>LL.md` is one
+  # word). Judge the deleted view too, in a subshell so no state leaks; deny-only (the original is judged below).
+  case "$cmd" in
+    *'\'"$_cp8b_nl"*)
+      if [ "${3:-}" != l3-view ]; then   # the recursion is marked by a PARAMETER, not an environment-shaped variable
+        _l3v=$(_cp8b_joinlines_empty "$cmd") || _guard_fault l3-joinlines
+        _guard_vanished l3-joinlines "$cmd" "$_l3v"
+        _l3r=$(guard_check_command "$_l3v" "${2:-}" l3-view) || { printf '%s' "$_l3r"; return 1; }
+      fi ;;
+  esac
+  # --- control-plane shell mutation (moved from guard.sh:81-93, + new files) ---
+  # GUARD-HOOKSPATH-CASE-BYPASS: unconditional case-fold (`-Eq` -> `-Eiq`), no fork. Git config
+  # KEYS are case-insensitive by spec on every platform, so this can only ever ADD a deny — no
+  # legitimate command sets a DIFFERENT config key that differs from core.hooksPath only by case.
+  # GUARD-READONLY-FP-RELIEF Arm F: the flat matcher is UNCHANGED (same regex, same `-Eiq` fold) and
+  # is now the CANDIDATE selector, evaluated per SEGMENT; the read/write decision is the default-deny
+  # recognizer above. Segmenting also joins backslash-continuations, so `git config \<nl> core.hooksPath
+  # /tmp/evil` — measured ALLOW before this slice, a line-oriented-grep hole — now denies.
+  if ! selfedit_allowed; then
+    _cp8b_segments_load "$cmd"
+    while _cp8b_next_seg; do
+      # design §12 E: `git -c core.hooksPath=… <sub>` (and `--config-env=`) sets the key for ONE command with no `git config`.
+      # Measured open too: the env spelling `GIT_CONFIG_KEY_<n>=core.hooksPath` / `GIT_CONFIG_PARAMETERS=…`, with or without `export`.
+      # design §13 H2/M2: quote splicing hides the key (`-c "core.hooksPath=…"`, `core.hooks""Path`, `GIT_CONFIG_KEY_0='core'.hooksPath`),
+      # so the match also runs on a view with quotes and backslashes DELETED, as the `--admin` arm does. Fork-free when the
+      # segment carries none of those bytes.
+      _dqv=$_seg
+      case "$_seg" in
+        *'"'*|*"$_cp8b_sq"*|*'\'*)
+          _dqv=$(printf '%s' "$_seg" | tr -d "\"'\\\\") || _guard_fault h2-dequote
+          _cp8b_dq_vanished h2-dequote "$_seg" "$_dqv" ;;
+      esac
+      _dqt=$(printf '%s\n%s' "$_seg" "$_dqv") || _guard_fault hooks-path-view
+      if _gmq hooks-path-inline "$_dqt" -Eiq -e 'git[[:space:]]+([^;&|]*[[:space:]])?(-c|--config-env)[[:space:]=]*core\.hooksPath' -e 'GIT_CONFIG_(KEY_[0-9]+|PARAMETERS)=[^;&|]*core\.hooksPath' && ! _cp8b_gitcfg_msg_data "$_seg"; then
+        printf '%s%s' '13: git -c core.hooksPath would disable the agent guard - human-gated.' "$(_guard_stop_pointer hooks-path)"; return 1
+      fi
+      _gmq hooks-path-config "$_dqt" -Eiq 'git[[:space:]]+config[[:space:]]+([^;&|]*[[:space:]])?core\.hooksPath' || continue
+      _cp8b_gitcfg_msg_data "$_seg" && continue
+      _cp8b_gitcfg_is_read "$_seg" && continue
+      printf '%s%s' '13: git config core.hooksPath would disable the agent guard - human-gated.' "$(_guard_stop_pointer hooks-path)"; return 1
+    done
+  fi
+  # --- B2 Δ4(i)′: RAW `git notes` WRITES to the promotion GO ledger (refs/notes/promotions) -----
+  # WHAT THIS IS. A DRIFT CONTROL, per owner ruling D3′ (2026-07-28): "BUILD the prevention as a
+  # drift control, with the FULL measured bypass set stated in the ceiling … the threat is a model
+  # that IGNORES the kit, not one that ATTACKS it … Denying the default route changes default
+  # behaviour, which is the goal." The default route is what the D-240805-3 incident actually took:
+  # a subagent minted an owner-attributed GO record with a bare `git notes add`. That route is now
+  # denied. NOTHING MORE IS CLAIMED.
+  #
+  # WHAT IS DENIED: the raw `git notes` WRITE verbs (add · append · copy · edit · remove · prune ·
+  # merge — copy included, it overwrites a target's note) when the command text targets the
+  # promotions ref in any spelling (--ref=promotions · --ref promotions · quoted · the full
+  # refs/notes/promotions name).
+  # WHAT IS NOT DENIED, deliberately: the ceremonial front door (scripts/promotion-verify.sh
+  # record — it DERIVES the assurance label instead of accepting one), every read (show/list),
+  # notes on any OTHER ref (fixtures, refs/notes/commits), and the ledger's own publish push
+  # (`git push origin refs/notes/promotions`, the front door's share step).
+  #
+  # ⚠️ THE COMPLETE MEASURED BYPASS SET — every one of these needs NO override and is NOT caught
+  # (measured independently by both review seats, 2026-08-07; the earlier claim that "any direct
+  # forge of the notes ref via shell is denied" was FALSE when it was ruled on, and is retracted):
+  #   1. git PLUMBING: `git hash-object` -> `git mktree` -> `git commit-tree` -> `git update-ref
+  #      refs/notes/promotions` mints a valid owner-attributed record with zero denied commands.
+  #   2. DESTRUCTION: `git update-ref -d refs/notes/promotions` and
+  #      `git push origin :refs/notes/promotions` delete the ledger outright.
+  #   3. ALIAS INDIRECTION: `git config alias.x "notes --ref=promotions add ..."` then `git x`.
+  #   4. FETCH REFSPEC: `git fetch <remote> '+<src>:refs/notes/promotions'` writes the ref.
+  #   5. ENV SPELLINGS: `GIT_NOTES_REF=refs/notes/promotions git notes add …` (the bare-ref
+  #      alternative below catches the common form; an indirect spelling does not appear in $cmd).
+  #   6. INTERPRETER WRAPPERS: python/node/ruby -c, or any script file, invoking the same git calls.
+  #   7. PUSH REFSPEC ONTO THE LEDGER: `git push origin refs/notes/<src>:refs/notes/promotions`
+  #      overwrites the ledger from any local ref — measured ALLOW (round 2, sec L-new-1). Entry 2
+  #      covers only the DELETE spelling (`:refs/notes/promotions`) and entry 4 only `git fetch`,
+  #      so the WRITE-by-push route was missing from a set that called itself COMPLETE. The FORCED
+  #      spelling (`+refs/notes/<src>:refs/notes/promotions`) is denied by the unrelated
+  #      force/mirror-push rule, not by this arm — that is not coverage, and the unforced form is
+  #      enough to overwrite a ref the remote fast-forwards or accepts outright.
+  #   8. SYMBOLIC-REF: `git symbolic-ref refs/notes/promotions refs/notes/<other>` repoints the
+  #      ledger NAME at another ref — measured ALLOW. It was named in the prose below, which is not
+  #      the SET, so it is numbered here.
+  #   9. THE SENTINEL ITSELF, under `install-shims` only — see THE SENTINEL below for the
+  #      runtime-scoped measurement.
+  # NOT in this set, because it is now COVERED (GUARD-HOOKSPATH-CASE-BYPASS): a case-variant ref
+  # spelling — `git notes --ref=PROMOTIONS add`, `refs/notes/PROMOTIONS` — is denied the same as the
+  # lowercase form. On macOS loose refs are ordinary files, so the uppercase spelling would otherwise
+  # write the exact same `.git/refs/notes/promotions` governance ledger the lowercase form protects;
+  # the ref-match leg above folds case for that reason. This does not touch entries 1-9: those are a
+  # DIFFERENT class (plumbing/destruction/alias/refspec/interpreter/sentinel), still disclosed as-is.
+  # These are NOT matched ON PURPOSE. Extending the matcher to update-ref/symbolic-ref/fetch and
+  # push refspecs is the ARMS RACE vetoed by the 2026-07-28 design §4 ("no text/graph predicate over
+  # author-controlled input") and permanently dropped by [S1]; it would fail the friction test
+  # (it binds nothing the moment the model stops cooperating) while growing false denials.
+  #
+  # THE HONEST CONTROL IS NOT THIS ARM. It is Δ4(ii)'s VISIBILITY: the matched GO record is
+  # rendered at the CI judgment surface before the owner's click (D-240805-4), which binds whether
+  # or not the model cooperates. Plus the subagent-brief ledger-write prohibition (process).
+  # A note BINDS, it does not AUTHENTICATE (scripts/promotion-verify.sh:38-44) — an agent running
+  # under the owner's git identity can mint a front-door record and no local mechanism can tell.
+  # PREVENTION IS NOT CLAIMED.
+  #
+  # THE SENTINEL, and why it is honest to ship a forgeable one [B2 sec H1]. Under `kit-guard
+  # install-shims` EVERY git invocation is routed through this arm, including promotion-verify.sh's
+  # OWN single note write — so the arm blocked the very door its deny message points at, and the
+  # ledger became unwritable by any route (measured, not theorised). promotion-verify.sh exports
+  # KIT_PROMOTION_FRONT_DOOR=1 around that one write and this arm honours it. IT IS
+  # AGENT-FORGEABLE — BUT IN ONE RUNTIME ONLY, and the earlier flat claim ("an agent can prefix the
+  # same variable to a raw command") over-stated it. MEASURED BOTH WAYS (round 2, sec L-new-1):
+  #   * under `kit-guard install-shims` the shim rebuilds the command from ARGV (`c=$self; for a in
+  #     "$@"`), so the `KIT_PROMOTION_FRONT_DOOR=1` prefix never appears in the text this arm reads —
+  #     the shell EXPORTS it into the shim's, and therefore this arm's, own environment => ALLOW.
+  #   * under the Claude hook / `kit-guard cmd` runtime the prefix arrives INSIDE the command TEXT
+  #     and this arm's environment does not carry it => DENY (the raw write is still refused).
+  # So the forgeability is entry 9 in the set above, SCOPED to install-shims. Erring safe was right;
+  # stating it unscoped was not. Either way it is consistent with the posture, not a hole in a wall —
+  # the wall is Δ4(ii).
+  # Over-deny residual, accepted: a `git notes` write to a FIXTURE ref whose -m message merely
+  # MENTIONS refs/notes/promotions is denied, and so are the conformance fixtures that write
+  # `--ref=promotions` inside throwaway repos when they are run under shims (they are not, in CI).
+  # No KIT_GUARD_SELFEDIT hint on THIS rule (L2): the one rule whose purpose is to stop
+  # record-minting must not close by naming its own off-switch.
+  # GUARD-HOOKSPATH-CASE-BYPASS (Fix 1, dual-review round): the REF-NAME leg folds too — on macOS
+  # loose refs are ordinary FILES, so `git notes --ref=PROMOTIONS add` writes the same
+  # `.git/refs/notes/promotions` file as the lowercase form; this is the same case-variance class as
+  # every other fold in this slice (config keys, secret names), not the ref-name family's OTHER
+  # disclosed bypasses (plumbing/update-ref/refspecs/alias — those stay exactly as disclosed below).
+  # `-Eq` -> `-Eiq` on THIS leg only: the verb leg (next line up) and the write-verb leg (below) stay
+  # byte-literal, deliberately — folding them would not narrow the over-deny risk, only widen it for
+  # no gain, since "notes"/"add" etc are already case-invariant tokens in practice for this arm's
+  # own fixtures. Monotone: a strict superset of the match, so no DENY can become an ALLOW.
+  if ! selfedit_allowed \
+     && [ "${KIT_PROMOTION_FRONT_DOOR:-}" != "1" ] \
+     && _gmq promotion-ledger "$cmd" -Eq '(^|[^[:alnum:]_])git[[:space:]]+([^;&|]*[[:space:]])?notes[[:space:]]' \
+     && _gmq promotion-ledger "$cmd" -Eiq -- "--ref[= ][\"']?(refs/notes/)?promotions[\"']?([[:space:]]|\$)|refs/notes/promotions" \
+     && _gmq promotion-ledger "$cmd" -Eq 'notes[[:space:]]([^;&|]*[[:space:]])?(add|append|copy|edit|remove|prune|merge)([[:space:]]|$)'; then
+    printf '%s' '13: raw `git notes` WRITE verbs (add/append/copy/edit/remove/prune/merge) on refs/notes/promotions are denied - this is the default route a drifting agent takes to mint a GO record (governance-ledger integrity, D-240805-3). Use the front door: scripts/promotion-verify.sh record, which derives the assurance label and publishes the note itself; to reconcile a diverged ledger, use scripts/promotion-verify.sh sync. The control that binds is the record rendered at the CI judgment surface, not this deny; the ceiling of this deny is stated in the escape-card row. (escape card R36 promotion-ledger)'; return 1
+  fi
+  # --- B2-SESSION-IDENTITY-LEDGER: RAW WRITES AND DELETES OF THE CLAIM REFS ARE DENIED ----------
+  # `refs/claims/<ROW>` on origin is the kit's work-in-progress truth: B4 counts the WIP ceiling
+  # from it, and `board-claim.sh` serializes "entering In Progress" on the forge's own
+  # non-fast-forward rule. `refs/claims-log/<ROW>` is the durable record of every non-holder
+  # release. MEASURED 2026-09-16, before this arm existed: `git push origin :refs/claims/X` and
+  # `git push origin --delete refs/claims/X` were both ALLOWED, so the script's refusal to release
+  # an unprovably-stale claim was one raw push away from theatre. (The FORCED refspec
+  # `+sha:refs/claims/X` was already denied by the unrelated force rule — that is not coverage by
+  # this arm.) The shape mirrors the `refs/notes/promotions` arm above.
+  #
+  # UNLIKE THE NOTES ARM, THIS ONE *DOES* CLAIM TO COVER DESTRUCTION, because destruction is the
+  # bypass here: a deleted claim is a released claim. Covered, each measured as a fixture in
+  # conformance/agent-autonomy.sh (B2-A … B2-G): the delete forms (`:refs/claims/`, `--delete`,
+  # `-d`), the bare write (`<sha>:refs/claims/`), the two-refspec form, `git send-pack`, `--prune`
+  # with a destination pattern into the namespace, and the configured routes
+  # (`git -c remote.*.push=…:refs/claims/…`, `git config remote.*.push …`), in any remote spelling
+  # including a full URL. READS STAY ALLOWED — `git ls-remote origin 'refs/claims/*'` and the
+  # `--depth=1` scratch fetch every reader uses.
+  #
+  # THE FRONT DOOR IS THE SENTINEL, AND IT IS PROCESS-ENV ONLY (the KIT_PROMOTION_FRONT_DOOR shape
+  # above, for the same measured reason): under `kit-guard install-shims` every child `git` is
+  # graded, so `board-claim.sh`'s own pushes would be denied by their own arm — it exports
+  # KIT_CLAIM_FRONT_DOOR=1 into the guard's ENVIRONMENT. Arriving in the command TEXT it is refused
+  # by the unvetted-prefix rule and by this arm's own reading of its process env, so an agent cannot
+  # type its way past this line. HONEST: like every sentinel here it is forgeable by an actor who
+  # can set the guard's environment; it is a DRIFT CONTROL, not a boundary.
+  #
+  # NOT COVERED, and not claimed to be: git plumbing that writes a LOCAL ref (`update-ref`; refs/local-claims is the exception,
+  # guarded by the sibling arm below, R37), `symbolic-ref` repointing, alias indirection, interpreter wrappers, and an actor with push
+  # rights at a plain terminal (no harness, no shims). The control that binds a human is the forge
+  # ruleset on `refs/claims/**` + `refs/claims-log/**`, which is an owner keystroke and is named
+  # not done.
+  # ⚠️ QUOTE-STRIPPED BEFORE THE MATCH, AND THAT IS A FIX-ROUND REPAIR, NOT A FLOURISH. The first
+  # build anchored every alternative on WHITESPACE, and both review seats measured the bypass: an
+  # ORDINARY QUOTED REFSPEC walked straight past it — `git push origin --delete "refs/claims/X"`,
+  # `-d 'refs/claims/X'`, `:"refs/claims/X"` and the bare `"refs/claims/X"` were all ALLOW while the
+  # unquoted spellings denied. Nobody has to know they are evading anything to type those; a shell
+  # user quotes a refspec by habit. This is the session-57 lesson applied again — a deny matcher
+  # must decline the CLASS, and quoting is a class, not a spelling. Stripping `'` and `"` from the
+  # text this arm reads makes every alternative quote-tolerant at once, which is why the repair is
+  # here rather than `["']?` sprinkled through the pattern (the sprinkle covers the quotes someone
+  # thought of; the strip covers quoting). Monotone: a strict superset of the old match — stripping
+  # characters can only ADD hits, so no DENY can become an ALLOW. The residual over-deny is stated:
+  # a command whose quoted *prose* happens to contain `refs/claims/` beside a push verb denies.
+  #
+  # ⚠️ AND THE STRIP COVERS **ALL THREE** QUOTING MECHANISMS, WHICH TOOK A SECOND ROUND TO GET RIGHT.
+  # The first repair stripped only `"` and `'` — and POSIX has a third, the BACKSLASH, plus bash's
+  # ANSI-C `$'…'`. Both seats measured the residue: `--delete \refs/claims/X`, `--delete
+  # refs\/claims/X`, `--delete refs/claims\/X` and `--delete $'refs/claims/X'` all ALLOWED, and a
+  # backslash before a `/` is something a shell user types without thinking about it at all. Naming
+  # a class and then enumerating two thirds of it is the same defect one level up, so the strip now
+  # removes `"`, `'`, `\` and `$`, and every alternative ALSO tolerates a run of non-alphanumerics
+  # between its anchor and `refs/claims` — belt and braces, because these two cover different
+  # residues (the strip handles characters INSIDE the token, the run handles anything glued in front
+  # of it). Still monotone in both halves.
+  _b2_claims_cmd=$(printf '%s' "$cmd" | tr -d '"$\\'"'") || _guard_fault claims-view
+  case "$cmd" in
+    *[!\"\'\\\$[:space:]]*) _guard_vanished claims-view "$cmd" "$_b2_claims_cmd" ;;
+  esac
+  if ! selfedit_allowed \
+     && [ "${KIT_CLAIM_FRONT_DOOR:-}" != "1" ] \
+     && _gmq claim-refs "$_b2_claims_cmd" -Eq '(^|[^[:alnum:]_])git([[:space:]]|$)' \
+     && _gmq claim-refs "$_b2_claims_cmd" -Eq '(^|[^[:alnum:]_])(push|send-pack|config)([[:space:]]|=|$)' \
+     && _gmq claim-refs "$_b2_claims_cmd" -Eiq -- ':[^[:alnum:]]*refs/claims(-log)?/|(--delete|-d)[[:space:]]+[^[:alnum:]]*refs/claims(-log)?/|(push|send-pack)[[:space:]]+([^;&|]*[[:space:]])?[^[:alnum:]]*refs/claims(-log)?/|remote\.[^[:space:]=]*\.push[[:space:]=][^;&|]*refs/claims(-log)?/'; then
+    printf '%s' '13: raw pushes whose refspec DESTINATION is refs/claims/ or refs/claims-log/ are denied, DELETES INCLUDED (`:refs/claims/X`, `--delete`, `-d`, `<sha>:refs/claims/X`, two-refspec, send-pack, --prune, and the `remote.*.push` configured routes, in any remote spelling). These refs are the work-in-progress truth (B4 counts the WIP ceiling from them) and the release record; a raw delete IS a release, and would make board-claim.sh refusing an unprovably-stale release into theatre. Use the front door: scripts/board-claim.sh claim | release [--stale] | status, which proves staleness and logs every non-holder release. Reads are allowed (`git ls-remote origin refs/claims/*`, the --depth=1 scratch fetch). This deny is a drift control, not a boundary; its ceiling is stated in the escape-card row. (escape card R18 claims)'; return 1
+  fi
+  # SWAS-795 - the local claims area, R18's sibling: same stripped view, same sentinel (process environment only), see _lc795_denied.
+  if ! selfedit_allowed; then
+    if [ "${KIT_CLAIM_FRONT_DOOR:-}" != "1" ]; then   # 795-SENT
+      if _lc795_denied "$cmd" "$_b2_claims_cmd"; then   # 795-CALL
+        if [ "$_lc795_unread" = 1 ]; then
+          printf '%s' '13: a git ref operand could not be read (a brace, $ or backtick beside a ref write or a refspec), so it may name refs/local-claims/*, and raw git writes there are denied: local claims are written only by sh scripts/board.sh claim, release and publish. (escape card R37 local-claims)'; return 1
+        fi
+        printf '%s' '13: raw git writes to refs/local-claims/* are denied: local claims are written only by sh scripts/board.sh claim, release and publish. (escape card R37 local-claims)'; return 1
+      fi
+    fi
+  fi
+  # SWAS-192 slice A - the checkout lease's refs and its key, R37's sibling: same stripped view, sentinel from the process environment only (the key is never exempt), see _cl192_denied.
+  if ! selfedit_allowed; then
+    if _cl192_denied "$cmd" "$_b2_claims_cmd"; then   # 192-CALL
+      if [ "$_cl192_kind" = key ]; then
+        printf '%s' '13: raw git config writes to kit.checkoutLease are denied: a person opts a checkout in or out of the checkout lease, in their own terminal. (escape card R38 checkout-lease)'; return 1
+      fi
+      printf '%s' '13: raw git writes to the checkout lease refs (refs/local-lease/*, refs/local-lease-log/*, refs/leases/*, refs/leases-log/*) are denied: the lease is written only by sh scripts/checkout-lease.sh (sparkwright lease acquire, release, sync and break). (escape card R38 checkout-lease)'; return 1
+    fi
+  fi
+
+  # KIT-BASE-SHARED (design §11.1): raw git writes onto kit-base / refs/kit/ — see `_kitbase_ref_denied`. Reads the
+  # quote-stripped view built for the claims arm above (no second fork). A rc >= 2 is a FAULT, as at the CP-8b boundary.
+  if ! selfedit_allowed; then
+    _kbs_prc=0; _kbs_reason=$(_kitbase_ref_denied "$cmd" "$_b2_claims_cmd") || _kbs_prc=$?
+    [ "$_kbs_prc" -le 1 ] || _guard_fault kitbase-ref
+    if [ "$_kbs_prc" = 0 ]; then
+      [ -n "$_kbs_reason" ] || _kbs_reason=$_kbs_tip
+      printf '%s' "$_kbs_reason"; return 1
+    fi
+  fi
+
+  # KIT-BASE-MANIFEST-CONCORDANCE (design A2): `incept.sh --kit-base-replace` is HUMAN-GATED, the same shape as
+  # `gh pr merge --admin`. The flag renames the project's kit-base aside and records another tree as the merge base, which is
+  # the swap the arm above denies as a raw git write; a sanctioned route to it would hand an agent that capability.
+  # `--kit-base-keep` is today's behaviour and stays open. See `_kbr_replace_denied`.
+  if ! selfedit_allowed && _kbr_replace_denied "$cmd" "$_b2_claims_cmd"; then
+    printf '%s%s' "$_kbr_tip" "$(_guard_stop_pointer kit-base-replace)"; return 1
+  fi
+
+  # CP-8b: the CO-OCCURRENCE block that used to live here matched a mutation verb and a control-plane
+  # path ANYWHERE in the flat string, and never asked whether the verb's TARGET was that path — which
+  # is both why `cp conformance/x /tmp/b` (copying OUT) was denied and why `git archive -o conformance/x`
+  # (a real write) was allowed. It is replaced by a SEGMENT WALK that binds each segment's leading verb
+  # to that segment's OWN arguments, plus subcommand-bound git write-primitives (which also absorb
+  # CP-8a's `git … --output` deny, narrowing its scope from "any git" to the subcommands that honor it).
+  # Monotone: every relaxation inside the predicate is an allow-back gated on POSITIVE recognition, so a
+  # bug there over-denies and cannot over-allow.
+  if ! selfedit_allowed; then
+    # G309-S6FIRST: pristine parity (Architect ruling 2026-11-14). A `gh api` command that S6R's REST-admin arm
+    # denies and that names the root waiver register was judged by S6R on the pristine core (S6R's reason, no R30
+    # pointer); the control-plane arms below would now deny it earlier with R30. So S6R judges again here, same
+    # reason text. Scope: ONLY gh api admin-denied commands naming the register; every other route (git mv, cp,
+    # redirects...) falls through to the arms below and keeps its R30 pointer. `_s6_gh_api_admin` is untouched.
+    case "$cmd" in
+      *[Ww][Aa][Ii][Vv][Ee][Rr]-[Rr][Ee][Gg][Ii][Ss][Tt][Ee][Rr].[Mm][Dd]*)
+        if _s6_gh_api_admin "$cmd"; then
+          _s6_admin_reason; return 1
+        fi
+        ;;
+    esac
+    # GUARD-QUOTED-EXEC-INTERMITTENT: a deny predicate's rc is 0 (denied) or 1 (not denied) and NOTHING else
+    # (audited: both predicates end `return 1`, every other return is 0). rc >= 2 at this boundary is a FAULT:
+    # dash aborts the shell that attempted a failed fork, so the `$(…)` dies rc 2 with no output, which a bare
+    # `if` would read as "not denied". The fault runs in THIS shell; its USR1 carries it to the main shell.
+    _cp8b_prc=0; _cp8b_reason=$(_cp8b_control_plane_denied "$cmd") || _cp8b_prc=$?
+    [ "$_cp8b_prc" -le 1 ] || _guard_fault cp-denied
+    if [ "$_cp8b_prc" = 0 ]; then
+      # Belt-and-suspenders: every deny arm inside the predicate already prints a reason via
+      # _cp8b_deny_reason / _cp8b_git_write_denied, but a blank reason must NEVER reach the adapter (it
+      # would surface as an empty permissionDecisionReason - a blocked agent with no guidance). Default it.
+      [ -n "$_cp8b_reason" ] || _cp8b_reason='13: mutating the guard / its config / CI gates via shell is denied (control-plane integrity). Next: make this change in a dev clone (escape card R30 cp-write).'
+      _cp8b_waiver_hint "$cmd" "$_cp8b_reason"; return 1
+    fi
+    # GUARD-BASENAME-AFTER-CD-BYPASS + GUARD-INTERPRETER-FAMILY-BYPASS: the resolved-target arm.
+    # UNION with the old arm above (deny = old-verb-arm ∨ new-target-arm). The old arm is retained
+    # verbatim, so this can only ever ADD a denial (monotone; panel #19 add-only shape).
+    _cp8b_prc=0; _cp8b_reason=$(_cp8b_target_arm_denied "$cmd") || _cp8b_prc=$?
+    [ "$_cp8b_prc" -le 1 ] || _guard_fault target-arm   # rc >= 2 is a fault, as above
+    if [ "$_cp8b_prc" = 0 ]; then
+      [ -n "$_cp8b_reason" ] || _cp8b_reason='13: writes against a resolved control-plane target via shell is denied (control-plane integrity). Next: make this change in a dev clone (escape card R30 cp-write).'
+      _cp8b_waiver_hint "$cmd" "$_cp8b_reason"; return 1
+    fi
+  fi
+  # H3a: secret-in-context (shell) — a content-read verb (cat/grep/strings/diff/awk/...; also
+  # source/. which load a .env into the environment) targeting secret material pulls it into the
+  # agent's context: the read half of exfil. Human-gate it, symmetric with the secret-WRITE deny in
+  # guard_check_path. ls (metadata) is excluded; template env files (.env.example/.sample/.template/
+  # .dist) are NOT in the secret-suffix list so they stay allowed (no command-wide exclusion, which
+  # a `cat .env.example .env` multi-arg form could abuse). Honest ceiling: an interpreter
+  # (python -c open()) or an uncommon content-emitter not in the verb list bypasses — the robust
+  # path is the Read-tool deny (guard_check_read) + platform containment. Asymmetry by design: the
+  # shell path enumerates common .env.<suffix> files, while the Read tool's `*.env.*` glob catches
+  # any suffix (e.g. `.env.foo` / `.env.local.bak` slip the shell path but the Read equivalent denies).
+  # GUARD-HOOKSPATH-CASE-BYPASS (seat HIGH, condition 2): BOTH legs fold (`-Eq` -> `-Eiq`). The
+  # verb leg first — on a case-insensitive filesystem `/bin/CAT` resolves to `/bin/cat`, so a
+  # byte-literal verb match is the same defect as a byte-literal path match (precedent in-file:
+  # `:894-899` folds the CP-arm verbs, "same defect, one argument position to the left"). Then the
+  # filename leg. Deny-side only; `.env.example` stays ALLOW because "example" is never a listed
+  # suffix alternative — folding case cannot add it (design §4a).
+  # GUARD-DENY-TRIO M2 (F3, D-240816-1): the verb leg now also lists CONTENT-DIGEST verbs
+  # (md5/md5sum/shasum/sha*sum/cksum/sum/b2sum/b3sum/rhash/xxhsum/crc32/gpg/digest, and `openssl` scoped
+  # to its TWO-WORD subcommand form `openssl dgst|sha256|…` — a bare `openssl` would over-match
+  # `openssl rsa -in server.key`). A digest of a secret is a CONFIRMATION ORACLE (candidate-value
+  # verification / offline brute-force of a short secret), categorically worse than metadata. METADATA
+  # verbs (wc/stat/du/ls/file) stay OFF this list — the disclosed, accepted trade, fixtured both ways.
+  # HONEST CEILING, stated not implied-closed: this list is NON-EXHAUSTIVE under the SAME interpreter/
+  # unknown-binary ceiling the content-read arm already carries — `certutil`, a scripted `openssl -in`,
+  # `python -c hashlib`, any renamed digester slips it. The oracle is NARROWED, not closed; the
+  # complete-by-disqualification fix (invert to a positive metadata allowlist) is M-sized and boarded
+  # separately. `_CP8B_READ_VERBS`' vetting of digests as harmless is UNCHANGED — a digest of a CONTROL-
+  # PLANE config is genuinely harmless, so the secret/CP asymmetry is intentional and fixtured both ways.
+  if ! selfedit_allowed \
+     && _gmq shell-secret-read "$cmd" -Eiq '(^|[;&|]|[[:space:]])[[:space:]]*((cat|less|more|head|tail|grep|egrep|fgrep|rg|strings|xxd|od|hexdump|base64|nl|tac|diff|cmp|comm|awk|sed|sort|uniq|cut|paste|fold|jq|yq|rev|source|\.|md5|md5sum|shasum|sha1sum|sha224sum|sha256sum|sha384sum|sha512sum|cksum|sum|b2sum|b3sum|rhash|xxhsum|crc32|gpg|digest)[[:space:]]|openssl[[:space:]]+(dgst|sha1|sha224|sha256|sha384|sha512|sha3-224|sha3-256|sha3-384|sha3-512|md5|md5sum|rmd160|blake2b512|blake2s256|shake128|shake256)([[:space:]]|$))' \
+     && _gmq shell-secret-read "$cmd" -Eiq '\.env(\.(local|production|development|staging|test|prod|dev|stage|qa|preview|ci|bak|old))?([[:space:];|&*]|$)|\.(pem|key)([[:space:];|&*]|$)|id_rsa|(^|[[:space:]/;|&])secrets?/'; then
+    printf '%s%s' '13: reading secret material into context (the read half of exfil -> model/logs/PR) is human-gated.' "$(_guard_stop_pointer secret-read)"; return 1
+  fi
+  # SWAS-332: a copy, move, link, archive or `dd if=` whose SOURCE is a secret is the read half of exfil under another name, and
+  # the path-prefixed reader (`/bin/cat .env`) is judged the same way (see _guard_secret_copy_denied, end of file). ADD-ONLY: a
+  # no-deny falls through to the destructive matrix below; this arm never returns an allow. Gated like H3a, so a clone is not relaxed.
+  if ! selfedit_allowed; then
+    _scp_rc=0; _scp_out=$(_guard_secret_copy_denied "$cmd" "${2:-}") || _scp_rc=$?
+    [ "$_scp_rc" -le 1 ] || _guard_fault secret-copy
+    if [ "$_scp_rc" = 1 ] && [ "$_scp_out" != ok ]; then _guard_fault secret-copy; fi
+    if [ "$_scp_rc" = 0 ]; then printf '%s' "$_scp_out"; return 1; fi
+  fi
+  # --- destructive matrix: moved VERBATIM from the PRE-SPLIT guard.sh (see git history; the line
+  #     range that stood here died with the split) ---
+  # CP-8a: the leading verb decides whether the ARGUMENTS are code or data. These carry
+  # identical bytes and only the verb tells them apart:
+  #     bash -c "rm -rf /"          <- the argument is CODE (a weapon) -> must DENY
+  #     grep -rn "rm -rf" scripts/  <- the argument is DATA (a search) -> must ALLOW
+  # A provably read-only SINGLE invocation therefore skips the matrix. Everything else
+  # falls through with the command UNCHANGED, so no rule below has its input perturbed.
+  # CP-8a (security re-review of #297): git's diff machinery (diff/log/show) honors
+  # --output=<file> — an arbitrary file WRITE/TRUNCATE with NO shell redirect, so it slips both
+  # the control-plane block above and (as a read verb) the exemption below.
+  # `git diff --output=.github/workflows/ci.yml HEAD` zeroes the workflow on a clean tree.
+  # Do NOT parse the --output TARGET: the guard sees PRE-shell-parse bytes, so any quoting /
+  # escaping / substitution of the target (`--output="conformance/x"`, `--output=$(...)`) evades a
+  # path match while git still writes the real path (a live bypass caught in re-review). Deny
+  # `git ... --output` OUTRIGHT — fail-closed, no target to parse. The legitimate residual is a
+  # plain redirect to a non-control-plane path (`git diff > /tmp/x`, which the guard allows) or
+  # KIT_GUARD_SELFEDIT=1 for deliberate human maintenance.
+  # CP-8b: CP-8a's blanket `git … --output` deny lived here. It is now SUBCOMMAND-BOUND inside
+  # _cp8b_git_write_denied (called above): still an OUTRIGHT deny with no target parsed, but scoped to
+  # the subcommands that actually honor the flag (diff/log/show/format-patch/archive). That removes the
+  # residual CP-8a recorded — `git commit -m "… --output …"`, where a commit message merely *mentions*
+  # the flag and `-o` means `--only` — without weakening the deny for any subcommand that can write.
+  if guard_read_only_command "$cmd"; then return 0; fi
+  # GUARD-DENY-SECRET-STORE-READ (SWAS-109, design §2.3): a direct secret-store read. After the read-only exit (a single plain
+  # read that merely NAMES a shape stays open), with the destructive matrix, and NOT gated by selfedit_allowed: this arm
+  # only adds denies and the owner types secret commands in their own terminal. See `_ssr_denied`.
+  if _ssr_denied "$cmd"; then printf '%s' "$_SSR_TIP"; return 1; fi
+  # recursive rm in any flag arrangement (-rf, -fr, -r -f, --recursive), bounded so
+  # 'confirm'/'npm' are not matched, but quoted forms (bash -c "rm -rf") are.
+  if _gmq recursive-rm "$cmd" -Eq '(^|[^[:alnum:]_])rm[[:space:]]+([^;&|]*[[:space:]])?(-[[:alnum:]]*[rR]|--recursive)'; then
+    { printf '%s%s' '13: recursive rm is irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # 9b: non-recursive rm of a DANGEROUS target — a glob, a data/critical file extension,
+  # an absolute path, or a dotfile of record. Anchored to command position so a commit
+  # message mentioning rm is not matched. Plain relative single files (rm stale.txt,
+  # rm dist/bundle.js) remain ALLOWED to avoid over-blocking normal dev work.
+  if _gmq rm-dangerous "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]]'; then
+    if _gmq rm-dangerous "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]]+([^;&|]*[[:space:]])?(--[[:space:]]+)?[^;&|[:space:]]*[*?[][^;&|[:space:]]*([[:space:]]|$)' \
+       || _gmq rm-dangerous "$cmd" -Eiq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]][^;&|]*\.(db|sqlite|sqlite3|sql|dump|pgdump|bak|rdb|mdb)([[:space:]]|$)' \
+       || _gmq rm-dangerous "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]]+([^;&|]*[[:space:]])?/[^[:space:]]' \
+       || _gmq rm-dangerous "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]][^;&|]*(\.env|/\.git)([[:space:]]|$|/)' \
+       || _gmq rm-dangerous "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rm[[:space:]]+([^;&|]*[[:space:]])?\.env([[:space:]]|$)'; then
+      { printf '%s' '13: rm of a glob, data file, absolute path, or dotfile-of-record can be irreversible - human-gated. For an ABSOLUTE scratch path the escape is a repo-relative one. (escape card R8 rm-absolute)'; return 1; }
+    fi
+  fi
+  # 9b: non-rm destruction primitives. Binaries are anchored to COMMAND POSITION
+  # (start, or after a ; && || | separator, optional sudo) so a word like "truncate"
+  # inside a commit message is NOT matched — only an actually-invoked command is.
+  if _gmq destroy-primitive "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?(truncate|shred|wipefs|blkdiscard|mkfs(\.[a-z0-9]+)?)([[:space:]]|$)'; then
+    { printf '%s%s' '13: in-place file/device destruction (truncate/shred/wipefs/blkdiscard/mkfs) is irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # dd is a scalpel like rm: deny only when of= targets a device or a data-file extension
+  # (dd of=test-fixture.img stays allowed; dd of=/dev/sda and dd of=db.sqlite are denied).
+  if _gmq dd-target "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?dd[[:space:]]' \
+     && _gmq dd-target "$cmd" -Eiq 'of=(/dev/|[^[:space:]]*\.(db|sqlite|sqlite3|sql|dump|pgdump|bak|rdb|mdb)([[:space:]]|$))'; then
+    { printf '%s%s' '13: dd of= a device or data file overwrites it irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # redirection/empty-source truncation of an existing target. GENERIC by target: the
+  # patterns below match ANY destination ([^[:space:]&|;]+), so truncating a scanner-config
+  # (e.g. `: > .gitleaks.toml`) is already covered here — no path enumeration needed (KW10).
+  if _gmq truncating-redirect "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*):[[:space:]]*>[[:space:]]*[^[:space:]&|;]+' \
+     || _gmq truncating-redirect "$cmd" -Eq '/dev/null[[:space:]]*>[[:space:]]*[^[:space:]&|;]+' \
+     || _gmq truncating-redirect "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(cat|cp)[[:space:]]+/dev/null[[:space:]]+[>]?[[:space:]]*[^[:space:]&|;]+' \
+     || _gmq truncating-redirect "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)echo[[:space:]]+-n[[:space:]]*>[[:space:]]*[^[:space:]&|;]+'; then
+    { printf '%s%s' '13: redirection/empty-source truncation zeroes a file irreversibly - human-gated (a shell >/: truncation is denied because it can irreversibly zero an existing file).' "$(_guard_stop_pointer truncation)"; return 1; }
+  fi
+  if _gmq bulk-delete "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?find[[:space:]]+[^|]*-delete([[:space:]]|$)' \
+     || _gmq bulk-delete "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?find[[:space:]]+[^|]*-exec[[:space:]]+(rm|shred|truncate)([[:space:]]|$)' \
+     || _gmq bulk-delete "$cmd" -Eq '\|[[:space:]]*(sudo[[:space:]]+)?xargs[[:space:]]+([^|]*[[:space:]])?(rm|shred|truncate|unlink|wipefs)([[:space:]]|$)'; then
+    { printf '%s%s' '13: bulk irreversible deletion (find -delete / -exec rm / pipe to xargs rm) - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq rsync-delete "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?rsync[[:space:]]+[^|]*--delete([[:space:]]|$|[^a-z])'; then
+    { printf '%s%s' '13: rsync --delete mirrors a source and removes destination files irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq git-clean "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)git[[:space:]]+clean[[:space:]]+[^|]*-[a-z]*[fdx]'; then
+    { printf '%s%s' '13: git clean -f/-d/-x force-deletes untracked/ignored files irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq mv-to-null "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?mv[[:space:]]+[^;&|]*[[:space:]]/dev/null([[:space:]]|$)'; then
+    { printf '%s%s' '13: moving a file onto /dev/null destroys its contents - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq git-reset-hard "$cmd" -Eq 'git[[:space:]]+reset[[:space:]]+.*--hard'; then
+    { printf '%s%s' '13: git reset --hard discards work irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq package-publish "$cmd" -Eq '(npm|yarn|pnpm)[[:space:]]+publish'; then
+    { printf '%s%s' '13: publishing a package is externally irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  _fpq=$cmd; _fpc=$cmd   # design §16 R4: the force-push rule also reads the quote-and-backslash-deleted view
+  case "$cmd" in
+    *'"'*|*"$_cp8b_sq"*|*'\'*)
+      _fpq=$(printf '%s' "$cmd" | tr -d "\"'\\\\") || _guard_fault forcepush-dequote
+      _cp8b_dq_vanished forcepush-dequote "$cmd" "$_fpq"
+      _fpc=$(_cp8b_collapse_quotes "$cmd") || _guard_fault forcepush-collapse ;;   # GSR C5: the quote-collapsed third view
+  esac
+  _fpt=$(printf '%s\n%s\n%s' "$cmd" "$_fpq" "$_fpc") || _guard_fault forcepush-view
+  # SWAS-842: this rule alone skips its deny for the kit's own compare-and-swap delete of a lease or claim ref (_lda842_admitted: grammar-exact, paired with its
+  # sentinel in the process environment): an admitted command hands the rule an empty subject, so the rule line below stays byte-identical and the rule does not
+  # fire. No early return: push-to-main and every later rule still run. Design: docs/architecture/2026-11-11-leased-delete-admission-842-design.md.
+  if _lda842_admitted "$cmd"; then
+    _fpt=''   # 842-CALL
+  fi
+  if _gmq force-push "$_fpt" -Eq 'git'"$_CP8B_GITG"'[[:space:]]+push.*(--force|--force-with-lease|--mirror|[[:space:]]-f([[:space:]]|$)|[[:space:]+]\+[^[:space:]]*[[:space:]]*$)'; then
+    { printf '%s%s' '13: force/mirror push rewrites or deletes published history - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # push to main/master in any refspec form: 'main', '+main', 'HEAD:main', 'x:master', "main" (incl. git -c … push)
+  # CP-8b: SCOPED to a segment. The identical regex now runs per-segment instead of over the flat string,
+  # so it can no longer match by SPANNING a shell separator — which is the whole false positive:
+  #     git push -u origin fix/x && gh pr create --body "… merges to main"
+  # (`git push` in segment 1, the word "main" in segment 2's PR body). A real push to main keeps both on
+  # ONE segment and still denies. Only THIS rule's window narrows; every other matrix rule below still
+  # sees the raw, unsplit command (`curl … | sh` keeps its pipe; `--admin` keeps its end-of-string anchor).
+  # The segmenter also JOINS backslash-newline continuations first, which closes a pre-existing hole:
+  # grep is line-oriented, so `git push \<newline> origin main` put `push` and `main` on different lines
+  # and the flat regex matched NEITHER.
+  # SWAS-883: this one deny is skipped for the exact first-push shape `git [-C <abs>] push [-u] <remote> main` in a kit repository whose pre-push hook and core are byte-identical
+  # to the running guard's (_fp883_admitted; local reads only). git then runs that hook, which admits only the creation of an absent main. A near miss adds one fixed clause naming the
+  # failed condition. Force-push (above) and every later rule still run. Design: docs/architecture/2026-11-14-guard-first-push-883-design.md.
+  if _cp8b_push_main_denied "$cmd"; then
+    if ! _fp883_admitted "$cmd" "$_fp883_cwd"; then   # 883-CALL
+      { printf '%s%s%s' '13: pushing directly to main/master bypasses review - human-gated.' "$(_fp883_clause)" "$(_guard_stop_pointer push-main)"; return 1; }
+    fi
+  fi
+  # S6: gh pr merge --admin/--administrator BYPASSES branch protection (incl. the control-plane-
+  # ratification / required-review gate) — the fox opening its own henhouse. A SPEED BUMP (string
+  # match): the real boundary is the platform never issuing the agent an admin credential
+  # (docs/enterprise/platform-safety-boundary.md). The agent's sanctioned path is a NORMAL merge on
+  # a recorded authenticated GO (scripts/promotion-verify.sh actuate); --admin is the SOLO kill-switch.
+  # S6R (A1, `D-240825-1`): the porcelain flag is only half the arm — `--admin` IS the REST
+  # PUT /pulls/N/merge, so the same doctrine, the same message, one extra disjunct. See
+  # _s6_gh_api_admin above for the disqualifier, the deliberate contexts-POST exception, and the
+  # honest ceiling (one client; curl/python siblings are boarded, not closed).
+  # GUARD-READ-LANE-2 T2 (design §4) — THE SAME NORMALISATION, NOW ON THE PORCELAIN HALF TOO.
+  # Until this line the porcelain greps read the RAW string while the REST half (_s6_gh_api_admin)
+  # read a quote-stripped copy, so the arm was quote-honest on one side and quote-blind on the other:
+  # `sh -c 'gh pr merge 5 --admin'` ALLOWED at 13b176de, as did `bash -lc "…"`, `xargs -0 sh -c '…'`
+  # and a same-command `CMD='…'; sh -c "$CMD"`. A quote is a JOINER in the shell, not a boundary
+  # (`me''rge` executes as `merge`), so deleting quotes/backslashes is what makes the bytes readable.
+  # ★ THE FIX IS BYTE-LEVEL, AND ITS SCOPE IS EXACTLY THE JOINER BYTES NAMED HERE — no more. Round 0's
+  # prose claimed "every wrapper shape closes at once … no new wrapper needs adding later"; MEASURED at
+  # 4b9f464f that was FALSE, and round 1 closes what it missed. What is handled, each pinned by a cell:
+  #   · QUOTE joiners `'` and `"`, and the escaping `\`  (round 0)          — `--ad""min`
+  #   · a LINE CONTINUATION *inside* the command (round 1) — `tr` deleted the `\` but left the newline
+  #     and grep is line-oriented, so `gh \<nl>pr merge …` matched nothing. `_cp8b_joinlines` first.
+  #   · COMMAND SUBSTITUTION used as a joiner (round 1) — `--ad$()min`, `--ad``min`, `me$()rge`,
+  #     `--ad`echo`min`. Handled by a SECOND view (`$_px`) with substitutions removed.
+  #   · INTRA-TOKEN CONTINUATION, PARAMETER EXPANSION, NEWLINE-STRADDLING AND NESTED substitutions
+  #     (round 2) — closed not as four more spellings but by the (A) disqualifier below.
+  # FOUR VIEWS, deny if ANY matches — not one merged view. Stripping substitutions in the ONLY view
+  # would LOSE a deny, because `` `gh pr merge 5 --admin` `` keeps the offending bytes INSIDE the
+  # substitution. Add-only is a contract here: every view is a SUPERSET match over the raw string, so
+  # nothing that denied before can stop denying (pinned by the R REG cells in agent-autonomy.sh).
+  # HONEST CEILING, REWRITTEN AT ROUND 2 AND NARROWER THAN ROUND 1'S, one sentence per cell.
+  # Round 1's ceiling said "bytes ABSENT from the string still pass", and named `$VAR`, `$(cat f)`
+  # and `` `echo m` `` as examples. THAT SENTENCE IS NOW FALSE and is retired: inside a merge-shaped
+  # command every one of those carries a `$` or a backtick, and (A) denies on the glue byte without
+  # ever asking what it expands to (pinned: `--ad$xmin`, `"$@"`, `$ADMIN_FLAG`, `--ad$(cat f)min`).
+  # ⚠️ ROUND 2's NEXT SENTENCE WAS ALSO FALSE, AND ROUND 3 MEASURED IT FALSE. It read "what is left is
+  # only the case where NO glue byte and NO merge shape is in the string at all". `gh -R o/r pr merge
+  # 5 --admin` has BOTH a merge shape and (with `$(date)` appended) a glue byte, and ALLOWED at
+  # 07928fc1 — because the SHAPE TEST was an adjacency match and `gh` hoists its global flags in front
+  # of the sub-command. The hole was never in the ceiling; it was in the predicate. Closed by
+  # `_cp8b_gh_pr_merge_order` (see its header) and pinned by the T2R3 cells.
+  # ── THE CEILING AS OF ROUND 3. THREE SENTENCES, EACH BACKED BY A CELL IN agent-autonomy.sh.
+  #   (i) A `gh alias`: `gh mymerge 5` ALLOWs — `merge` is not in the command and no shape test can
+  #       find a shape that is not there. Aliases live in `gh`'s own config, which this guard does not
+  #       read. ⚠️ THE SECOND SENTENCE OF THIS CEILING IS RETIRED (GUARD-ADMIN-ARMS, K-3b face B,
+  #       2026-09-09). It read "the CREATION of one is visible in a command string, and `gh alias set
+  #       mm 'pr merge --admin'` ALLOWs TODAY — measured, boarded, not closed here". It is now closed:
+  #       `_s6_gh_persist_denied` denies `gh alias set|import`, `gh config set` and `gh auth login|
+  #       refresh|switch` OUTRIGHT, on the primitive rather than on the body, and the ALLOW cell that
+  #       pinned the old sentence was RE-KINDED to `assert_deny` under a `K-3b ` label rather than
+  #       edited in place (an `allow` cell may never end DENY under any delta prefix). WHAT REMAINS is
+  #       the USE half — `gh mymerge 5`, and any alias or config that ALREADY exists — whose cell is
+  #       unchanged above. That half is the boundary's, not this guard's: the bytes are not here.
+  #  (ii) The merge bytes living entirely OUTSIDE the command: `sh ./merge.sh` ALLOWs. The command
+  #       names a FILE; the guard scans the command string, not the filesystem the command reaches.
+  #       (Cell: `T2R3 CEILING (ii)`.)
+  # (iii) GraphQL `mergePullRequest` is NOT a hole and is not listed as one: it HONOURS branch
+  #       protection, which is why the REST endpoint is the interesting one — but that is GitHub-side
+  #       behaviour, not a boundary this guard maintains. (See the same note on `_s6_gh_api_admin`.)
+  # (i) and (ii) are one residual stated twice: the guard reads the bytes it is handed. It does not
+  # run the shell, resolve the environment, expand an alias, or open a file. Neither is closed by any
+  # amount of further normalisation — which is why round 2 stopped normalising, and why round 3 fixed
+  # a PREDICATE rather than adding a spelling. They are boarded, not claimed closed.
+  # ⚠️ `M-R4` DOES NOT EXIST, and its absence is deliberate rather than an oversight. Round 1 planned
+  # a mutant per change and MEASURED that one planned subject had no probe that flipped on it alone,
+  # so the number was cut rather than padded with a mutant that would survive while proving nothing.
+  # The gap in the numbering is left visible on purpose: renumbering would hide that a planned lock
+  # was dropped for cause.
+  # ★★ T2 ROUND 2 — THE JOINER CLASS ENDS HERE, AND IT ENDS BY CHANGING THE FAILURE DIRECTION.
+  # Rounds 0 and 1 each closed the joiner spellings they had measured, and the seat came back each
+  # time with more: an INTRA-TOKEN continuation (`--ad\<nl>min` — the space-join made it `--ad min`),
+  # a PARAMETER EXPANSION (`--ad${x:-}min` — in neither view), a NEWLINE inside the substitution
+  # (`--ad$(<nl>)min` — sed and grep are line-oriented), and the NESTED forms
+  # `--ad$(echo $(echo))min` / ``--ad`echo \`echo\``min`` (the strip was one non-nested pass).
+  # All measured ALLOW at 35a2032f. ★ THE LESSON IS THAT ENUMERATION LOSES: the shell has more ways
+  # to glue two fragments together than this guard will ever have rounds, and each round's closing
+  # sentence was falsified by the next round's measurement.
+  # So the rule below is not another spelling. It is a DISQUALIFIER, and it is fail-CLOSED: if the
+  # command is MERGE-SHAPED and also carries a GLUE byte, it is denied OUTRIGHT — the guard never
+  # asks what the glue would have expanded to. Every trick in the class needs glue, so the class is
+  # closed by construction rather than by enumeration, and a spelling nobody has thought of yet is
+  # closed too. The cost is a real over-deny (a legitimate `gh pr merge $(cat pr) --squash` now
+  # needs its number spelled out); it is priced, pinned cell by cell, and small.
+  _pj=$(_cp8b_joinlines "$cmd") || _guard_fault merge-joinlines
+  _guard_vanished merge-joinlines "$cmd" "$_pj"
+  _pe=$(_cp8b_joinlines_empty "$cmd") || _guard_fault merge-joinlines-empty
+  _guard_vanished merge-joinlines-empty "$cmd" "$_pe"
+  _pn=$(_s6_dequote "$_pj") || _guard_fault merge-views
+  _cp8b_dq_vanished merge-views "$_pj" "$_pn"
+  _pne=$(_s6_dequote "$_pe") || _guard_fault merge-views
+  _cp8b_dq_vanished merge-views "$_pe" "$_pne"
+  # The substitution-stripped twins, now stripped to a FIXPOINT and newline-flattened first, so the
+  # nested and newline-straddling forms collapse instead of surviving one pass. These twins are not
+  # decoration: they also feed the merge-SHAPE test below, which is what lets the disqualifier see a
+  # shape that is itself hidden inside a construct (`gh pr me$(echo $(echo))rge`).
+  _pxs=$(_cp8b_strip_subst "$_pj") || _guard_fault merge-views
+  _px=$(_s6_dequote "$_pxs") || _guard_fault merge-views
+  _pxs=$(_cp8b_strip_subst "$_pe") || _guard_fault merge-views
+  _pxe=$(_s6_dequote "$_pxs") || _guard_fault merge-views
+  # (A) MERGE-SHAPED? Asked over every view, so a shape hidden by quoting, continuation or
+  # substitution still counts. Two shapes: the porcelain verb, and the REST merge endpoint.
+  _pms=0
+  # T2 round 3: the porcelain shape is the ADJACENCY grep UNION the TOKEN-ORDER walk (add-only; see
+  # `_cp8b_gh_pr_merge_order`). The REST disjunct KEEPS its adjacency deliberately — `gh` REJECTS a
+  # hoisted global flag before `api` (`gh -R o/r api …` exits "unknown shorthand flag" and never
+  # reaches the endpoint), so there is no real invocation to widen for, and widening would only
+  # manufacture over-denies. Measured, not assumed.
+  # The REST disjunct ALSO now requires a MUTATION INDICATOR. Round 2 fired on `gh api` +
+  # `pulls/N/merge` with no regard for the method, so `gh api …/pulls/5/merge --jq "$(cat q)"` — a GET
+  # of the merge-STATUS resource, a pure read — was DENIED, and so was an ordinary `-H "X-Y: $(cat h)"`
+  # header. That is an UNPRICED over-deny in exactly the read lane this row exists to protect, and it
+  # is the failure mode the row was opened for. The indicator only brings (A) into line with what
+  # `_s6_gh_api_admin_scan` has always required of the arm (A) fronts for.
+  # T2 round 4: the INDICATOR is literal-token OR expansion-carried (see
+  # `_cp8b_api_expansion_indicator` for the regression that made this necessary, and for the
+  # read-only-flag exclusion that keeps round 3's refund). Only the LEAD `gh` is case-folded in the
+  # adjacency greps — `[Gg][Hh]` — never `pr`, `merge`, `api` or any flag.
+  # The api adjacency stays adjacency: measured on `gh 2.96.0`, `gh -R o/r api …` exits
+  # `unknown shorthand flag: 'R'` and never reaches the endpoint, so there is no invocation to widen
+  # for. That version is recorded because the claim is a MEASUREMENT of one release's CLI parsing.
+  # T2 round 5: the expansion indicator is computed ONCE, over the QUOTE-PRESERVING views, and the
+  # loop reads the answer. Two reasons, both measured rather than stylistic:
+  #   · it must see QUOTES (see the function header) — `$_pn`/`$_pne` have had them deleted, and a
+  #     de-quoted `-H "A: $X"` splits into two tokens and loses the read-only-flag exclusion;
+  #   · the SUBSTITUTION-STRIPPED twins are the wrong input for it by construction. `_cp8b_strip_subst`
+  #     DELETES `$(…)`/`${…}` — the exact bytes this test is about — so the strip can only ever remove
+  #     indicators, never add one (any `$` left after stripping was there before). Dropping the twins
+  #     therefore loses no deny, and keeping them would actively cost one: in `--jq $(x) $Y` the strip
+  #     leaves `--jq` adjacent to `$Y` and hands it the exclusion it has not earned.
+  _pai=1
+  if _cp8b_api_expansion_indicator "$_pj" || _cp8b_api_expansion_indicator "$_pe"; then _pai=0; fi
+  for _pv in "$_pn" "$_pne" "$_px" "$_pxe"; do
+    if _gmq merge-shape "$_pv" -Eq '[Gg][Hh][[:space:]]+pr[[:space:]]+merge' \
+       || _cp8b_gh_pr_merge_order "$_pv"; then _pms=1; break; fi
+    if _gmq merge-shape "$_pv" -Eq '[Gg][Hh][[:space:]]+api' \
+       && _gmq merge-shape "$_pv" -Eq 'pulls/[^[:space:]]*/merge' \
+       && { _gmq merge-shape "$_pv" -Eq "$_CP8B_API_MUTATOR" \
+            || [ "$_pai" = 0 ]; }; then _pms=1; break; fi
+  done
+  # (A) GLUE? Asked of the RAW command, deliberately: `_cp8b_joinlines` has already consumed the
+  # backslash-newline by the time `$_pj` exists, so a joined view can no longer testify that a
+  # continuation was ever there. `$` covers `$(…)`, `${…}` and a bare `$VAR` alike — the last of
+  # those is the one no byte-level normalisation could ever reach, because its bytes are ABSENT.
+  _pgl=0
+  _gmq merge-glue "$cmd" -q '[$`]' && _pgl=1
+  _gmqn merge-glue "$cmd" -q '\\$' && _pgl=1
+  if [ "$_pms" = 1 ] && [ "$_pgl" = 1 ]; then
+    unset _pj _pe _pn _pne _px _pxe _pv _pms _pgl _pai 2>/dev/null || :
+    { printf '%s' '13: gh pr merge / merge-endpoint call carries shell substitution or continuation - spell it plainly (no $(...), ${...}, backticks, or line continuation) so the guard can read it; --admin is human-gated. A legitimate merge works with the number and subject written out, or with the body passed via -F file. (escape card R35 admin-merge)'; return 1; }
+  fi
+  # The incumbent --admin probe, unchanged in shape and now reading all four views. The anchor widens
+  # from `([[:space:]]|=|$)` to `([^A-Za-z0-9_-]|$)` so `;`, `|`, `&`, `)` anchor too — W13's shape,
+  # where deleting the quotes leaves `--admin;` mid-string. It still matters after (A): a glue-free
+  # `sh -c 'gh pr merge 5 --admin'` has nothing for the disqualifier to fire on.
+  _phit=0
+  for _pv in "$_pn" "$_pne" "$_px" "$_pxe"; do
+    if { _gmq admin-probe "$_pv" -Eq '[Gg][Hh][[:space:]]+pr[[:space:]]+merge' \
+         || _cp8b_gh_pr_merge_order "$_pv"; } \
+       && _gmq admin-probe "$_pv" -Eq '(--admin|--administrator)([^A-Za-z0-9_-]|$)'; then
+      _phit=1; break
+    fi
+  done
+  # ── K-3b FACES A AND B, at the SAME SITE and over the SAME FOUR VIEWS. ────────────────────────────
+  # Site rule, and it is not stylistic: the faces run INSIDE this block, after the four views exist and
+  # BEFORE they are unset — never on `$cmd` raw. That is the entire content of four rounds of joiner
+  # lessons above; a face bolted on outside would be quote-blind and continuation-blind on day one, and
+  # every spelling `--ad""min`, `--ad$()min`, `me\<nl>rge` closed for the incumbent arm is closed for
+  # these two for free because they read the views those rounds built.
+  # The hits are computed HERE into flags, and the reasons are printed after the unset, because each
+  # face carries its OWN reason token (`gh-admin-verb`, `gh-persist`) — a shared message would tell an
+  # adopter the wrong retry, and the retry is the only part of a deny that is actionable.
+  _pav=0; _pbv=0; _pcv=0
+  for _pv in "$_pn" "$_pne" "$_px" "$_pxe"; do
+    if _s6_gh_porcelain_admin "$_pv"; then _pav=1; break; fi
+  done
+  for _pv in "$_pn" "$_pne" "$_px" "$_pxe"; do
+    if _s6_gh_persist_denied "$_pv"; then _pbv=1; break; fi
+  done
+  # Face C reads the RAW command, not the four views, and that is deliberate: it does its OWN
+  # quote-aware segmentation, and the views have already had their quotes DELETED — which is exactly
+  # the information a span walk needs. Handing it `$_pn` would hand it a string in which every quoted
+  # body has merged with its neighbours and no boundary can be settled.
+  if _s6_http_admin "$cmd"; then _pcv=1; fi
+  unset _pj _pe _pn _pne _px _pxe _pv _pms _pgl _pai 2>/dev/null || :
+  # THE INCUMBENT ARM IS ASKED FIRST, deliberately: anything that already denied keeps the message it
+  # already had (`gh alias set -s mm 'gh api -X PUT .../merge'` denies as the REST call it spells out,
+  # which is the more specific truth), so the new faces can only ever speak for commands that had NO
+  # deny at all. A reason cell would otherwise move without any verdict moving.
+  if [ "${_phit:-0}" = 1 ] || _s6_gh_api_admin "$cmd"; then
+    unset _phit _pav _pbv _pcv 2>/dev/null || :
+    _s6_admin_reason; return 1
+  fi
+  if [ "${_pav:-0}" = 1 ]; then
+    unset _phit _pav _pbv _pcv 2>/dev/null || :
+    { printf '%s' '13: gh repo edit/delete/archive/unarchive/rename, gh repo deploy-key add/delete and gh ssh-key/gpg-key add/delete are the CLI clients of PATCH/DELETE /repos/:o/:r or of a credential mint (POST /repos/:o/:r/keys, POST /user/keys) - the same Tier-3 act as gh api -X PATCH repos/o/r, which this guard already denies - human-gated (trigger=gh-admin-verb). The owner runs it as a keystroke (!gh repo ...) or in the web UI. Reads (gh repo view/list, deploy-key list, ssh-key list) are untouched. (escape card R15 gh-admin-verb)'; return 1; }
+  fi
+  if [ "${_pbv:-0}" = 1 ]; then
+    unset _phit _pav _pbv _pcv 2>/dev/null || :
+    { printf '%s' "13: gh alias set/import, gh config set and gh auth login/refresh/switch write gh's OWN persistent state, which changes what a LATER gh command runs or which credential it runs under (an alias walks past the --admin arm; a pager value names a program; auth refresh -s delete_repo widens the token the whole boundary rests on) - human-gated (trigger=gh-persist). Type the full gh command instead; the owner sets aliases, config and credentials by keystroke. alias list/delete, config get/list, auth status/setup-git/logout are untouched. (escape card R16 gh-persist)"; return 1; }
+  fi
+  if [ "${_pcv:-0}" = 1 ]; then
+    unset _phit _pav _pbv _pcv 2>/dev/null || :
+    { printf '%s' '13: an HTTP request with a mutating method (or a body, which makes it a POST) to a GitHub admin endpoint - the merge bypass, branch protection, rulesets, git/refs, collaborators or deploy/account keys, the repo root or transfer, the push twins, a forged status - is the same Tier-3 act as gh api -X PUT ..., whatever the client - human-gated (trigger=http-admin). Reads are untouched: GET/HEAD and any request with no body still allow, including a piped authenticated read. The owner runs the write as a keystroke. (escape card R17 http-admin)'; return 1; }
+  fi
+  unset _phit _pav _pbv _pcv 2>/dev/null || :
+  # destructive SQL via a DB client
+  if _gmq destructive-sql "$cmd" -Eiq '(psql|mysql|mariadb|sqlite3|mongosh?).*(drop[[:space:]]+(table|database)|truncate|delete[[:space:]]+from)'; then
+    { printf '%s%s' '13: destructive SQL (DROP/TRUNCATE/DELETE via a DB client) - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # destructive DB resets via migration runners
+  if _gmq db-reset-runner "$cmd" -Eiq '(prisma[[:space:]]+migrate[[:space:]]+reset|prisma[[:space:]]+db[[:space:]]+push[^|]*--force-reset|sequelize[^|]*db:migrate:undo:all|knex[^|]*migrate:rollback[^|]*--all|drizzle-kit[[:space:]]+push)'; then
+    { printf '%s%s' '13: destructive DB reset via a migration runner - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # dropdb as an invoked command (start or after a shell separator), not when merely
+  # mentioned in prose (e.g. a commit message "fix dropdb bug").
+  if _gmq dropdb "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)dropdb([[:space:]]|$)'; then
+    { printf '%s%s' '13: dropdb destroys a database irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # ORM / framework DB destruction (drop/reset/wipe/fresh) across stacks
+  if _gmq orm-db-reset "$cmd" -Eiq '(rails|rake)[[:space:]]+db:(drop|reset|migrate:reset|purge)|artisan[[:space:]]+(migrate:fresh|migrate:reset|db:wipe)|manage\.py[[:space:]]+(flush|reset_db|sqlflush)|alembic[[:space:]]+downgrade[[:space:]]+base|flyway[[:space:]]+clean|dotnet[[:space:]]+ef[[:space:]]+database[[:space:]]+(drop|update[[:space:]]+0)'; then
+    { printf '%s%s' '13: destructive DB drop/reset via an ORM/framework tool - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq pg-restore-clean "$cmd" -Eq 'pg_restore[^|]*(--clean|[[:space:]]-c([[:space:]]|$))'; then
+    { printf '%s%s' '13: pg_restore --clean drops objects irreversibly - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq redis-flush "$cmd" -Eiq 'redis-cli[^|]*(flushall|flushdb)'; then
+    { printf '%s%s' '13: redis FLUSHALL/FLUSHDB wipes the datastore - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq kubectl-delete "$cmd" -Eq 'kubectl[[:space:]]+([^|]*[[:space:]])?delete([[:space:]]|$)'; then
+    { printf '%s%s' '13: kubectl delete removes cluster resources - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq docker-prune "$cmd" -Eq 'docker[[:space:]]+(volume[[:space:]]+(rm|prune)|system[[:space:]]+prune[^|]*(-a|--all))'; then
+    { printf '%s%s' '13: docker volume/system prune destroys persistent state - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq cloud-delete-named "$cmd" -Eq 'aws[[:space:]]+s3[[:space:]]+rm[^|]*--recursive|aws[[:space:]]+s3[[:space:]]+rb|aws[[:space:]]+rds[[:space:]]+delete-db-instance|aws[[:space:]]+dynamodb[[:space:]]+delete-table|gcloud[[:space:]]+sql[[:space:]]+instances[[:space:]]+delete|az[[:space:]]+group[[:space:]]+delete|az[[:space:]]+sql[^|]*[[:space:]]delete'; then
+    { printf '%s%s' '13: cloud resource deletion (storage/DB/instance) is irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # 9b: cloud/infra destruction as capability families (verb-agnostic across vendors)
+  if _gmq terraform "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)terraform[[:space:]]+(destroy|apply)([[:space:]]|$)'; then
+    { printf '%s%s' '13: terraform destroy/apply changes real infrastructure - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq cloud-delete "$cmd" -Eiq '(^[[:space:]]*|[;&|][[:space:]]*)(aws|gcloud|az)[[:space:]][^|]*[[:space:]](delete|delete-[a-z-]+|terminate-[a-z-]+|remove|rb|destroy)([[:space:]]|$)'; then
+    { printf '%s%s' '13: cloud resource deletion/termination is irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq workload-disrupt "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)helm[[:space:]]+(uninstall|delete)([[:space:]]|$)' \
+     || _gmq workload-disrupt "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)kubectl[[:space:]]+(drain|cordon)([[:space:]]|$)'; then
+    { printf '%s%s' '13: helm uninstall / kubectl drain disrupts running workloads - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq database-drop "$cmd" -Eiq '(mongosh?|cockroach|psql|mysql)[^|]*(dropDatabase|drop[[:space:]]+database)' \
+     || _gmq database-drop "$cmd" -Eiq '(^[[:space:]]*|[;&|][[:space:]]*)(liquibase[[:space:]]+dropAll|flyway[[:space:]]+undo)'; then
+    { printf '%s%s' '13: database drop via a client/migration tool is irreversible - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # SWAS-187: the shell name used to end on whitespace only, so a quote, a bracket or an operator right
+  # after it (`sh -c '… | sh'`, `$(… | sh)`, `| sh;echo`) got past. The class lists the shell's word
+  # terminators (blank ; & | ( ) < >), the three bytes that close a quoted body, `$` (`| sh$X`) and the
+  # glob bytes * ? [ (`| sh*` runs /bin/sh when a file named sh is the only match).
+  if _gmq payload-to-shell "$cmd" -Eq '(curl|wget|base64[[:space:]]+(-d|--decode)|xxd[[:space:]]+-r)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(sh|bash|zsh|dash|python[0-9.]*|node|perl|ruby|php)([[:space:]'\''"`$;&|()<>*?[]|$)'; then
+    { printf '%s%s' '13: piping a fetched/decoded payload into a shell is high-blast-radius - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # 9b: data-exfiltration channels (PARTIAL — binary-name denial only; interpreters
+  # (python -c, node -e) remain channels. The real control is the platform network-egress
+  # allowlist — see docs/enterprise/platform-safety-boundary.md. This is a speed bump.)
+  if _gmq exfil-channel "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?(scp|sftp)[[:space:]]' \
+     || _gmq exfil-channel "$cmd" -Eq '(curl|wget)[[:space:]][^|]*(-T[[:space:]]|--upload-file|-F[[:space:]]*[^[:space:]&|;]*@|--data-binary[[:space:]]*@|--post-file)' \
+     || _gmq exfil-channel "$cmd" -Eq '\|[[:space:]]*(nc|ncat|netcat)[[:space:]]+[^[:space:]]' \
+     || _gmq exfil-channel "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)rclone[[:space:]]+(copy|sync|move)[[:space:]][^|]*[a-zA-Z0-9_-]+:' \
+     || _gmq exfil-channel "$cmd" -Eq '\|[[:space:]]*mail[[:space:]]'; then
+    { printf '%s%s' '13: possible data exfiltration (scp/sftp/curl-upload/nc/rclone/mail). Partial guard - the boundary is the platform egress allowlist - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # 9b: eval of a command substitution hides the real command from inspection.
+  # Anchored to command position so "eval $(...)" inside a commit message is NOT matched.
+  if _gmq eval-substitution "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(sudo[[:space:]]+)?eval[[:space:]]+[^;&|]*(\$\(|`)'; then
+    { printf '%s%s' '13: eval of a command substitution obscures the executed command - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq production-deploy "$cmd" -Eiq '(vercel[[:space:]]+(deploy[[:space:]]+)?--prod|railway[[:space:]]+up|fly[[:space:]]+deploy|terraform[[:space:]]+apply|kubectl[[:space:]]+apply|helm[[:space:]]+(install|upgrade))'; then
+    { printf '%s%s' '13: production deploy / infra apply is high-blast-radius - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  # prod-context catch-all: a mutating kube/helm op against a production context or namespace.
+  # Patterns are intentionally `.`-prefixed (not leading `--`) so GNU grep does not parse them
+  # as options; the leading `.` matches the space that always precedes the flag in real commands.
+  if _gmq production-context "$cmd" -Eiq '.(-(kube-)?context[[:space:]=][^[:space:]]*prod)|[[:space:]]-n[[:space:]]+[^[:space:]]*prod' \
+     && _gmq production-context "$cmd" -Eiq '(kubectl|helm)[[:space:]]([^|]*[[:space:]])?(apply|delete|create|replace|patch|scale|rollout|upgrade|install|uninstall|destroy)'; then
+    { printf '%s%s' '13: mutating operation against a production context - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq production-env "$cmd" -Eq '(^[[:space:]]*|[;&|][[:space:]]*)([A-Z_]*ENV)=prod[a-z]*[[:space:]]' \
+     && _gmq production-env "$cmd" -Eiq '(migrate|deploy|apply|reset|drop|delete|destroy|publish|flush|truncate|prune)'; then
+    { printf '%s%s' '13: destructive/deploy command in a production environment - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  if _gmq production-flag "$cmd" -Eiq '.(--(env|environment)[[:space:]=]prod)' \
+     && _gmq production-flag "$cmd" -Eiq '(migrate|deploy|apply|reset|drop|delete|destroy|publish|flush|truncate|prune)'; then
+    { printf '%s%s' '13: destructive/deploy command targeting production - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1; }
+  fi
+  return 0
+}
+
+# guard_check_mcp "<tool>" "<allowlist>" "<overrides>": ALLOW (return 0) / DENY (return 1 + reason).
+# Pure: the adapter loads the policy and passes it in (the core never reads a file).
+#   <tool>      a Claude MCP tool name, mcp__<server>__<action> (action = segment after the last __)
+#   <allowlist> newline list of exact mcp__server__action OR action-anchored mcp__*__<action> keys
+#               (explicit permit). The all-tools wildcard mcp__server__* / mcp__*__* is REJECTED (3d F2).
+#   <overrides> newline list of "mcp__server__action=class" (reclassify; class 'read'/'data.read' => allow)
+# Decision: allowlist > override-class > tokenized action-verb heuristic > fail-closed deny.
+#   The heuristic tokenizes the action (camelCase->snake, lowercased): the first token must be a
+#   read verb to allow, and ANY destructive verb token downgrades to deny (so get_and_delete /
+#   fetchAndExport deny; list_deployments / get_updates stay read - the noun is not the verb).
+# secret.read (A8 family 6) is deny-by-default by NAME: an action naming secret material, or a
+# known secret-store server on a read, is denied even when a read verb leads.
+# Honest ceiling: classifies by what the NAME reveals; a renamed action (get_data that exfiltrates),
+# a secret read via a generic-named server/action (mcp__storage__read_blob), and real egress are NOT
+# caught here — the platform egress allowlist + the 11c sandbox are the real controls
+# (docs/enterprise/platform-safety-boundary.md). The all-tools wildcard that once admitted a
+# destructive tool is no longer honored (3d F2); the action-anchored mcp__*__<action> key records a
+# per-action trust decision, it does not authenticate the tool.
+guard_check_mcp() {
+  t=$1; al=$2; ov=$3
+  # 0. SHAPE GATE (SESSION-SURFACE 3d F2-1). A well-formed MCP tool name is mcp__<srv>__<act> with a
+  #    NON-EMPTY server and action segment and an action that is not the literal '*'. A malformed
+  #    name — no mcp__ prefix, an empty action (mcp__srv__), or a wildcard-shaped action (mcp__srv__*,
+  #    mcp__*__*) — SKIPS the allowlist entirely and falls through to classification, which applies its
+  #    NORMAL read/destructive decision (NOT deny-by-default): a malformed name is simply un-allowlisted,
+  #    exactly like an un-allowlisted well-formed name, so a bare read verb still ALLOWs and a
+  #    destructive verb denies. What the shape gate removes is only the ALLOWLIST shortcut for a
+  #    wildcard-shaped name, never the read decision.
+  #    This makes "the all-tools wildcard is rejected" literally true rather than only via the removed
+  #    wildcard branch: a tool LITERALLY named mcp__github__* can no longer be admitted by the
+  #    exact-match line below against an allow entry of the same spelling, and neither the exact nor
+  #    the action-anchored allow check can honor an allow entry whose action segment is '*' (that
+  #    entry could only ever exact-match a '*'-actioned — i.e. malformed — tool, which is barred here).
+  #    An allow entry grants a SPECIFIC, well-formed tool, never a wildcard-shaped name.
+  _mcp_shape_ok=1
+  case "$t" in
+    mcp__*__*) ;;
+    *) _mcp_shape_ok=0 ;;
+  esac
+  if [ "$_mcp_shape_ok" = 1 ]; then
+    _mcp_rest=${t#mcp__}
+    _mcp_srv=${_mcp_rest%%__*}
+    _mcp_act=${t##*__}
+    if [ -z "$_mcp_srv" ] || [ -z "$_mcp_act" ] || [ "$_mcp_act" = '*' ]; then
+      _mcp_shape_ok=0
+    fi
+  fi
+  # 1. explicit allowlist. Two honored shapes (only for a well-formed tool name; a malformed name
+  #    skips both by the shape gate above):
+  #    (a) exact tool               mcp__<server>__<action>
+  #    (b) action-anchored, server-agnostic  mcp__*__<action>  — matches any tool whose TRAILING
+  #        action segment equals <action>, regardless of server. Survives a server rename by
+  #        construction (mcp__*__create_pull_request admits create_pull_request on github,
+  #        claude_ai_Github_MCP, or any future name). EXACT on the action segment: it is built from
+  #        ${t##*__}, so create_pull_request_and_delete / delete_repository yield a different key and
+  #        do NOT match (no prefix/substring bypass).
+  #    REJECTED shape (SESSION-SURFACE 3d F2): the all-tools wildcard mcp__<server>__* and mcp__*__*
+  #    — a wildcard admitting EVERY tool on a server is no longer an allow. It is simply not honored;
+  #    a tool relying on it falls through to classification below (and denies if destructive). This
+  #    tightens the pre-3d behavior, which honored mcp__<server>__* here.
+  #    Honest ceiling: the action-anchored key does NOT authenticate the tool — it records that the
+  #    adopter made a per-ACTION (not per-server) trust decision by writing the key. A renamed-to-
+  #    exfil action, a secret read via a generic name, and real egress remain the platform egress
+  #    boundary's job (docs/enterprise/platform-safety-boundary.md).
+  if [ "$_mcp_shape_ok" = 1 ]; then
+    if _gmqn mcp-allowlist "$al" -qxF -- "$t"; then return 0; fi
+    if _gmqn mcp-allowlist "$al" -qxF -- "mcp__*__${t##*__}"; then return 0; fi
+  fi
+  # 2. class: a per-tool override wins; else heuristic on the action segment.
+  act=${t##*__}
+  _rest=${t#mcp__}; srv=$(printf '%s' "${_rest%%__*}" | tr 'A-Z' 'a-z') || _guard_fault mcp-server  # server segment, lowercased
+  _guard_vanished mcp-server "${_rest%%__*}" "$srv"
+  # The override lookup walks the lines of $ov with parameter expansion only: no pipeline subshell and no fork.
+  cls=''
+  _ovr=$ov
+  while [ -n "$_ovr" ]; do
+    case "$_ovr" in
+      *"$_cp8b_nl"*) _ovl=${_ovr%%"$_cp8b_nl"*}; _ovr=${_ovr#*"$_cp8b_nl"} ;;
+      *)             _ovl=$_ovr; _ovr='' ;;
+    esac
+    case "$_ovl" in
+      *=*) _ovk=${_ovl%%=*}; _ovv=${_ovl#*=} ;;
+      *)   _ovk=$_ovl; _ovv='' ;;
+    esac
+    if [ "$_ovk" = "$t" ]; then cls=$_ovv; break; fi
+  done
+  if [ -z "$cls" ]; then
+    # Tokenize the action: split camelCase to snake, lowercase, turn _/- into spaces.
+    # Whole-token verb matching keeps legit compounds read (list_deployments, get_updates -
+    # 'deployments'/'updates' are not the verbs 'deploy'/'update') while downgrading a read-
+    # prefixed action that carries a destructive verb token (get_and_delete, fetchAndExport).
+    rverbs=' read get list search query fetch describe show view find count '
+    dverbs=' delete drop destroy remove truncate reset write update create insert upsert patch put set upload publish deploy send post email notify apply merge push revoke rotate export download '
+    norm=$(printf '%s' "$act" | sed 's/\([a-zA-Z0-9]\)\([A-Z]\)/\1_\2/g' | tr 'A-Z_-' 'a-z  ')
+    first=${norm%% *}
+    cls=unknown
+    case "$rverbs" in
+      *" $first "*) cls=read ;;
+      esac
+    for tok in $norm; do
+      case "$dverbs" in
+        *" $tok "*) cls=destructive; break ;;
+        esac
+    done
+    # secret-material READ is deny-by-default even when a read verb leads (A8 family 6 - the read
+    # half of exfil). Catch it by NAME: (a) the action names secret material, or (b) the server is
+    # a known secret store on a read. Ceiling: a secret read via a generic-named server/action
+    # (e.g. mcp__storage__read_blob holding a secret) is NOT caught - that is the 11c sandbox's job.
+    # MCP-SECRET-READ-CLASSIFIER residuals: (a) camelCase action variants (getKey/getParameter) are
+    # NOT matched - the secret regex below runs on the raw $act, where 'key'/'parameter' lack the
+    # required _/-/anchor boundary (the camelCase-split $norm is used only for verb detection above),
+    # so a squashed compound slips through (under-deny, disclosed); (b) the key/parameter action
+    # tokens also deny non-secret config reads (over-deny; recoverable via .claude/mcp-policy.json
+    # allowlist/classOverride); (c) 'ssm' is an unanchored server substring.
+    if [ "$cls" = "read" ] && _gmq mcp-secret-action "$act" -Eiq 'secret|credential|passphrase|password|api[_-]?key|private[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|(^|[_-])keys?([_-]|$)|(^|[_-])parameter'; then
+      cls=secret.read
+    fi
+    if [ "$cls" = "read" ] && _gmq mcp-secret-server "$srv" -Eiq 'vault|1password|onepassword|secretsmanager|secrets[_-]?manager|secret[_-]?manager|keyvault|key[_-]?vault|credstash|doppler|infisical|akeyless|bitwarden|conjur|cyberark|ssm|parameter[_-]?store'; then
+      cls=secret.read
+    fi
+  fi
+  # 3d F2 migration reason: this tool is about to be DENIED. If the allowlist still carries a
+  # now-dead all-tools server wildcard that WOULD have admitted it under the pre-3d rule
+  # (mcp__<srv>__* on this tool's server, or mcp__*__*), name that entry in the reason and point
+  # at the action-anchored replacement mcp__*__<action>. This changes NO decision (the wildcard is
+  # not honored either way — a read still classify-allows above, a destructive still denies below);
+  # it is operator guidance so an adopter migrating off a wildcard sees WHY it stopped granting,
+  # instead of a silent fall-through. Match the entry on the RAW (non-lowercased) server, as the
+  # exact/action-anchored allow checks above match literally.
+  _rawsrv=${t#mcp__}; _rawsrv=${_rawsrv%%__*}; mig=''
+  if printf '%s\n' "$al" | grep -qxF -- "mcp__${_rawsrv}__*" 2>/dev/null; then
+    _we="mcp__${_rawsrv}__*"
+  elif printf '%s\n' "$al" | grep -qxF -- "mcp__*__*" 2>/dev/null; then
+    _we="mcp__*__*"
+  else
+    _we=''
+  fi
+  if [ -n "$_we" ]; then
+    mig=$(printf ' The allowlist entry %s no longer grants (an all-tools server wildcard admits every tool on a server, bypassing classification; rejected in 3d F2) - allowlist this specific action with mcp__*__%s.' "$_we" "$act")
+  fi
+  case "$cls" in
+    read|data.read) return 0 ;;
+    secret.read) printf '13: MCP tool %s reads secret/credential material - deny-by-default (the read half of exfil; A8 family 6). The owner may allowlist it in .claude/mcp-policy.json.%s%s' "$t" "$mig" "$(_guard_stop_pointer mcp)"; return 1 ;;
+    unknown) printf '13: MCP tool %s is not classifiable as read-only - denied (fail-closed). The owner may allowlist it in .claude/mcp-policy.json.%s%s' "$t" "$mig" "$(_guard_stop_pointer mcp)"; return 1 ;;
+    *) printf '13: MCP tool %s is a destructive/egress capability (%s) - human-gated. The owner may allowlist it in .claude/mcp-policy.json.%s%s' "$t" "$cls" "$mig" "$(_guard_stop_pointer mcp)"; return 1 ;;
+  esac
+}
+
+# SWAS-885 slice 1 — no file-tool write into any repository's git directory, or into a tracked hooks directory git runs, in EVERY
+# repository (the dev-clone relax never reaches them). Design docs/architecture/2026-11-14-guard-git-dir-home-dotfiles-885-design.md
+# (rev 3) + its errata c1-c4. The helpers below, all plain POSIX sh, prefixed _g885_ so they cannot clash with the globals the sourced
+# helpers above share. Named residuals (declared, pinned by SWAS885-S1-i cells): a bare repository, a separate git directory, a GIT_DIR in
+# the environment and a core.hooksPath pointing anywhere other than <work tree>/hooks.
+_g885_reason() {
+  printf '%s' '13: writing a repository'\''s git hooks or .git internals with a file tool is denied in every repository (they run code at git time). Use git'\''s own commands; a person edits them by hand if needed (escape card R30 cp-write).'
+}
+
+# _g885_dotgit_path "<path>": rc 0 iff the path has a `.git` component (a git dir, or the gitfile of a worktree/submodule), judged
+# case-folded (a case-insensitive filesystem resolves `.GIT`). The fork to `tr` happens only when an uppercase byte is present.
+_g885_dotgit_path() {
+  _g885_p=$1
+  [ -n "$_g885_p" ] || return 1
+  case "$_g885_p" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _g885_p=$(printf '%s' "$_g885_p" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault dotgit-fold ;;   # G885-FOLD
+  esac
+  case "$_g885_p" in
+    .git|.git/*|*/.git|*/.git/*) return 0 ;;   # G885-DOTGIT
+  esac
+  return 1
+}
+
+# _g885_dotgit_any "<literal>" "<normalised>" "<resolved>": the UNION, as every other path arm judges it.
+_g885_dotgit_any() {
+  _g885_dotgit_path "$1" && return 0
+  _g885_dotgit_path "$2" && return 0   # G885-ANY
+  _g885_dotgit_path "$3" && return 0   # G885-ANY
+  return 1
+}
+
+# _g885_relief_dotgit "<literal>" "<normalised>" "<resolved>": rc 0 iff one of them lies under the .claude/projects or .claude/plans relief
+# (the early `return 1` in _cpp_kitowned and _cpp_match) AND has a `.git` component. Architect ruling 2026-11-15: the relief is for
+# memory and plan files, never for a repository's git directory, so it no longer exempts one.
+# Judged case-folded, as the classifier's second pass folds: a `.CLAUDE/PROJECTS/r/.GIT` spelling reaches the relief folded, so it must reach this test folded too.
+_g885_relief_dotgit() {
+  for _g885_rp in "$1" "$2" "$3"; do
+    [ -n "$_g885_rp" ] || continue
+    case "$_g885_rp" in
+      *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _g885_rp=$(printf '%s' "$_g885_rp" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault relief-fold ;;   # G885-RFOLD
+    esac
+    case "$_g885_rp" in
+      .claude/projects/*|*/.claude/projects/*|.claude/plans/*|*/.claude/plans/*)
+        _g885_dotgit_path "$_g885_rp" && return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# _g885_dir_abs "<path>": echo the absolute, PHYSICAL spelling of a directory that may not exist yet: an existing one by `cd -P`, otherwise
+# its longest existing prefix resolved physically with the rest appended textually. A `..` left in the not-yet-existing tail cannot be
+# judged, so it returns rc 1 (the callers fail closed). The input is copied to its own variable first so that no line here matches the
+# K-COUPLE greps for the two composed-path seds (conformance/agent-autonomy.sh) - that check must keep finding exactly one line each.
+_g885_dir_abs() {
+  _g885_in=$1
+  _g885_da=$(printf '%s' "$_g885_in" | sed -e 's#//*#/#g' -e 's#/*$##' -e ':b' -e 's#/\./#/#' -e 'tb' -e 's#/\.$##' -e 's#/*$##') || return 1
+  [ -n "$_g885_da" ] || _g885_da=/
+  if [ -d "$_g885_da" ]; then ( CDPATH='' cd -P "$_g885_da" 2>/dev/null && pwd -P ); return; fi
+  _g885_da=$(_resolve_physical "$_g885_da") || return 1
+  case "/$_g885_da/" in
+    *"/../"*|*"/./"*) return 1 ;;
+  esac
+  printf '%s' "$_g885_da"
+}
+
+# _g885_same_dir "<a>" "<b>": rc 0 = the same directory (physical text, or device+inode when both exist), 1 = different, 2 = cannot tell.
+_g885_same_dir() {
+  _g885_s1=$(_g885_dir_abs "$1") || return 2
+  _g885_s2=$(_g885_dir_abs "$2") || return 2
+  [ "$_g885_s1" = "$_g885_s2" ] && return 0
+  if [ -d "$1" ] && [ -d "$2" ]; then
+    _g885_i1=$(_devino_of "$1") || return 2
+    _g885_i2=$(_devino_of "$2") || return 2
+    [ "$_g885_i1" = "$_g885_i2" ] && return 0
+  fi
+  return 1
+}
+
+# _g885_hooks_cfg_hit "<work tree>" "<target parent>": rc 0 (DENY) iff that work tree's effective core.hooksPath resolves to the
+# work tree's `hooks/` directory AND the target's parent is that same directory (physical paths; device+inode when both exist; the directory
+# need not exist yet). rc 1 = not live (including hooksPath unset). The config read keeps its rc: 1 = unset; 0 = the LAST value; any other rc,
+# an empty value or a value holding a newline FAILS CLOSED.
+_g885_hooks_cfg_hit() {
+  _g885_w=$1; _g885_ctp=$2
+  [ -n "$_g885_w" ] || return 1   # G885-WT
+  _g885_nl='
+'
+  _g885_rc=0; _g885_all=$(git -C "$_g885_w" config --get-all core.hooksPath 2>/dev/null) || _g885_rc=$?
+  [ "$_g885_rc" = 1 ] && return 1
+  [ "$_g885_rc" = 0 ] || return 0   # G885-RC
+  [ -n "$_g885_all" ] || return 0
+  _g885_rc=0; _g885_one=$(git -C "$_g885_w" config --get core.hooksPath 2>/dev/null) || _g885_rc=$?
+  [ "$_g885_rc" = 0 ] || return 0
+  case "$_g885_one" in
+    ''|*"$_g885_nl"*) return 0 ;;   # G885-ONE
+  esac
+  _g885_val=${_g885_all##*"$_g885_nl"}   # G885-LAST
+  case "$_g885_val" in
+    /*) _g885_hp=$_g885_val ;;
+    \~/*) _g885_tl=${_g885_val#\~/}; _g885_hp="${HOME:-/nonexistent}/$_g885_tl" ;;
+    \~*) return 0 ;;
+    *) _g885_hp="$_g885_w/$_g885_val" ;;
+  esac
+  # F-c: decided from the CONFIGURED value, so a hooks directory that does not exist yet is judged too (the configured directory and the
+  # target's parent must each be the work tree's hooks/ directory, physically). rc 2 (cannot tell) fails closed.
+  _g885_hr=0; _g885_same_dir "$_g885_hp" "$_g885_w/hooks" || _g885_hr=$?   # G885-HPCMP
+  [ "$_g885_hr" = 1 ] && return 1
+  [ "$_g885_hr" = 0 ] || return 0   # G885-HPFAIL
+  _g885_hr=0; _g885_same_dir "$_g885_ctp" "$_g885_w/hooks" || _g885_hr=$?   # G885-HPSAME
+  [ "$_g885_hr" = 1 ] && return 1
+  return 0
+}
+
+# _g885_live_hooks_hit "<absolute path>": rc 0 (DENY) iff the path's parent directory is the `hooks/` directory of ANY work tree that encloses
+# it AND that work tree's effective core.hooksPath resolves to that same directory (_g885_hooks_cfg_hit). rc 1 = not a live hook (including: no
+# work tree above it, hooksPath unset everywhere).
+# The walk goes UP from the nearest existing ancestor through EVERY enclosing work tree (G-c: a nested repository in P/hooks reports P/hooks
+# as its top level, and git never reads the outer P's hooksPath for it, so the walk continues from the parent of each top level), and a
+# directory that has a `.git` entry but whose top level git cannot report (an unreadable or corrupt config: rc 128) fails CLOSED when the
+# target's parent is its hooks/ (the config could not be read, so it cannot be shown unset). No `.git` entry anywhere above: it does not fire.
+# The cheap prefilter keeps the git forks off other writes: the parent must be spelled hooks (any case), or be a SYMLINK that resolves to a
+# directory spelled hooks (G-a: P/myhooks -> P/hooks). Errata c2: the caller runs this whatever the relax.
+_g885_live_hooks_hit() {
+  _g885_tp=${1%/*}
+  _g885_pb=${_g885_tp##*/}
+  case "$_g885_pb" in
+    [Hh][Oo][Oo][Kk][Ss]) : ;;
+    *)
+      [ -L "$_g885_tp" ] || return 1   # G885-PSYM
+      _g885_pr=$(_g885_dir_abs "$_g885_tp") || return 0
+      case "${_g885_pr##*/}" in
+        [Hh][Oo][Oo][Kk][Ss]) : ;;
+        *) return 1 ;;
+      esac ;;
+  esac
+  _g885_wd=$_g885_tp
+  while [ -n "$_g885_wd" ] && [ ! -d "$_g885_wd" ]; do _g885_wd=${_g885_wd%/*}; done
+  [ -n "$_g885_wd" ] || _g885_wd=/
+  _g885_wp=$(CDPATH='' cd -P "$_g885_wd" 2>/dev/null && pwd -P) && _g885_wd=$_g885_wp
+  _g885_n=0
+  while [ "$_g885_n" -lt 256 ]; do
+    _g885_n=$((_g885_n + 1))
+    _g885_wt=$(git -C "$_g885_wd" rev-parse --show-toplevel 2>/dev/null </dev/null) || _g885_wt=''   # G885-GITTOP
+    if [ -n "$_g885_wt" ]; then
+      _g885_wt=$(CDPATH='' cd -P "$_g885_wt" 2>/dev/null && pwd -P) || return 0
+      _g885_hooks_cfg_hit "$_g885_wt" "$_g885_tp" && return 0
+      _g885_wd=$_g885_wt   # G885-NEXT
+    elif [ -e "$_g885_wd/.git" ]; then
+      _g885_ur=0; _g885_same_dir "$_g885_tp" "$_g885_wd/hooks" || _g885_ur=$?   # G885-UNREAD
+      [ "$_g885_ur" = 1 ] || return 0
+    fi
+    [ "$_g885_wd" != / ] || return 1
+    _g885_wd=${_g885_wd%/*}
+    [ -n "$_g885_wd" ] || _g885_wd=/
+  done
+  return 0
+}
+
+# _g885_nlink_reason: the one refusal for a relaxed write to an existing multi-link regular file (Architect ruling 2026-11-14).
+_g885_nlink_reason() {
+  printf '%s' '13: this file has other hard links; a dev-clone write to it is refused (control-plane integrity). Copy the file instead of linking it (escape card R30 cp-write).'
+}
+
+# guard_check_path "<path>": print reason + return 1 if denied, else 0.
+# Moved from the PRE-SPLIT guard.sh (drop the jq line — caller passes the path); the line range that
+# stood here died with the split, so this cites the file and the change, not a dead offset.
+guard_check_path() {
+  fp=$1
+  # CP-8c: an adapter that can prove the protected repo root passes it as $2. When the target is a
+  # dev clone (guard_dev_clone_relaxable), the CONTROL-PLANE denies below relax — the secret-write
+  # deny does NOT. No root passed (kit-guard CLI, older adapters) => _cp8c_relax=0 => today's
+  # behavior (fail-safe).
+  _cp8c_root=${2:-}
+  _cp8c_relax=0
+  _cp8c_hint=''
+  if [ -n "$_cp8c_root" ] && guard_dev_clone_relaxable "$fp" "$_cp8c_root"; then _cp8c_relax=1; fi
+  # BYTE-TWIN of _cp8b_norm's sed (GUARD-CP-WRITE-ROUTES K-COUPLE) — the /./ FIXPOINT edit is applied
+  # here identically; a byte-identity selftest leg pins the two seds equal so they cannot drift.
+  fpn=$(printf '%s' "$fp" | sed -e 's#//*#/#g' -e ':b' -e 's#/\./#/#' -e 'tb' -e 's#^\./##' -e 's#/*$##' -e ':a' -e 's#[^/]*/\.\./##' -e 'ta')
+  _fpn_rc=$?   # the substitution's own status: a failed normalise leaves only the literal and resolved legs, which is a fault, not a verdict
+  [ "$_fpn_rc" = 0 ] || _guard_fault path-normalize
+  base=$(basename "$fp" 2>/dev/null || printf '%s' "$fp")
+  # GUARD-PATH-ALIAS-BYPASS (P0): judge the UNION — literal OR normalised OR RESOLVED. The rc is
+  # CAPTURED, never discarded via `is_control_plane_path "$(_resolve_physical ...)"`: that form drops
+  # the rc, `is_control_plane_path ""` answers ordinary, and every resolution failure becomes a
+  # silent ALLOW. Any failure to resolve is itself a denial (design ceiling 9a).
+  _res=''; _resok=0
+  _res=$(_resolve_physical "$fp") && _resok=1 || _resok=0
+  _rbase=''; [ "$_resok" = 1 ] && _rbase=$(basename "$_res" 2>/dev/null || printf '%s' "$_res")
+  # SWAS-885 slice 1 (design §2 item 2): the dev-clone relax is OFF for a `.git` component — literal, normalised or resolved, case-folded.
+  # The control-plane denies below (now carrying `.git` and the gitfile) then apply in every repository, with the refusal that names the act.
+  _g885_flip=0
+  if [ "$_cp8c_relax" = 1 ] && _g885_dotgit_any "$fp" "$fpn" "$_res"; then _cp8c_relax=0; _g885_flip=1; fi   # G885-FLIP
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 0 ] && [ "$_resok" = 0 ]; then
+    printf '13: path (%s) could not be resolved - refusing to write to a target that cannot be identified.%s' "$fp" "$(_guard_stop_pointer unresolvable-path)"; return 1
+  fi
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 0 ] && { is_control_plane_path "$fp" || is_control_plane_path "$fpn"; }; then
+    # A dev-clone addressed through a symlink from OUTSIDE temp gets the real remedy, not the kill
+    # switch. Naming KIT_GUARD_SELFEDIT here would tell an operator to disarm the guard globally to
+    # do work the guard is happy to allow by its real path — the endorsed-bypass class.
+    if [ "$_g885_flip" = 1 ]; then _g885_reason; return 1; fi
+    if [ "${_cp8c_hint:-}" = symlinked-clone ]; then
+      printf '%s' '13: this dev-clone was addressed through a symlink from outside the temp root, so the clone affordance does not apply (control-plane integrity). Address it by its real path — `cd <clone> && pwd -P` — and the same edit is allowed. (escape card R30 cp-write)'; return 1
+    fi
+    _cp8b_waiver_hint "$fp" '13: modifying the guard / its config / CI gates is denied (control-plane integrity). Next: make this change in a dev clone (escape card R30 cp-write).'; return 1
+  fi
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 0 ] && [ "$_resok" = 1 ] && is_control_plane_path "$_res"; then
+    if [ "$_g885_flip" = 1 ]; then _g885_reason; return 1; fi
+    _cp8b_waiver_hint "$_res" "$(printf '13: this path resolves to a control-plane file (%s) - denied (control-plane integrity). The name it is reached by does not change what it writes. Next: make this change in a dev clone (escape card R30 cp-write).' "$_res")"; return 1
+  fi
+  # SWAS-885 (Architect ruling 2026-11-15, the reviewer's F1): the relief above exempts .claude/projects and .claude/plans by subtree name, so a
+  # `.git` component inside them matched no control-plane arm and was allowed. The backstop refuses it, relaxed or not; nothing else changes.
+  if ! selfedit_allowed && _g885_relief_dotgit "$fp" "$fpn" "$_res"; then _g885_reason; return 1; fi   # G885-RELIEF
+  # GUARD-CP-HARDLINK-ALIAS (§2b): the CP-INODE disjunct, immediately after the resolved-CP arm and
+  # UNDER THE SAME dev-clone relax gate that arm carries (Leg G). A non-empty name => a genuine CP
+  # hardlink; empty => the engine's fail-safe (M1: a DISTINCT reason, true for an ordinary file).
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 0 ] && [ "$_resok" = 1 ]; then
+    _hlrc=0; _hlnamed=$(_hardlink_alias_hit_cp "$_res" "$_cp8c_root") || _hlrc=$?   # rc >= 2 = fault, as above
+    [ "$_hlrc" -le 1 ] || _guard_fault hardlink-cp
+    if [ "$_hlrc" = 0 ]; then
+      if [ -n "$_hlnamed" ]; then
+        _cp8b_waiver_hint "$_hlnamed" "$(printf '13: this path is a hardlink to a control-plane file (%s) - denied (control-plane integrity). The name it is reached by does not change what it writes. Next: make this change in a dev clone (escape card R30 cp-write).' "$_hlnamed")"
+      else
+        printf '13: could not verify the target'\''s hardlink aliases (stat/find unavailable, timed out, or an ambiguous root) - denied fail-safe (control-plane integrity). Remedy: usually an unreadable directory under the repo root, or a find that exceeded its time budget - the owner may make that directory searchable or raise the find budget (escape card R34 hardlink-unverified)'
+      fi
+      return 1
+    fi
+  fi
+  # SWAS-885 slice 1 (design §2 item 3, errata c2): a write into a work tree's LIVE tracked hooks directory (its effective core.hooksPath IS
+  # <work tree>/hooks, by device and inode) is refused WHATEVER the relax, the protected root included. `hooks/<name>` other than pre-push is not
+  # control-plane, so the arms above cannot see it. The resolved and the literal spellings are both judged (a symlinked leaf or hooks directory).
+  if ! selfedit_allowed && [ "$_resok" = 1 ]; then
+    _g885_lit=$fpn
+    case "$_g885_lit" in
+      /*) : ;;
+      *) _g885_lit="$(pwd -P)/$_g885_lit" ;;
+    esac
+    [ "$_g885_lit" != "$_res" ] || _g885_lit=''
+    if _g885_live_hooks_hit "$_res" || { [ -n "$_g885_lit" ] && _g885_live_hooks_hit "$_g885_lit"; }; then _g885_reason; return 1; fi   # G885-LIVE
+  fi
+  # WS1: validate by basename when the NORMALIZED path has no real parent directory — either it is a
+  # bare name, OR it still ESCAPES its root (a leading/unresolved `..` the fixpoint could not consume),
+  # which cannot be trusted by directory. A path with a genuine parent dir (`.vscode/settings.json`) is
+  # matched precisely by is_control_plane_path above, so the net is skipped only there. This closes the
+  # `./settings.json`, `a/../guard.sh`, multi-`..`, trailing-slash, AND leading-`../name` bypasses while
+  # still allowing an innocent `.vscode/settings.json` / `app/config/settings.json`.
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 0 ]; then
+    _bare=1
+    case "$fpn" in
+      ..|../*|*/../*) _bare=1 ;;
+      */*)           _bare=0 ;;
+    esac
+    if [ "$_bare" = 1 ]; then
+      # A2 (case) — the FIFTH matcher. This bare/escaping-name net exists precisely for the relative
+      # paths that is_control_plane_path's directory-anchored patterns cannot see, and it was still
+      # byte-literal: measured, `guard-core.sh` DENIED while `Guard-Core.sh` was ALLOWED, and likewise
+      # `Settings.json`, `MCP-Policy.json`, `../Guard-Core.sh`. Reachable via any harness or
+      # `scripts/kit-guard` that passes a bare or escaping name. Fold once, then match a LOWERCASE list.
+      _bn=$base
+      case "$_bn" in
+        *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _bn=$(printf '%s' "$_bn" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault path-basename-fold ;;
+        esac
+      case "$_bn" in
+        guard.sh|guard-core.sh|kit-guard|pre-push|settings.json|settings.local.json|mcp-policy.json|codeowners|.meta-control-last|meta-control-log.md|\
+        .gitleaks.toml|.gitleaksignore|.publish-identifiers|.semgrepignore|.trivyignore|.checkov.yaml|.checkov.yml)
+          printf '13: modifying a control-plane file (%s) is denied (control-plane integrity). Next: make this change in a dev clone (escape card R30 cp-write).' "$base"; return 1 ;;
+      esac
+    fi
+  fi
+  # GUARD-CP-HARDLINK-ALIAS (§2b): the secret-INODE disjunct goes BEFORE the template allowlist (vet
+  # HIGH-1) and is UNGATED — not relax-gated, not selfedit-gated — byte-parity with the direct secret
+  # arms below (a relax-gated secret check would be strictly weaker than the direct arm it mirrors). A
+  # genuine single-link `.env.example` produces no hit and falls through to the allowlist unchanged; a
+  # hardlinked `.env.example`->`.env` produces a secret hit and denies before the allowlist greens it.
+  # (UNGATED: the guard below carries NO _cp8c_relax — K(iv) pins that asymmetry vs the CP site above.)
+  if [ "$_resok" = 1 ]; then
+    _hlrc=0; _hlnamed=$(_hardlink_alias_hit_secret "$_res" "$_cp8c_root") || _hlrc=$?   # rc >= 2 = fault, as above
+    [ "$_hlrc" -le 1 ] || _guard_fault hardlink-secret-write
+    if [ "$_hlrc" = 0 ]; then
+      if [ -n "$_hlnamed" ]; then
+        printf '13: this path is a hardlink to secret material (%s) - human-gated. The name it is reached by does not change what it writes.%s' "$_hlnamed" "$(_guard_stop_pointer secret-write)"
+      else
+        printf '13: could not verify the target'\''s hardlink aliases (stat/find unavailable, timed out, or an ambiguous root) - denied fail-safe (refusing to write to a target whose aliases cannot be confirmed). Remedy: usually an unreadable directory under the repo root, or a find that exceeded its time budget - the owner may make that directory searchable or raise the find budget (escape card R34 hardlink-unverified)'
+      fi
+      return 1
+    fi
+  fi
+  # SWAS-278a (design §3.5, Sec-M5, N7): the hardlink precondition for a RELAXED path. The CP-inode arm above is skipped for a dev-clone path, so
+  # a clone name that is a hardlink to a root file reached the ROOT's inode. For an existing relaxed file with more than one link, any other
+  # name under the protected root denies (control-plane or not), the object store included. Since SWAS-885 neither arm decides a verdict: a `.git`
+  # path turns the relax off before this block, so H4-OBJECTS cannot be reached, and every multi-link file the root search denies the nlink rule
+  # at the end of this block denies too. Their mutants (MH4a, MH4b, MLA, MLB) are retired; SWAS-898 carries remove-or-re-prove. A device mismatch answers "no alias". It sits after the
+  # secret-inode arm (whose own fail-safe wording the F2 legs pin) and BEFORE the template allowlist, which can return. A fault denies.
+  if ! selfedit_allowed && [ "$_cp8c_relax" = 1 ] && [ "$_resok" = 1 ]; then   # H-RELAXED-HL
+    case "$_res" in
+      */.git/objects/*)
+        if [ -f "$_res" ] && _hn=$(_nlink_of "$_res") && [ "$_hn" -gt 1 ] 2>/dev/null; then   # H4-OBJECTS
+          printf '%s%s' '13: this dev-clone path is a git object with more than one link (a clone --local object may be a hardlink into another repository) - denied (control-plane integrity).' "$(_guard_stop_pointer clone-object-links)"; return 1
+        fi ;;
+    esac
+    _hlrc=0; _hlnamed=$(_hardlink_root_alias_hit "$_res" "$_cp8c_root") || _hlrc=$?   # rc >= 2 = fault, as above
+    [ "$_hlrc" -le 1 ] || _guard_fault hardlink-relaxed
+    if [ "$_hlrc" = 0 ]; then
+      if [ -n "$_hlnamed" ]; then
+        printf '13: this dev-clone path is a hardlink to a file under the protected repo (%s) - denied (control-plane integrity). The name it is reached by does not change what it writes; copy the file instead of linking it. (escape card R30 cp-write)' "$_hlnamed"
+      else
+        printf '13: could not verify the dev-clone path'\''s hardlink aliases (stat/find unavailable, timed out, or an ambiguous root) - denied fail-safe (control-plane integrity). Remedy: usually an unreadable directory under the repo root, or a find that exceeded its time budget - the owner may make that directory searchable or raise the find budget (escape card R34 hardlink-unverified)'
+      fi
+      return 1
+    fi
+    # SWAS-885 slice 1 (Architect ruling 2026-11-14, replacing errata c1): under the relax, a write to an EXISTING regular file whose link
+    # count is above one is refused. No inode search and no count: a name for the file may lie anywhere (a git directory, a live hooks
+    # directory, another repository), and this rule needs none of them. A count that cannot be read on an existing file fails CLOSED.
+    if [ -f "$_res" ]; then   # G885-NLINK
+      _g885_nlk=$(_nlink_of "$_res") || _g885_nlk=''
+      case "$_g885_nlk" in
+        ''|*[!0-9]*) _g885_nlink_reason; return 1 ;;
+      esac
+      if [ "$_g885_nlk" -gt 1 ]; then _g885_nlink_reason; return 1; fi
+    fi
+  fi
+  # The template allowlist is the SECOND predicate that turns denies off, so it takes the
+  # CONJUNCTION: allow only when the literal AND the resolved basenames are both template names.
+  # Literal-only is a cloak (an alias NAMED .env.example reaching a real .env); resolved-only is a
+  # new fail-open (the common `.env -> .env.example` symlink would flip DENY to ALLOW).
+  case "$base" in
+    .env.example|.env.sample|.env.template|.env.dist)
+      case "$_rbase" in
+        .env.example|.env.sample|.env.template|.env.dist) return 0 ;;
+      esac ;;
+  esac
+  # GUARD-CP-HARDLINK-ALIAS §2c: the byte-literal + case-folded secret arms are consolidated into
+  # _is_secret_path (one source of truth, byte-identity-coupled). The template ALLOW above stays
+  # byte-literal, so a case-variant `.ENV.EXAMPLE` falls through to THIS deny — an accepted over-deny.
+  if _is_secret_path "$fp"; then
+    printf '13: writing secret material (%s) - human-gated.%s' "$base" "$(_guard_stop_pointer secret-write)"; return 1
+  fi
+  # …and the same union on the RESOLVED path (both arms, via the same helper), so a benign name cannot
+  # front a secret target.
+  if [ "$_resok" = 1 ] && _is_secret_path "$_res"; then
+    printf '13: this path resolves to secret material (%s) - human-gated. The name it is reached by does not change what it writes.%s' "$_res" "$(_guard_stop_pointer secret-write)"; return 1
+  fi
+  return 0
+}
+
+# guard_check_push <remote-ref> <local-sha> <remote-sha>: print reason + return 1 if denied.
+# Ref-based (more precise than the command-string git rules): real non-fast-forward detection.
+guard_check_push() {
+  remote_ref=$1; local_sha=$2; remote_sha=$3
+  zero=0000000000000000000000000000000000000000
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      if [ "$local_sha" = "$zero" ]; then
+        printf '%s%s' '13: deleting main/master is destructive and bypasses review - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1
+      fi
+      # SWAS-712: the FIRST push creates main on a remote that has none (remote sha all zeros). ORDER MATTERS: the delete
+      # deny above runs first, so this allow only ever sees a non-zero local sha; do not move it above that deny. Nothing exists to open a PR against, so this is the one admitted shape.
+      # Disclosed risk: an all-zero remote sha also admits re-creating a main someone deleted on the host, and pushing
+      # main to a new empty mirror. Both are rare human acts; branch protection on the host is the real control.
+      if [ "$remote_sha" = "$zero" ]; then return 0; fi
+      printf '%s%s' '13: pushing directly to main/master bypasses review - human-gated.' "$(_guard_stop_pointer push-main)"; return 1 ;;
+  esac
+  # force-push / non-fast-forward to ANY branch: remote tip not an ancestor of the new tip.
+  if [ "$remote_sha" != "$zero" ] && [ "$local_sha" != "$zero" ]; then
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      printf '%s%s' '13: non-fast-forward (force) push rewrites published history - human-gated.' "$(_guard_stop_pointer human-gated)"; return 1
+    fi
+  fi
+  return 0
+}
+
+# shellcheck shell=sh
+# =============================================================================
+# guard-core.additions.sh (Slice B) — the EXACT snippet apply.py appends to
+# .claude/hooks/guard-core.sh (after guard_check_push, before EOF). Not a
+# standalone script: a function fragment sourced with the rest of the core.
+# =============================================================================
+
+# guard_check_skill "<skill_name>": the roster-authority dial (Slice B, opt-in, ships OFF).
+# Prints a verdict TOKEN on line 1 (allow|ask|deny) and, for ask/deny, a reason on line 2+;
+# ALWAYS returns 0 — the adapter (guard.sh) maps the token to a permission decision.
+#
+# Dial source: KIT_ROSTER_GUARD (per-session override) wins; else MODE= in .kit/roster.conf
+# (repo-root-relative; path overridable via KIT_ROSTER_CONF for tests, mirroring
+# RUNAWAY_BUDGET_CONFIG). The config file is itself control-plane, so an agent cannot flip the
+# dial (see is_control_plane_path + the command/redirect matchers).
+#
+# FAIL-SAFE toward OFF (the load-bearing invariant): any unreadable/absent/garbage config, or a
+# MODE that is not exactly ask|deny, routes to `allow`. A config error must NEVER wedge the
+# session — the roster-authority FLOOR contract (CLAUDE.md/AGENTS.md) still steers by preference.
+#
+# Namespace match resists spoofing: the namespace is the part before the FIRST ':' (no colon =>
+# the whole string), trimmed and lowercased, then whole-token matched against BLOCKLIST. So
+# `Superpowers:x` (capitalized) and bare `superpowers` are BOTH caught, while `x::superpowers`
+# (namespace `x`) and any non-blocklisted namespace (figma/vercel/LSPs) are allowed.
+guard_check_skill() {
+  _sk=$1
+  _conf="${KIT_ROSTER_CONF:-.kit/roster.conf}"
+
+  # 1. mode: session override wins; else MODE= from config; else empty (=> off). Unreadable => off.
+  _mode="${KIT_ROSTER_GUARD:-}"
+  if [ -z "$_mode" ] && [ -r "$_conf" ]; then
+    _mode=$(grep -E '^[[:space:]]*MODE[[:space:]]*=' "$_conf" 2>/dev/null | tail -n1 \
+      | sed -E 's/^[[:space:]]*MODE[[:space:]]*=[[:space:]]*//; s/#.*$//; s/["'"'"']//g; s/[[:space:]].*$//')
+  fi
+  _mode=$(printf '%s' "$_mode" | tr 'A-Z' 'a-z') || _guard_fault skill-mode
+  # 2. fail-safe: only ask|deny are active; off / empty / garbage => allow.
+  case "$_mode" in
+    ask|deny) : ;;
+    *) printf 'allow\n'; return 0 ;;
+  esac
+
+  # 3. namespace = part before the first ':'; trim ws; lowercase (spoof-resistant).
+  _ns=${_sk%%:*}
+  _ns=$(printf '%s' "$_ns" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr 'A-Z' 'a-z') || _guard_fault skill-namespace
+  [ -n "$_ns" ] || { printf 'allow\n'; return 0; }
+
+  # 4. blocklist (fail-safe empty if unreadable): whole-token membership, never substring.
+  _bl=''
+  if [ -r "$_conf" ]; then
+    _bl=$(grep -E '^[[:space:]]*BLOCKLIST[[:space:]]*=' "$_conf" 2>/dev/null | tail -n1 \
+      | sed -E 's/^[[:space:]]*BLOCKLIST[[:space:]]*=[[:space:]]*//; s/#.*$//; s/["'"'"']//g' | tr 'A-Z' 'a-z')
+  fi
+  case " $_bl " in
+    *" $_ns "*) : ;;
+    *) printf 'allow\n'; return 0 ;;
+  esac
+
+  # 5. blocklisted namespace under an active mode => emit the mode + a MODE-APPROPRIATE reason.
+  #    ask: the user is prompted and just approves to proceed (a soft nudge, not a block).
+  #    deny: hard-blocked; the only escape is the per-session KIT_ROSTER_GUARD=off override.
+  printf '%s\n' "$_mode"
+  if [ "$_mode" = ask ]; then
+    printf 'kit prefers its own roster (skills/; see skills/using-skills/SKILL.md for the foreign->kit equivalent). Approve this prompt to use `%s` anyway.\n' "$_sk"
+  else
+    # SWAS-301a: the refusal no longer names the session override; the owner decides (they know the dial), the agent stops.
+    printf 'kit prefers its own roster (skills/; see skills/using-skills/SKILL.md for the foreign->kit equivalent). To use `%s` anyway, ask the owner.%s\n' "$_sk" "$(_guard_stop_pointer human-gated)"
+  fi
+  return 0
+}
+
+# kit_dial_mode "<DIAL_NAME>": the ENFORCEMENT-DIAL reader (DIAL-DELIVERY Δ-A, ruling D-240811-2.1).
+# Prints exactly `enforce` or `observe` on stdout and ALWAYS returns 0 — the consumer (today
+# hooks/pre-push's two legs) compares the printed word, so a dial can never wedge a push by erroring.
+#
+# SOURCE: $ROOT/.kit/dials.conf — the REPO-ROOT path, never cwd-relative, so a linked worktree and a
+# fixture tree each read their own state (and the kit's own conf can never leak into a fixture, which
+# is what keeps hooks/pre-push's dial-leg selftests observe-by-default). $ROOT is the pre-push hook's
+# own derivation when set; otherwise it is derived here. PARSE, DON'T SOURCE — guard_check_skill's
+# proven idiom above (:1541-1556): a conf file must never become executable code reachable from a gate.
+#
+# FAIL-SAFE toward OBSERVE (the load-bearing invariant, matching the roster dial's fail-safe-to-off):
+# an absent/unreadable/garbage file, a missing key, a value that is not exactly `enforce`, or a dial
+# NAME outside [A-Z0-9_] all print `observe`. A dial that cannot be read must never refuse a push.
+#
+# PRECEDENCE IS ASYMMETRIC, and that asymmetry is the mechanism, not a nicety (owner-lens finding 1):
+#   * the conf value is AUTHORITATIVE;
+#   * an env var of the same name may ESCALATE observe -> enforce (a per-session tightening);
+#   * an env var may NOT de-escalate a conf `enforce`. It LOSES, and one loud anomaly line is printed
+#     (the SEC M1 shape at hooks/pre-push:224-236). Env-wins would leave every flip one silent,
+#     sticky `export` from undone — a bypass CHEAPER than --no-verify, which at least announces
+#     itself per command, and the exact "remember to export" asymmetry the ruling was written to kill.
+# An UNSET/empty env var is the normal case and is never an anomaly.
+kit_dial_mode() {
+  _kdm_name=$1
+  # A dial name is a shell identifier by construction; anything else would reach the indirection
+  # below, so reject it here and fail safe (this function is never a place to evaluate input).
+  case "$_kdm_name" in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) printf 'observe\n'; return 0 ;;
+  esac
+  _kdm_root="${ROOT:-}"
+  [ -n "$_kdm_root" ] || _kdm_root=$(git rev-parse --show-toplevel 2>/dev/null) || _kdm_root=""
+  [ -n "$_kdm_root" ] || _kdm_root=.
+  _kdm_conf="$_kdm_root/.kit/dials.conf"
+  _kdm_val=''
+  if [ -r "$_kdm_conf" ]; then
+    _kdm_val=$(grep -E "^[[:space:]]*${_kdm_name}[[:space:]]*=" "$_kdm_conf" 2>/dev/null | tail -n1 \
+      | sed -E "s/^[[:space:]]*${_kdm_name}[[:space:]]*=[[:space:]]*//; s/#.*$//; s/[\"']//g; s/[[:space:]].*$//")
+  fi
+  # The env side, read INDIRECTLY (POSIX sh has no ${!name}); the name is charset-checked above.
+  _kdm_env=$(eval "printf '%s' \"\${$_kdm_name:-}\"")
+  if [ "$_kdm_val" = enforce ]; then
+    if [ -n "$_kdm_env" ] && [ "$_kdm_env" != enforce ]; then
+      # SANITIZE BEFORE INTERPOLATING (review round 1). The value is caller-controlled: a newline in
+      # it would FORGE an extra instruction line on stderr — the same injection class hooks/pre-push
+      # hardens `refuse_no_core` against (:17-26, where a crafted path could inject `--no-verify`
+      # into a refusal). Strip CR/LF and bound the length; the diagnostic value is the first few
+      # bytes, not an unbounded echo of whatever was exported.
+      _kdm_safe=$(printf '%s' "$_kdm_env" | tr -d '\n\r' | cut -c1-40)
+      # ONE LINE PER DIAL PER PROCESS, not per call (review round 1): decl_check_ref and go_relay each
+      # consult the dial per ref-line, so a 3-ref push printed the identical anomaly 3x — the same
+      # line-discipline defect go_relay's own ONE-RELAY-PER-INVOCATION rule exists to prevent. Keyed
+      # per NAME so DECL and GO each still get their own warning. ⚠️ CEILING, measured (review round
+      # 1): this memo binds only WITHIN ONE PROCESS. A caller that consults the dial inside a command
+      # substitution runs each call in a SUBSHELL, so the assignment below cannot propagate back —
+      # measured 3 anomaly lines on a 3-ref-line push both before and after this memo alone. The
+      # suppression that actually binds is therefore the CALLER's: hooks/pre-push's `_kit_dial`
+      # resolves each dial at most once per push invocation (3 -> 1, re-measured). This memo is kept
+      # because it is correct for any in-process consumer and costs nothing; it is NOT the control.
+      case " ${_kdm_warned:-} " in
+        *" $_kdm_name "*) : ;;
+        *)
+          printf '%s\n' "kit dial: $_kdm_name='$_kdm_safe' in the environment cannot de-escalate the repo-carried enforce in .kit/dials.conf - the conf WINS (env may only escalate observe->enforce). Change the dial through the ratified control-plane ceremony; a one-off bypass is git push --no-verify, which at least announces itself." >&2
+          _kdm_warned="${_kdm_warned:-} $_kdm_name" ;;
+      esac
+    fi
+    printf 'enforce\n'; return 0
+  fi
+  [ "$_kdm_env" = enforce ] && { printf 'enforce\n'; return 0; }
+  printf 'observe\n'; return 0
+}
+
+# === GUARD-SPELLING-RESIDUALS — nine spellings the guard misjudged, each cured by REFUSING ON DOUBT. ================
+# Every helper below can only ADD a deny. None executes agent text, and none hands agent text to `find` as a predicate: they
+# read bytes (parameter expansion, `case`, `sed` over DATA) or, for C9, run the guard's own `_resolve_physical` on an
+# absolute path. They sit at the END of the file on purpose, so the call sites above keep their line numbers stable.
+# Design: docs/architecture/2026-10-06-guard-spelling-residuals-design.md (C1-C7, C9).
+
+# _cp8b_skeleton "<token>": the token with `${…}`, `$(…)` and backtick spans deleted, then every quote, backslash and `$`.
+# Normalisation TOWARD the verb word (C3): `x""args`, `xa"rg"s`, `x\args`, `x${E}args` and `$'xargs'` all read `xargs`. Its only
+# failure is an over-match, which matters only when a later token is git, a write verb or an interpreter.
+_cp8b_skeleton() {
+  printf '%s' "$1" | sed -e 's/\${[^}]*}//g' -e 's/\$([^)]*)//g' -e 's/`[^`]*`//g' -e 's/\$[A-Za-z_][A-Za-z0-9_]*//g' -e "s/'//g" -e 's/"//g' -e 's/\\//g' -e 's/\$//g'
+}
+
+# _cp8b_xargs_optscan "<seg>": 0 iff xargs' OWN option tokens (from the xargs word to the command word it runs) carry a
+# file-feed: a short cluster whose letters before the first value-taking letter hold `a` (`-0a`, `-ra`), or a long option
+# `--a…` (GNU takes any unique prefix of `--arg-file`). Scanning only xargs' own options keeps `printf 'a\0' | xargs -0 git add`
+# a non-match. The plain `-a` / `--arg-file` substring test in the caller stays as it was.
+_cp8b_xargs_optscan() {
+  _xo_g=0; case "$-" in
+    *f*) _xo_g=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $1
+  _xo_hit=1; _xo_seen=0; _xo_n=''; _xo_norm=''
+  while [ $# -gt 0 ]; do
+    _xo_t=$1; shift
+    # every option token is matched DE-QUOTED (`"-0a"`, `'-ra'`, `"--ar"`)
+    case "$_xo_t" in
+      *'"'*|*"$_cp8b_sq"*|*'\'*|*'$'*|*'`'*)
+        _xo_t=$(_cp8b_skeleton "$_xo_t") || _guard_fault xargs-skeleton ;;
+    esac
+    if [ "$_xo_seen" = 0 ]; then
+      _xo_n="$_xo_n $_xo_t"
+      [ "${_xo_t##*/}" = xargs ] && _xo_seen=1
+      continue
+    fi
+    # On a hit the segment is handed back (`_xo_norm`) with the file-feed rewritten to xargs' canonical `-a` / `--arg-file`, because
+    # `_cp8b_interp_lead` peels only the canonical spellings with their value: `-0a /tmp/l rm` would otherwise read `/tmp/l` as the
+    # command word. A value attached to the cluster (`-0a/tmp/l`) is kept as the `-a` value. The caller resolves the command word
+    # the xargs RUNS on that normalised text.
+    case "$_xo_t" in
+      --) break ;;
+      -[nIdELPs]|--max-args|--max-procs|--max-lines|--max-chars|--delimiter|--eof|--process-slot-var)   # a SEPARATE value
+        _xo_n="$_xo_n $_xo_t"; [ $# -gt 0 ] && { _xo_n="$_xo_n $1"; shift; }; continue ;;
+      --a*=*) _xo_hit=0; _xo_norm="$_xo_n $_xo_t $*"; break ;;
+      --a*) _xo_hit=0; _xo_norm="$_xo_n --arg-file $*"; break ;;
+      -[!-]*)
+        _xo_c=${_xo_t#-}; _xo_c=${_xo_c%%[nIdELPs]*}
+        case "$_xo_c" in
+          *a*) _xo_hit=0; _xo_pre=${_xo_t%%a*}; _xo_norm="$_xo_n ${_xo_pre%-} -a ${_xo_t#*a} $*"; break ;;
+        esac ;;
+      -*) : ;;
+      *) break ;;
+    esac
+    _xo_n="$_xo_n $_xo_t"
+  done
+  [ "$_xo_g" = 1 ] || set +f
+  return $_xo_hit
+}
+
+# _cp8b_collapse_quotes "<text>": ONE left-to-right pass (C5, and the view C7 reads): a `"…"` or `'…'` span that holds whitespace
+# becomes the single token `Q`, every other span loses its quotes (`"main"`, `m"ai"n`, `'a"b'` read as the bare word), `\ ` becomes `Q`
+# and any other `\x` becomes `x`; inside `"…"` a backslash consumes the next byte. A third view for the push rules, ORed with the raw
+# and de-quoted ones, so a quoted global-option value no longer ends the option chain. Data only, never executed.
+_cp8b_collapse_quotes() {
+  printf '%s\n' "$1" | LC_ALL=C awk -v SQ="$_cp8b_sq" '{
+    out = ""; n = length($0); i = 1
+    while (i <= n) {
+      c = substr($0, i, 1)
+      if (c == "\\") { d = substr($0, i + 1, 1); out = out ((d == " " || d == "\t") ? "Q" : d); i += 2; continue }
+      if (c == "\"" || c == SQ) {
+        s = ""; j = i + 1
+        while (j <= n) {
+          e = substr($0, j, 1)
+          if (c == "\"" && e == "\\") { s = s substr($0, j + 1, 1); j += 2; continue }
+          if (e == c) break
+          s = s e; j++
+        }
+        out = out ((s ~ /[ \t]/) ? "Q" : s); i = j + 1; continue
+      }
+      out = out c; i++
+    }
+    print out
+  }'
+}
+
+# _cp8b_restore_opt "<token>": git restore's own option sets (SWAS-227; man git-restore, git 2.48). rc 0 = a flag or a joined value,
+# 1 = the next token is its value (--source, --conflict, -s), 2 = not a restore option (doubt: the guard cannot know whether it takes a value).
+# A long option matches by PREFIX of the name, as git resolves abbreviations. Short letters: -p -W -S -q -m, plus -2/-3 (unconfirmed, over-listing is sound).
+_cp8b_restore_opt() {
+  _ro_t=${1#-}
+  case "$_ro_t" in
+    -*)
+      _ro_n=${_ro_t#-}; _ro_j=0
+      case "$_ro_n" in
+        *=*) _ro_n=${_ro_n%%=*}; _ro_j=1 ;;
+      esac
+      [ -n "$_ro_n" ] || return 2
+      case "$_ro_n" in
+        no-*) return 0 ;;
+      esac
+      for _ro_k in source conflict; do
+        case "$_ro_k" in
+          "$_ro_n"*) return $((1 - _ro_j)) ;;
+        esac
+      done
+      for _ro_k in patch worktree staged quiet progress ours theirs merge ignore-unmerged ignore-skip-worktree-bits recurse-submodules overlay pathspec-from-file pathspec-file-nul; do
+        case "$_ro_k" in
+          "$_ro_n"*) return 0 ;;
+        esac
+      done
+      return 2 ;;
+  esac
+  case "${_ro_t%%s*}" in
+    *[!pWSqm23]*) return 2 ;;
+  esac
+  case "$_ro_t" in
+    *s) [ "${_ro_t%s}" = "${_ro_t%%s*}" ] && return 1 ;;
+  esac
+  return 0
+}
+
+# _cp8b_git_pathspec_doubt "<seg>" "<sub>": 0 (and prints the reason) iff a pathspec of this worktree/index-writing git
+# subcommand is a glob or magic whose target the guard cannot prove ordinary (C7). Pure text: no git call, no filesystem read.
+#   `:(<words>)<rest>`: `exclude`, `icase`, or an empty <rest>, is doubt; `literal` skips the glob test.
+#   short magic `:<run>[:]<rest>` (run of `/`, `!`, `^`; an empty run too): `!`/`^` or an empty <rest> is doubt.
+#   after ANY magic, <rest> that is a control-plane target is doubt.
+#   what remains is doubt if it holds `*`, `?` or `[` (git globs every pathspec by default, and its `*` crosses `/`).
+#   checkout/restore only (SWAS-188): a `{..,..}` / `{..'..'..}` brace shape is doubt; a token ending in a `.`/`..` component
+#   (after a trailing `/`), or an empty one, names the whole tree; a restore with no pathspec is the same. restore's source value
+#   (-s <rev>, --so* <rev>, a bundle whose first `s` is its last char) is judged but not counted. After `--` every token is a pathspec.
+# `stash` drops the value of -m/--message first, so `git stash push -m "wip *"` is not doubt.
+_cp8b_git_pathspec_doubt() {
+  _gp_seg=$1; _gp_sub=$2
+  if [ "$_gp_sub" = stash ]; then
+    _gp_seg=$(printf '%s' "$_gp_seg" | sed -E "s/(-m|--message)[[:space:]=]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+)//g") || return 0
+  fi
+  _gp_g=0; case "$-" in
+    *f*) _gp_g=1 ;;
+    esac
+  set -f
+  # shellcheck disable=SC2086  # deliberate word-split; globbing disabled above
+  set -- $_gp_seg
+  _gp_hit=1; _gp_seen=0; _gp_gv=0; _gp_dd=0; _gp_why=glob; _gp_np=0; _gp_sv=0
+  _gp_wt=0; case "$_gp_sub" in
+    checkout|restore) _gp_wt=1 ;;
+    esac
+  while [ $# -gt 0 ]; do
+    _gp_t=$1; shift
+    if [ "$_gp_seen" = 0 ]; then
+      # global options are skipped as _cp8b_git_sub skips them: a two-token form consumes its value (which may spell the sub)
+      if [ "$_gp_gv" = 1 ]; then _gp_gv=0; continue; fi
+      case "$_gp_t" in
+        -c|-C|--git-dir|--work-tree|--exec-path|--namespace) _gp_gv=1; continue ;;
+      esac
+      [ "$_gp_t" = "$_gp_sub" ] && _gp_seen=1
+      continue
+    fi
+    if [ "$_gp_dd" = 0 ]; then               # after `--` git reads every token as a pathspec, a `-x` one included
+      case "$_gp_t" in
+        --) _gp_dd=1; continue ;;
+        --pathspec-fr*) _gp_hit=0; break ;;   # the file's lines are pathspecs the guard cannot read (both `=` and separate-value forms)
+        -*)                                   # restore: its own closed option sets (SWAS-227); a value option's next token is judged, not counted
+          if [ "$_gp_sub" = restore ]; then
+            _cp8b_restore_opt "$_gp_t"
+            case $? in
+              1) _gp_sv=1 ;;
+              2) _gp_hit=0; _gp_why=opt; break ;;
+            esac
+          fi
+          continue ;;
+      esac
+    fi
+    _gp_d=$(_cp8b_dequote "$_gp_t") || _guard_fault pathspec-dequote
+    _gp_lit=0; _gp_mg=0
+    case "$_gp_d" in
+      ':('*')'*)
+        _gp_lp='('; _gp_rp=')'
+        _gp_w=${_gp_d#:"$_gp_lp"}; _gp_w=${_gp_w%%"$_gp_rp"*}; _gp_d=${_gp_d#*"$_gp_rp"}; _gp_mg=1
+        case "$_gp_w" in
+          *exclude*|*icase*) _gp_hit=0; break ;;
+        esac
+        [ -n "$_gp_d" ] || { _gp_hit=0; break; }
+        case "$_gp_w" in
+          *literal*) _gp_lit=1 ;;
+        esac ;;
+      :*)
+        # short magic: `:` then a run of [/!^] then an optional `:`, ALWAYS (an empty run too: `:conformance` is the pattern `conformance`)
+        _gp_m=${_gp_d#:}; _gp_run=${_gp_m%%[!/!^]*}; _gp_m=${_gp_m#"$_gp_run"}
+        case "$_gp_run" in
+          *'!'*|*'^'*) _gp_hit=0; break ;;     # exclude-only magic
+        esac
+        case "$_gp_m" in
+          :*) _gp_m=${_gp_m#:} ;;
+        esac
+        _gp_d=$_gp_m; _gp_mg=1
+        [ -n "$_gp_d" ] || { _gp_hit=0; break; } ;;
+    esac
+    if [ "$_gp_mg" = 1 ] && _cp8b_tok_is_cp "$_gp_d"; then _gp_hit=0; break; fi
+    if [ "$_gp_wt" = 1 ]; then
+      # restore's source value is not a pathspec (not counted) but is still judged: `.` is never a valid rev
+      if [ "$_gp_sv" = 1 ]; then _gp_sv=0; else _gp_np=$((_gp_np + 1)); fi
+      _gp_x=$_gp_d
+      while :; do
+        case "$_gp_x" in
+          */) _gp_x=${_gp_x%/} ;;
+          *) break ;;
+        esac
+      done
+      case "$_gp_x" in
+        ''|.|..|*/.|*/..) _gp_hit=0; _gp_why=tree; break ;;
+        '~'*) _gp_hit=0; _gp_why=tilde; break ;;   # SWAS-227: a ~-led word is a shell expansion (~+ ~- ~) the guard cannot resolve
+      esac
+    fi
+    [ "$_gp_lit" = 1 ] && continue
+    case "$_gp_d" in
+      *[*?[]*) _gp_hit=0; break ;;
+    esac
+    # checkout/restore: a shell brace expansion (`{a,b}`, `{1..3}`) can become other pathspecs; a ref such as `@{-1}` has neither shape
+    if [ "$_gp_wt" = 1 ]; then
+      case "$_gp_d" in
+        *'{'*,*'}'*|*'{'*..*'}'*) _gp_hit=0; break ;;
+      esac
+    fi
+  done
+  [ "$_gp_g" = 1 ] || set +f
+  if [ "$_gp_hit" = 1 ] && [ "$_gp_sub" = restore ] && [ "$_gp_seen" = 1 ] && [ "$_gp_np" = 0 ]; then
+    _gp_hit=0; _gp_why=tree
+  fi
+  [ "$_gp_hit" = 0 ] || return 1
+  if [ "$_gp_why" = opt ]; then
+    printf '13: git restore with a restore option the guard does not know (it may take a value) cannot be judged - denied (fail-closed). Drop it or spell the option as git documents it. (escape card R23 git-pathspec)'
+    return 0
+  fi
+  if [ "$_gp_why" = tilde ]; then
+    printf '13: git %s with a ~-led pathspec (~+, ~-, ~) is a shell expansion the guard cannot resolve (it can name the whole tree) - denied (fail-closed). Name the path literally (git restore -s <rev> -- docs/x.md); for a file whose name starts with ~ use ./~x. (escape card R23 git-pathspec)' "$_gp_sub"
+    return 0
+  fi
+  if [ "$_gp_why" = tree ]; then
+    printf '13: git %s with a whole-tree or absent pathspec (., .., a path ending in /. or /.., :/., or no path) rewrites the control plane with the rest of the tree - denied (control-plane integrity). Name the paths (git restore -s <rev> -- docs/x.md); to unstage everything use git reset -q; to move branches use git switch / git checkout <branch>. (escape card R23 git-pathspec)' "$_gp_sub"
+    return 0
+  fi
+  printf '13: git %s with a glob or magic pathspec cannot be proven to stay off the control plane (git globs every pathspec, and its * crosses /) - denied (refuse on doubt). Name the files literally, or wrap a file whose name holds brackets as the :(literal) form (git restore '"'"':(literal)app/[slug]/page.tsx'"'"'). (escape card R23 git-pathspec)' "$_gp_sub"
+  return 0
+}
+
+# _cp8b_via_link_cp "<target>" ["<verb>"]: 0 iff a write target reaches a control-plane path THROUGH an existing symlink (C9).
+# The text-only redirect and write-verb routes judge the spelling, never where a link points; the tool routes already resolve it
+# (`_resolve_physical`). Walks the target's own prefixes with the builtin `[ -L ]` (no fork); only when the leaf or an ancestor
+# is a link does it resolve (in a subshell, so no variable leaks) and judge the PHYSICAL path. A resolution failure denies.
+# Verbs that replace or remove the link ITSELF (rm, mv, ln, rsync) do not write through it and are skipped. /dev/ is skipped.
+_cp8b_via_link_cp() {
+  _vl_t=$1; _vl_v=${2:-}
+  case "$_vl_t" in     # judged where the shell will write: `~/` is HOME-rooted, a relative target sits under the known `cd` prefix
+    ''|/dev/*) return 1 ;;
+    '~'|'~/'*) [ -n "${HOME:-}" ] || return 1; _vl_t=$HOME${_vl_t#'~'} ;;
+    /*) : ;;
+    *) [ -z "${_CP8B_EFF:-}" ] || _vl_t=$_CP8B_EFF/$_vl_t ;;
+  esac
+  _vl_r=$_vl_t; _vl_a=''; _vl_l=0
+  case "$_vl_r" in
+    /*) _vl_a=/; _vl_r=${_vl_r#/} ;;
+  esac
+  while [ -n "$_vl_r" ]; do
+    case "$_vl_r" in
+      */*) _vl_s=${_vl_r%%/*}; _vl_r=${_vl_r#*/} ;;
+      *)   _vl_s=$_vl_r; _vl_r='' ;;
+    esac
+    [ -n "$_vl_s" ] || continue
+    _vl_a=$_vl_a$_vl_s
+    if [ -L "$_vl_a" ]; then
+      # the FIRST link found decides the verb skip: a LEAF link is removed or replaced by rm/mv/ln/rsync (no write through it); an
+      # ANCESTOR link is traversed by every verb
+      if [ -z "$_vl_r" ]; then
+        case "${_vl_v##*/}" in
+          rm|rmdir|unlink|mv|ln|rsync) return 1 ;;
+        esac
+      fi
+      _vl_l=1; break
+    fi
+    _vl_a=$_vl_a/
+  done
+  [ "$_vl_l" = 1 ] || return 1
+  _cp8b_gsr_tip=' TIP: the target is behind a symlink that resolves into the control plane (the guard judges the PHYSICAL path): write the real path with the Edit/Write tool, or pick a target that is not behind that link.'
+  _vl_p=$(_resolve_physical "$_vl_t") || return 0
+  [ -n "$_vl_p" ] || return 0
+  if is_control_plane_target "$_vl_p"; then return 0; fi
+  _cp8b_gsr_tip=''
+  return 1
+}
+
+# _cp8b_redir_link_denied "<segment>": 0 iff a LITERAL redirect target of the segment reaches the control plane through an existing
+# symlink (C9). The text triggers cannot see it (`echo x > lnk` names nothing protected), so the target arm calls this as a trigger of
+# its own. A non-literal target (rc 3) is the launder arm's, not this one's. Under a known `cd` the target is composed first.
+_cp8b_redir_link_denied() {
+  case "$1" in
+    *'>'*) : ;;
+    *) return 1 ;;
+  esac
+  _rl_rc=0; _rl_t=$(_redir_targets "$1") || _rl_rc=$?        # rc 3 is a non-literal target (the launder arm's); any other non-zero rc is a fault (SWAS-583 E7)
+  [ "$_rl_rc" = 0 ] || [ "$_rl_rc" = 3 ] || _guard_fault redir-link
+  while [ -n "$_rl_t" ]; do
+    case "$_rl_t" in
+      *"$_cp8b_nl"*) _rl_e=${_rl_t%%"$_cp8b_nl"*}; _rl_t=${_rl_t#*"$_cp8b_nl"} ;;
+      *)             _rl_e=$_rl_t; _rl_t='' ;;
+    esac
+    [ -n "$_rl_e" ] || continue
+    _cp8b_via_link_cp "$_rl_e" && return 0
+  done
+  return 1
+}
+
+# _cp8b_git_view "<seg>": the segment as git will read it, for C7. Quotes are collapsed (`g""it`, `"checkout"`, a quoted `-c` value with
+# a space), then a leading group opener, `NAME=value` assignments and the env/command/nice/timeout/time wrappers are peeled with the
+# guard's own helpers; if the word left is git (any path, any case of quoting) the view is `git <rest>`, else it is empty. Data only.
+_cp8b_git_view() {
+  case "$1" in
+    *g*i*t*) : ;;
+    *) return 0 ;;
+  esac
+  _gv_s=$(_cp8b_collapse_quotes "$1") || _guard_fault git-view
+  _gv_i=0
+  while [ "$_gv_i" -lt 4 ]; do
+    _gv_i=$((_gv_i + 1))
+    _gv_s=$(_cp8b_strip_assigns "$(_cp8b_group_peel "$_gv_s")") || _guard_fault git-view
+    _gv_w=$(_cp8b_lead "$_gv_s")
+    case "${_gv_w##*/}" in
+      env|command|nice|time|nohup|exec) _gv_s=$(_cp8b_drop_tok "$_gv_s") || _guard_fault git-view ;;
+      timeout) _gv_s=$(_cp8b_drop_tok "$(_cp8b_drop_tok "$_gv_s")") || _guard_fault git-view ;;
+      *) break ;;
+    esac
+  done
+  _gv_w=$(_cp8b_lead "$_gv_s")
+  [ "${_gv_w##*/}" = git ] || return 0
+  printf 'git %s' "$(_cp8b_drop_tok "$_gv_s")"
+}
+
+# KIT-BASE-MANIFEST-CONCORDANCE (design A2) - `incept.sh --kit-base-replace` is human-gated.
+# A SPEED BUMP on the string, like the `--admin` arm: a script an agent wrote first and then ran, or a flag assembled
+# from a variable, is not seen. What it does see: the flag on a segment led by anything that is not a plain reader
+# (`sh`, `bash -c`, `env X=1 sh`, a path to incept.sh, `xargs` fed the flag), with quotes, backslashes and `$` stripped and the
+# case folded, so `--kit-base-""replace` is read as spelled. A read or a prose mention (`grep`, `cat`, `echo`, `git commit -m`)
+# is not the act and stays open. `--kit-base-keep` is today's behaviour and is not gated.
+_kbr_tip='13: incept.sh --kit-base-replace swaps the project kit merge base: it renames the existing kit-base aside and records another tree as the base kit-update uses to tell the kit own files from the adopter edits. An agent raw git writes onto kit-base are already denied, so this flag is human-gated too (trigger=kit-base-replace). Report the incept refusal to the owner, who runs the replace in their own terminal (!sh scripts/incept.sh ... --kit-base-replace). --kit-base-keep is not gated. See docs/operations/kit-base.md.'
+# _kbr_replace_denied "<cmd>" "<the cmd with quotes, backslashes and $ stripped>": PREDICATE, 0 = deny.
+_kbr_replace_denied() {
+  # fork-free gate. Open on the intact text `kit-base-` (stripped view), OR on any word that starts like the flag once an
+  # escape, brace, expansion, glob or quote could hide the rest: `--k...` or `--` followed by one of $ { ? [ * \ " ' (a script
+  # name is NOT the key: a glob or a copy of the script defeats it, and neither is a bare `kit-base-` before the word)
+  _kbr_g=0
+  case "$2" in
+    *[Kk][Ii][Tt]-[Bb][Aa][Ss][Ee]-*) _kbr_g=1 ;;
+  esac
+  case "$1" in
+    *--[Kk]*|*-'$'*|*-'{'*|*-'?'*|*-'['*|*-'*'*|*-"\\"*|*-'"'*|*-"'"*|*"\$'"*|*"\$\""*) _kbr_g=1 ;;
+  esac
+  [ "$_kbr_g" = 1 ] || return 1
+  _kbr_c=$(_kbr_strip_hd "$1") || _guard_fault kbr-hd
+  _guard_vanished kbr-hd "$1" "$_kbr_c"
+  _kbr_cn=0
+  if _kbr_any_hit "$_kbr_c"; then _kbr_cn=1; fi
+  _cp8b_walk_load "$_kbr_c"
+  while _cp8b_next_seg; do
+    case $_seg in
+      *[![:space:]]*) ;;
+      *) continue ;;
+    esac
+    case "$_seg" in
+      *["$_cp8b_mk_all"]*)
+        _kbr_um=$(_cp8b_unmask_quoted "$_seg") || _guard_fault kbr-unmask
+        _guard_vanished kbr-unmask "$_seg" "$_kbr_um"
+        _seg=$_kbr_um ;;
+    esac
+    # (a segment with no letter or digit, such as the `)"` left after a heredoc substitution, holds no flag)
+    case $_seg in
+      *[[:alnum:]]*) ;;
+      *) continue ;;
+    esac
+    _kbr_s=$(printf '%s' "$_seg" | tr -d "\"\$\\\\'" | tr '()`' '   ' | tr '[:upper:]' '[:lower:]') || _guard_fault kbr-seg
+    _guard_vanished kbr-seg "$_seg" "$_kbr_s"
+    _kbr_pl=$(_cp8b_group_peel "$_kbr_s") || _guard_fault kbr-peel
+    _kbr_lead=$(_cp8b_lead "$_kbr_pl") || _guard_fault kbr-lead
+    _kbr_lead=${_kbr_lead##*/}
+    # a flag fed through xargs rides the pipe, not this segment (the whole command already holds the flag text)
+    if [ "$_kbr_lead" = xargs ] && [ "$_kbr_cn" = 1 ]; then return 0; fi
+    if ! _kbr_any_hit "$_seg"; then continue; fi
+    # a reader lead exempts the segment unless the flag text (or a doubt word) sits INSIDE a substitution span that runs:
+    # `echo $(sh ... --kit-base-replace)` runs it, `echo "$(git log -1)" --kit-base-replace` only prints it. A quoted heredoc
+    # body was already stripped by the walk load (data).
+    case "$_kbr_lead" in
+      git|gh|grep|egrep|fgrep|rg|cat|head|tail|less|more|sed|wc|diff|echo|printf|ls|jq|tr|sort|cut|nl)
+        _kbr_spans "$_seg"
+        if [ -n "$_kbr_spantxt" ] && _kbr_any_hit "$_kbr_spantxt"; then return 0; fi
+        continue ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# _kbr_strip_hd "<cmd>": the command without the BODY of a quoted-delimiter heredoc that only feeds `cat` (the repo's standard
+# `git commit -m "$(cat <<'EOF' ... EOF)"`). That body is data. A heredoc that feeds anything else (`sh <<'EOF'`, `cat <<'EOF' | sh`,
+# `cat <<'EOF' > file`) keeps its body, because a shell can run it.
+_kbr_strip_hd() {
+  printf '%s\n' "$1" | awk '
+    { n++; L[n] = $0 }
+    END {
+      i = 1
+      while (i <= n) {
+        line = L[i]
+        if (match(line, /<<-?[ \t]*(\047[A-Za-z_][A-Za-z0-9_]*\047|"[A-Za-z_][A-Za-z0-9_]*"|\\[A-Za-z_][A-Za-z0-9_]*)/)) {
+          rs = RSTART; rl = RLENGTH
+          op = substr(line, rs, rl); pre = substr(line, 1, rs - 1); post = substr(line, rs + rl)
+          dash = (op ~ /^<<-/)
+          d = op; sub(/^<<-?[ \t]*/, "", d); gsub(/[\047"\\]/, "", d)
+          ok = 1
+          # only a git/gh line whose double-quoted message argument holds the whole `$(cat <<...)`
+          if (pre !~ /^[ \t]*(git|gh)[ \t]/) ok = 0
+          if (pre !~ /(-[A-Za-z]*m|--message|-F|--body|--title|--notes)[ \t=]+"\$\([ \t]*cat[ \t]*$/) ok = 0
+          if (pre ~ /eval|[ \t]-c|<\(/) ok = 0
+          if (post !~ /^[ \t)"\047]*$/) ok = 0
+          cnt = 0; e = 0
+          for (j = 1; j <= n; j++) {
+            t = L[j]; if (dash) sub(/^\t+/, "", t)
+            if (t == d) { cnt++; if (j > i && e == 0) e = j }
+          }
+          if (cnt != 1 || e == 0) ok = 0
+          # refuse on doubt: a body line that merely BEGINS with the delimiter (bash 3.2 ends a heredoc at `EOF)`) is not data
+          if (ok) {
+            for (j = i + 1; j < e; j++) {
+              t = L[j]; if (dash) sub(/^\t+/, "", t)
+              if (substr(t, 1, length(d)) == d) ok = 0
+            }
+          }
+          if (ok) { print substr(line, 1, rs - 1) substr(line, rs + rl); i = e + 1; continue }
+        }
+        print line; i++
+      }
+    }'
+}
+
+# _kbr_any_hit "<raw text>": 0 iff the text holds the flag or a doubt word (stripped, lowercased view for the text rule; the
+# raw words for the doubt rule).
+_kbr_any_hit() {
+  _kah_s=$(printf '%s' "$1" | tr -d "\"\$\\\\'" | tr '()`' '   ' | tr '[:upper:]' '[:lower:]') || _guard_fault kbr-hit
+  _guard_vanished kbr-hit "$1" "$_kah_s"
+  # the byte-pinned twin (SWAS-717): a locale `tr` can mis-map I (Turkish) and miss the flag text; either view hitting denies
+  _kah_c=$(printf '%s' "$1" | LC_ALL=C tr -d "\"\$\\\\'" | LC_ALL=C tr '()`' '   ' | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault kbr-hit-c
+  _guard_vanished kbr-hit-c "$1" "$_kah_c"
+  if _kbr_text_hit "$_kah_s"; then return 0; fi
+  if _kbr_text_hit "$_kah_c"; then return 0; fi
+  _kbr_text_doubt "$1"
+}
+
+# _kbr_text_doubt "<raw text>": 0 iff some word could spell the flag by an escape, brace, expansion or glob: a `--` word
+# (optionally behind `$'`) that is not exactly --kit-base-keep and either starts with one of $ { ? [ * \ " ' after the dashes
+# or starts with k and carries one of those characters anywhere.
+_kbr_text_doubt() {
+  _kd_pg=0
+  case "$-" in
+    *f*) _kd_pg=1 ;;
+  esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  [ "$_kd_pg" = 1 ] || set +f
+  for _kd_w in "$@"; do
+    if _kbr_word_doubt "$_kd_w"; then return 0; fi
+  done
+  return 1
+}
+
+# _kbr_word_doubt "<raw word>": 0 iff the word could spell `--kit-base-replace` once its escapes, braces, expansions or globs
+# are resolved. The word must start with a dash (or `$'`, a quote), hold a special character ($ { ? [ * \ " '), and the
+# literal text between its leading dashes and that first special character, lowercased, must be a PREFIX of kit-base-replace
+# (the empty string is one). So `-{-,-}kit-base-replace`, `$'\x2d\x2d...'` and `--kit-bas?-replace` are doubt, and an ordinary
+# `--kubeconfig=$X`, `--key=$K` or `--keep=${X}` is not: its literal part diverges from the flag.
+_kbr_word_doubt() {
+  _kw=$1
+  _kw_a=0
+  case $_kw in
+    "\$'"*|"\$\""*) _kw_a=1; _kw=${_kw#?} ;;
+  esac
+  case $_kw in
+    "'"*|'"'*) _kw=${_kw#?} ;;
+  esac
+  # an empty literal (nothing literal between the dashes and the first special character) is doubt only beside kit/base/repl
+  # text anywhere in the word: `-$MODE`, `--"$ARG"` and `$'\t'` are ordinary, `--${K:-kit}-base-replace` is not
+  _kw_hint=0
+  case $1 in
+    *[Kk][Ii][Tt]*|*[Bb][Aa][Ss][Ee]*|*[Rr][Ee][Pp][Ll]*) _kw_hint=1 ;;
+  esac
+  case $_kw in
+    -*) : ;;
+    *)
+      if [ "$_kw_a" = 0 ]; then return 1; fi
+      # a `$'...'` word with no literal leading dash: doubt only if its first escape decodes to a dash, or it carries a hint
+      case $_kw in
+        "\\x2d"*|"\\x2D"*|"\\055"*|"\\55"*) _kw_hint=1 ;;
+      esac
+      if [ "$_kw_hint" = 0 ]; then return 1; fi ;;
+  esac
+  while :; do
+    case $_kw in
+      -*) _kw=${_kw#-} ;;
+      *) break ;;
+    esac
+  done
+  _kw_lit=''; _kw_sp=0
+  while [ -n "$_kw" ]; do
+    _kw_c=${_kw%"${_kw#?}"}
+    case $_kw_c in
+      '$'|'{'|'?'|'['|'*'|"\\"|'"'|"'")
+        _kw_sp=1
+        break ;;
+    esac
+    _kw_lit=$_kw_lit$_kw_c
+    _kw=${_kw#?}
+  done
+  if [ "$_kw_sp" = 0 ]; then return 1; fi
+  case $_kw_lit in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*)
+      _kw_lit=$(printf '%s' "$_kw_lit" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault kbr-lit ;;
+  esac
+  if [ -z "$_kw_lit" ] && [ "$_kw_hint" = 0 ]; then return 1; fi
+  _kw_full=kit-base-replace
+  case $_kw_full in
+    "$_kw_lit"*) return 0 ;;
+  esac
+  return 1
+}
+
+# _kbr_spans "<raw segment>": sets _kbr_spantxt to the text INSIDE every command substitution `$(...)`, process substitution
+# `<(...)` / `>(...)` and backtick pair of the segment (nesting counted, an unterminated span runs to the end).
+_kbr_spans() {
+  _ks_r=$1; _ks_o=''; _ks_d=0; _ks_p=''; _ks_bt=0
+  while [ -n "$_ks_r" ]; do
+    _ks_c=${_ks_r%"${_ks_r#?}"}
+    _ks_r=${_ks_r#?}
+    if [ "$_ks_d" -gt 0 ]; then
+      case $_ks_c in
+        '(')
+          _ks_d=$((_ks_d + 1)); _ks_o="$_ks_o$_ks_c" ;;
+        ')')
+          _ks_d=$((_ks_d - 1))
+          if [ "$_ks_d" -gt 0 ]; then _ks_o="$_ks_o$_ks_c"; else _ks_o="$_ks_o "; fi ;;
+        *)
+          _ks_o="$_ks_o$_ks_c" ;;
+      esac
+    elif [ "$_ks_bt" = 1 ]; then
+      case $_ks_c in
+        '`')
+          _ks_bt=0; _ks_o="$_ks_o " ;;
+        *)
+          _ks_o="$_ks_o$_ks_c" ;;
+      esac
+    else
+      case $_ks_c in
+        '(')
+          case $_ks_p in
+            '$'|'<'|'>') _ks_d=1 ;;
+          esac ;;
+        '`')
+          _ks_bt=1 ;;
+      esac
+    fi
+    _ks_p=$_ks_c
+  done
+  _kbr_spantxt=$_ks_o
+}
+
+# _kbr_text_hit "<lowercased text>": 0 iff the text holds the flag `kit-base-replace`, or `--kit-base-` followed by anything
+# other than exactly `keep` at a word boundary (refusing on doubt: an escape, a brace or a default expansion leaves a
+# different tail after the prefix). A file name such as kit-base-shared.sh has no `--` before it and is not a hit.
+_kbr_text_hit() {
+  # the intact flag text `kit-base-replace` ending at a word boundary, whatever precedes it (the dashes may be hidden by an
+  # escape or a brace); the aside branch kit-base-replaced-<sha> is released by the boundary (the next byte is d)
+  _kbh_r=$1
+  while :; do
+    case "$_kbh_r" in
+      *kit-base-replace*) : ;;
+      *) break ;;
+    esac
+    _kbh_r=${_kbh_r#*kit-base-replace}
+    case "$_kbh_r" in
+      [abcdefghijklmnopqrstuvwxyz0123456789_]*) : ;;
+      *) return 0 ;;
+    esac
+  done
+  _kbh_r=$1
+  while :; do
+    case "$_kbh_r" in
+      *--kit-base-*) : ;;
+      *) return 1 ;;
+    esac
+    _kbh_r=${_kbh_r#*--kit-base-}
+    case "$_kbh_r" in
+      keep|keep[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) : ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# === GUARD-DENY-SECRET-STORE-READ (SWAS-109): the agent's direct secret-store read is human-gated. ====================
+# A SEATBELT, not a boundary: it reads the text of the typed command and can only ADD a deny. ONE principle, literal-or-deny:
+# when a STORE WORD (security, op, secret-tool, lpass, standing alone; a full Keychain subcommand name; or a resolver
+# stem tracker-cred / tracker_cred / _tcr anywhere) is present, the RAW
+# command must be entirely LITERAL (a plain alphabet, no newline, no xargs / -exec / alias / hash / ln / cp word), else it is
+# refused. That closes the whole "value built at runtime" family (variables, substitution, braces, globs, pipes, xargs, a
+# multi-line alias or symlink) by construction. Only a literal command goes on to the precise judgement: a `security` token walk
+# over EVERY occurrence (global flags skipped, a -p flag consumes its value, -i refused, any PREFIX of find-generic-password,
+# find-internet-password or dump-keychain gets the -w/-g or -d flag rule; measured: `security` accepts any unambiguous prefix);
+# `op` / `lpass` / `secret-tool` followed by their reading verb; `op://` anywhere; and the resolver rows. NOT binary-independent:
+# the verb rows need the standalone binary word, so `op item get` under another binary name and a renamed binary with an
+# abbreviated Keychain subcommand are not seen (runtime-guards.md R27 ceiling). Every shape is asked of one blob of views (joined,
+# empty-joined, dequoted, substitution-stripped, skeleton), once as written and once lowercased (APFS is case-insensitive).
+_SSR_BASE_FIND='(^|[^a-z0-9])(find-generic-password|find-internet-password)([^a-z0-9]|$)'
+_SSR_BASE_DUMP='(^|[^a-z0-9])dump-keychain([^a-z0-9]|$)'
+_SSR_FLAG_WG='(^|[^A-Za-z0-9-])-[A-Za-z]*[wg][A-Za-z]*([^A-Za-z0-9]|$)'
+_SSR_FLAG_D='(^|[^A-Za-z0-9-])-[A-Za-z]*d[A-Za-z]*([^A-Za-z0-9]|$)'
+_SSR_OPFLAGS='([[:space:],]+-[^[:space:],]+([[:space:],]+[^-[:space:],][^[:space:],]*)?)*'
+_SSR_LEAD="(^|[[:space:]'\"/])"
+_SSR_OP="${_SSR_LEAD}op${_SSR_OPFLAGS}[[:space:],]+"
+_SSR_END='([^a-z0-9]|$)'
+# A store word stands alone: a boundary before it (space, quote, slash, line start, or a shell-structure byte, so `S=security`,
+# `${x:-security}` and `$(security` count, but `fix(security):` does not) and after it. `security-policy.sh`, `SECURITY.md`, `no-op` and `ops/run.sh` do not.
+_SSR_WB_PRE='(^|[[:space:]'"'"'"/{;&|<>=!`]|[$][(]|:[-=+?])'
+_SSR_WB_POST='([[:space:]'"'"'"{}()$`;&|<>]|$)'
+_SSR_STEMS='tracker[-_]cred([^a-z0-9-]|$)|(^|[^a-z0-9])_tcr([^a-z0-9]|$)'
+_SSR_PLAIN_BAD="[^A-Za-z0-9[:blank:]_.:@/=,'\"+-]"
+_SSR_SRC_POS='(^|[;&|({`'"'"'"]|[[:space:]](then|do|else))[[:space:]]*((command|builtin|if|elif|while|until|time|eval|!)[[:space:]]+)*(\.|source)[[:space:]]+(--[[:space:]]+)?[^[:space:];&|]*tracker-(cred|jira|read)\.sh'
+_ssr_nl='
+'
+_SSR_AWK='{ s = $0; gsub("[\"\047,]", " ", s); n = split(s, t, " "); st = 0; skip = 0
+  for (i = 1; i <= n; i++) { w = t[i]; lw = tolower(w)
+    if (st == 1) {
+      if (skip == 1) { skip = 0; continue }
+      if (substr(w, 1, 1) == "-") {
+        if (w ~ /^-[a-z]*i[a-z]*$/) print "deny"
+        else if (w ~ /p$/) skip = 1
+        continue }
+      if (index("find-generic-password", lw) == 1 || index("find-internet-password", lw) == 1) print "find"
+      else if (index("dump-keychain", lw) == 1) print "dump"
+      st = 0 }
+    if (lw == "security" || lw ~ "/security$") st = 1 } }'
+_SSR_TIP='13: reading a secret store directly (macOS Keychain find-generic-password or find-internet-password with -w or -g, dump-keychain -d; 1Password op read, inject, run, item get, document get, signin --raw; secret-tool lookup or search; the kit tracker credential resolver) is human-gated (trigger=secret-store-read). A command whose TEXT names one of these shapes is refused too, unless it is a single plain read such as grep -e PATTERN file. Message text: pass it with git commit -F file or gh pr create --body-file file; read files with the Read or Grep tool; a human runs any secret command in their own terminal. An attribute-only lookup (find-generic-password with no -w or -g, written in plain letters, digits and . : @ / = , + - only) is allowed. The abbreviated subcommands (security find -w) are refused too. (escape card R27 secret-store-read)'
+
+# _ssr_blob "<cmd>": print the views of <cmd>, one per line. A non-zero return is a failed fork; the caller faults on it.
+_ssr_blob() {
+  _sb_j=$(_cp8b_joinlines "$1") || return 1
+  _sb_e=$(_cp8b_joinlines_empty "$1") || return 1
+  _sb_x=$(_cp8b_strip_subst "$_sb_j") || return 1
+  _sb_xe=$(_cp8b_strip_subst "$_sb_e") || return 1
+  _sb_d1=$(_s6_dequote "$_sb_j") || return 1
+  _sb_d2=$(_s6_dequote "$_sb_e") || return 1
+  _sb_d3=$(_s6_dequote "$_sb_x") || return 1
+  _sb_d4=$(_s6_dequote "$_sb_xe") || return 1
+  _sb_k=$(_cp8b_skeleton "$_sb_j") || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$_sb_j" "$_sb_e" "$_sb_d1" "$_sb_d2" "$_sb_d3" "$_sb_d4" "$_sb_k"
+}
+
+# _ssr_grep "<ERE>" "<text>": 0 match, 1 none. A grep rc above 1 is a fault (deny), never "no match".
+_ssr_grep() {
+  printf '%s\n' "$2" | grep -Eq -e "$1"
+  _sg_rc=$?
+  [ "$_sg_rc" -le 1 ] || _guard_fault ssr-grep
+  return "$_sg_rc"
+}
+
+# _ssr_store_word "<lower>": 0 iff a store word stands alone in some view, or a full Keychain subcommand name is present (lead-free,
+# for a renamed binary). Only then does literal-or-deny apply, so `security-policy.sh`, `SECURITY.md`, `no-op` and `ops/run.sh` cost nothing.
+_ssr_store_word() {
+  _ssr_grep "${_SSR_WB_PRE}(security|op|secret-tool|lpass)${_SSR_WB_POST}" "$1" && return 0
+  _ssr_grep "$_SSR_BASE_FIND" "$1" && return 0
+  _ssr_grep "$_SSR_BASE_DUMP" "$1" && return 0
+  # A2.1: the resolver stems are store words too (inside a path, as the prefix of a function name), so a runtime-assembled
+  # resolver name or a sourcing route through a substitution is refused by literal-or-deny, not by spelling. The stems are
+  # right-bounded (tracker-cred must not run on into a letter, digit or hyphen; _tcr must stand as a name), so a branch, path or
+  # message that contains a stem inside a longer word (tracker-credential, tracker-cred-fix) is not a store word. A stem padded
+  # or split across a runtime expansion (tracker-credx trimmed at run time) is R27's stated ceiling (SWAS-122).
+  _ssr_grep "$_SSR_STEMS" "$1" && return 0
+  return 1
+}
+
+# _ssr_xtrace_hit "<lower>": 0 iff an adapter script (tracker-jira, tracker-read, tracker-cred) is run under xtrace (A2.8). Belt
+# and braces: the control is the adapter's own xtrace-off around the credential lines; this refuses the trace being asked for.
+_ssr_xtrace_hit() {
+  _ssr_grep '(^|[^a-z0-9_-])tracker-(jira|read|cred)([^a-z0-9]|$)' "$1" || return 1
+  _ssr_grep 'xtrace' "$1" && return 0
+  _ssr_grep '(^|[^a-z0-9_-])(sh|bash|dash|zsh|ksh)([[:space:]]+-[a-z]+)*[[:space:]]+-[a-z]*x[a-z]*([[:space:]]|$)' "$1" && return 0
+  _ssr_grep '(^|[^a-z0-9_-])set[[:space:]]+-[a-z]*x' "$1" && return 0
+  return 1
+}
+
+# _ssr_nonliteral "<lower>" "<raw>": 0 iff the RAW command is not entirely literal: a newline, a byte outside the plain alphabet
+# (a POSITIVE allowlist, so a byte nobody has thought of is refused too), or an xargs / -exec / alias / hash / ln / cp word.
+_ssr_nonliteral() {
+  case "$2" in
+    *"$_ssr_nl"*) return 0 ;;
+  esac
+  _ssr_grep "$_SSR_PLAIN_BAD" "$2" && return 0
+  _ssr_grep '(^|[^a-z0-9_-])(xargs|alias|hash|ln|cp)([^a-z0-9_-]|$)' "$1" && return 0
+  _ssr_grep '(^|[^a-z0-9])-exec' "$1" && return 0
+  return 1
+}
+
+# _ssr_precise "<blob>" "<lower>": the judgement on a LITERAL command that names a store word. 0 iff a refused read.
+_ssr_precise() {
+  _sk_find=0; _sk_dump=0
+  _ssr_grep "$_SSR_BASE_FIND" "$2" && _sk_find=1
+  _ssr_grep "$_SSR_BASE_DUMP" "$2" && _sk_dump=1
+  case "$2" in
+    *security*)
+      _sk_walk=$(printf '%s\n' "$1" | awk "$_SSR_AWK") || _guard_fault ssr-awk
+      case "$_sk_walk" in
+        *deny*) return 0 ;;
+      esac
+      case "$_sk_walk" in
+        *find*) _sk_find=1 ;;
+      esac
+      case "$_sk_walk" in
+        *dump*) _sk_dump=1 ;;
+      esac ;;
+  esac
+  if [ "$_sk_find" = 1 ] && _ssr_grep "$_SSR_FLAG_WG" "$1"; then return 0; fi
+  if [ "$_sk_dump" = 1 ] && _ssr_grep "$_SSR_FLAG_D" "$1"; then return 0; fi
+  _ssr_grep "${_SSR_OP}(read|inject|run)${_SSR_END}" "$2" && return 0
+  _ssr_grep "${_SSR_OP}(items?|documents?)${_SSR_OPFLAGS}[[:space:],]+get${_SSR_END}" "$2" && return 0
+  if _ssr_grep "${_SSR_OP}signin${_SSR_END}" "$2" && _ssr_grep '(^|[^a-z0-9])--raw([^a-z0-9]|$)' "$2"; then return 0; fi
+  _ssr_grep "${_SSR_LEAD}secret-tool[[:space:],]+(lookup|search)${_SSR_END}" "$2" && return 0
+  _ssr_grep "${_SSR_LEAD}lpass[[:space:],]+(show|export)${_SSR_END}" "$2" && return 0
+  return 1
+}
+
+# _ssr_resolver_hit "<lower>": 0 iff the text names the kit's own credential resolver, or sources its library OR an adapter that
+# sources it (tracker-jira.sh, tracker-read.sh: a stem-free wrapper that exposes the resolver once sourced). Running them with sh is fine.
+_ssr_resolver_hit() {
+  _ssr_grep 'tracker_cred_resolve|_tcr_[a-z]' "$1" && return 0
+  _ssr_grep "$_SSR_SRC_POS" "$1" && return 0
+  _ssr_grep '(^|[^a-z0-9_./-])source[[:space:]]+(--[[:space:]]+)?[^[:space:];&|]*tracker-(cred|jira|read)\.sh' "$1" && return 0
+  _ssr_grep 'env=[^[:space:]]*tracker-(cred|jira|read)\.sh' "$1" && return 0
+  _ssr_grep '--(init-file|rcfile)([[:space:]]+|=)[^[:space:]]*tracker-(cred|jira|read)\.sh' "$1" && return 0
+  return 1
+}
+
+# _ssr_denied "<cmd>": 0 iff <cmd> is a refused secret-store read. Main-shell call: a failed fork is a fault, not an ALLOW.
+_ssr_denied() {
+  _sd_blob=$(_ssr_blob "$1") || _guard_fault ssr-blob
+  _guard_vanished ssr-blob "$1" "$_sd_blob"
+  _sd_lower=$(printf '%s\n' "$_sd_blob" | LC_ALL=C tr 'A-Z' 'a-z') || _guard_fault ssr-lower
+  _guard_vanished ssr-lower "$1" "$_sd_lower"
+  _ssr_grep 'op://' "$_sd_lower" && return 0
+  _ssr_resolver_hit "$_sd_lower" && return 0
+  _ssr_xtrace_hit "$_sd_lower" && return 0
+  _ssr_store_word "$_sd_lower" || return 1
+  _ssr_nonliteral "$_sd_lower" "$1" && return 0
+  _ssr_precise "$_sd_blob" "$_sd_lower"
+}
+
+# ================================================================================================
+# SWAS-332 GUARD-SECRET-COPY-THEN-READ (design docs/architecture/2026-10-21-guard-secret-copy-then-read-design.md rev 1.1).
+# The H3a arm (guard_check_command) denies a command that holds a READING verb and a secret-shaped name. A copy is not on its
+# verb list, so `cp .env notes.txt` and then a read of `notes.txt` left the secret in context under a benign name. This arm
+# judges the SOURCE operands of a copy, move, link, archive or `dd if=` (the complement of the control-plane arm, which judges the
+# destination), by NAME and by what the source RESOLVES to (a symlink or a hardlink alias). ADD-ONLY: it denies or falls through,
+# it never returns an allow. The path-prefixed READER face (`/bin/cat .env`) and the reader's resolution are NOT here: the owner
+# moved them to SWAS-336 with the over-deny measurement they owe.
+# It fails by disqualification (D-240813-3): the verb is found anywhere in a segment, de-quoted, basenamed and case-folded, and a
+# segment it cannot read (`$`, a backtick, `<(`) has every token of the whole command judged. A destination that is a secret is
+# a write, not a read, and stays allowed. Each operand is judged as written and cut at the first of ( ) < > ` { } (so
+# `dd if=.env>x` and `cp .env</dev/null x` are `.env`), and every flag or key test runs on the de-quoted token. A literal source that
+# exists is resolved (symlink, hardlink alias, a resolved `secrets` directory), with the template conjunction. A verb written as a
+# substitution, variable or brace has every token of its segment judged. A command of more tokens than _SCP_TOKCAP is refused
+# fail-closed. Named ceiling (boarded to SWAS-336): a name split by a variable (`.e${X}nv`), a glob piece, IFS changed earlier in the
+# same command, a brace operand (`x{.env,y}`). Also: an interpreter, a name computed from other text, a verb the text never spells (`/bin/c?`, `c${U}p`),
+# `xargs cp`, `find -exec cp`, a glob or brace source (a brace cut still catches `.env{,x}`), a directory that holds a secret,
+# `cpio`, `rsync --files-from`, a relative source resolved against the hook's cwd (a `cd sub && cp notes x` in one command resolves
+# against the directory the call started in), the reader face (SWAS-336), and the git-object, remote-copy and input-redirect reads
+# (all boarded in the design, section 4).
+# The set below is the fast exit's alternation too (_scp_copy_word); keep the two in step.
+# ================================================================================================
+# _scp_group "<verb>": sets _scp_grp for a copy-set verb. tdir = cp-like (a target-directory option is possible), dd = `if=`,
+# pos = positional (rsync, ditto: `-t` is --times there, so no binding), all = an archiver (every non-flag operand), none.
+_scp_group() {
+  case "$1" in
+    cp|install|mv|ln|gcp|ginstall|gmv|gln) _scp_grp=tdir ;;
+    dd|gdd) _scp_grp='dd' ;;
+    rsync|ditto|link|glink) _scp_grp=pos ;;
+    tar|gtar|bsdtar|zip|7z|7za|7zz|pax|gzip|gunzip|bzip2|xz|zstd|lz4|split|csplit) _scp_grp=all ;;
+    *) _scp_grp=none ;;
+  esac
+}
+# The token cap: a command of more tokens than this (counted once, across every segment) that names a copy or archive verb is refused
+# with the stop pointer, so the walk's cost has a fixed bound (measured at build by the SC-T1 leg; the hook's own timeout is the
+# harness's, and a timed-out hook proceeds - see runtime-guards.md).
+_SCP_TOKCAP=2000
+_SCP_SEGCAP=2000
+_SCP_PIECECAP=2000
+_SCP_RESCAP=256
+_SCP_FINDCAP=8
+# _scp_secretish "<text>": 0 iff the text could name a secret (a superset of _is_secret_path, case-folded, fork-free). It is the
+# cheap pre-check in front of the name classifier.
+_scp_secretish() {
+  case "$1" in
+    *[eE][nN][vV]*|*[pP][eE][mM]*|*[kK][eE][yY]*|*[iI][dD]_[rR][sS][aA]*|*[sS][eE][cC][rR][eE][tT]*) return 0 ;;
+  esac
+  return 1
+}
+# _scp_view "<cmd>": sets _scp_vw to the command and, when it holds a quote or a backslash, its quote- and backslash-deleted view
+# (as the hooksPath arm builds it), so the verb fast exit sees `c\p`.
+_scp_view() {
+  _scp_vw=$1
+  case "$1" in
+    *"'"*|*'"'*|*'\'*)
+      _scp_d=$(printf '%s' "$1" | tr -d "\"'\\\\") || exit 2
+      _scp_vw=$1$_cp8b_nl$_scp_d ;;
+  esac
+}
+# _scp_copy_word "<cmd>": 0 iff a copy-set word might be present in _scp_vw. A strict superset of the walk's verb lookup: the
+# boundary is every byte the walk strips or splits on. A command holding `$'` with a backslash always proceeds (an ANSI-C escape can
+# spell any verb). A grep fault proceeds. The alternation is _scp_group's set: keep them in step (the SC-C1 leg locks it).
+_scp_copy_word() {
+  _scp_cwl3=0
+  case "$1" in
+    *'$'"'"*'\'*) _scp_cwl3=1 ;;
+  esac
+  _scp_fr=0
+  printf '%s' "$_scp_vw" | grep -Eiq '(^|[^[:alnum:]_.-])(cp|install|rsync|mv|ln|link|glink|ditto|dd|gcp|ginstall|gmv|gln|gdd|tar|gtar|bsdtar|zip|7z|7za|7zz|pax|gzip|gunzip|bzip2|xz|zstd|lz4|split|csplit)([^[:alnum:]_-]|$)' || _scp_fr=$?
+  # _scp_cwreal = a copy word is really spelled in the text (what the verb-by-substitution rule keys on); an ANSI-C word alone only opens the walk
+  _scp_cwreal=0
+  if [ "$_scp_fr" != 1 ]; then _scp_cwreal=1; fi
+  [ "$_scp_cwreal" = 1 ] || [ "$_scp_cwl3" = 1 ]
+}
+# _scp_unparse "<segment>": 0 iff the segment carries a construct whose bytes the shell will change ($, a backtick, <( ).
+_scp_unparse() {
+  case "$1" in
+    *'$'*|*'`'*|*'<('*) return 0 ;;
+  esac
+  return 1
+}
+# _scp_wild "<segment>": 0 iff the segment holds a brace or glob byte (the shell may spell a word the guard cannot read).
+_scp_wild() {
+  case "$1" in
+    *'{'*|*'}'*|*'*'*|*'?'*|*'['*) return 0 ;;
+  esac
+  return 1
+}
+# _scp_tpl "<basename>": 0 iff it is one of the four template names (byte-literal, never folded; as _is_secret_hit).
+_scp_tpl() {
+  case "$1" in
+    .env.example|.env.sample|.env.template|.env.dist) return 0 ;;
+  esac
+  return 1
+}
+# _scp_norm "<token>": the verb candidate. Sets _scp_n (leading ( { $( backtick ! stripped, de-quoted, the part after the last
+# slash, case-folded), _scp_l3f (an ANSI-C `$'...\...'` word, which cannot be read) and _scp_slash.
+_scp_norm() {
+  _scp_l3f=0; _scp_slash=0
+  _scp_t=$1
+  while :; do
+    case "$_scp_t" in
+      '$('*) _scp_t=${_scp_t#??} ;;
+      '('*|'{'*|'`'*|'!'*) _scp_t=${_scp_t#?} ;;
+      *) break ;;
+    esac
+  done
+  case "$_scp_t" in
+    '$'"'"*'\'*) _scp_l3f=1 ;;
+  esac
+  case "$_scp_t" in
+    *"'"*|*'"'*|*'\'*)
+      _scp_t=$(printf '%s' "$_scp_t" | sed -e "s/\$'/'/g" -e 's/\$"/"/g' -e "s/'//g" -e 's/"//g' -e 's/\\//g') || exit 2 ;;
+  esac
+  case "$_scp_t" in
+    */*) _scp_slash=1; _scp_t=${_scp_t##*/} ;;
+  esac
+  case "$_scp_t" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) _scp_t=$(printf '%s' "$_scp_t" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz') || exit 2 ;;
+  esac
+  _scp_n=$_scp_t
+}
+# _scp_verb_of "<leg>": 0 iff the normalised token (_scp_n) is a copy-set verb (or an unreadable ANSI-C word); sets _scp_grp.
+_scp_verb_of() {
+  if [ "$1" = copy ] && [ "$_scp_l3f" = 1 ]; then _scp_grp=all; return 0; fi
+  [ -n "$_scp_n" ] || return 1
+  _scp_group "$_scp_n"
+  if [ "$_scp_grp" = none ]; then return 1; fi
+  return 0
+}
+# _scp_name_hit "<token>": 0 iff the NAME is secret-shaped. Sets _scp_nm to the de-quoted name with any `name=` prefix cut. The
+# second test catches a directory named `secrets` or `secret` written without a slash. The template exemption is _is_secret_hit's.
+_scp_name_hit() {
+  _scp_nm=$1
+  case "$_scp_nm" in
+    *"'"*|*'"'*|*'\'*)
+      _scp_nm=$(_cp8b_dequote "$_scp_nm") || exit 2 ;;
+  esac
+  _scp_cutat "$_scp_nm"
+  _scp_nc=$_scp_cut
+  case "$_scp_nm" in
+    *=*) _scp_nm=${_scp_nm#*=} ;;
+  esac
+  case "$_scp_nc" in
+    *=*) _scp_nc=${_scp_nc#*=} ;;
+  esac
+  if _scp_name_test "$_scp_nm"; then return 0; fi
+  if [ "$_scp_nc" != "$_scp_nm" ] && _scp_name_test "$_scp_nc"; then _scp_nm=$_scp_nc; return 0; fi
+  return 1
+}
+# _scp_cutat "<name>": sets _scp_cut to the name cut at the first of ( ) < > ` { } - the bytes a shell strips or splits on, so
+# `.env)`, `.env>x`, `.env</dev/null` and `.env{,x}` are judged as `.env` too. Fork-free; one byte per pass, so the walk is linear.
+_scp_cutat() {
+  _scp_cut=$1
+  for _scp_b in '(' ')' '<' '>' '`' '{' '}' '$'; do
+    case "$_scp_cut" in
+      *"$_scp_b"*) _scp_cut=${_scp_cut%%"$_scp_b"*} ;;
+    esac
+  done
+}
+# _scp_name_test "<name>": 0 iff the name is secret-shaped. The cheap secret-text pre-check keeps the common token fork-free. The
+# template exemption is byte-literal (_is_secret_hit's); the second test judges `<name>/` (a directory named `secrets` or `secret`
+# written without a slash).
+_scp_name_test() {
+  [ -n "$1" ] || return 1
+  _scp_secretish "$1" || return 1
+  _is_secret_hit "$1" && return 0
+  _is_secret_hit "$1/" && return 0
+  return 1
+}
+# _scp_alias_hit "<name>": 0 iff an EXISTING literal source is secret by what it is, the way guard_check_read judges it: the
+# symlink-resolved path is secret-shaped (an unresolvable one denies), or it is a hardlink alias of a secret. The template
+# exemption needs BOTH the literal and the resolved basename to be templates. A glob, brace, `$`, backtick or `~` source is not a
+# literal and is not resolved.
+_scp_alias_hit() {
+  case "$1" in
+    *'$'*|*'*'*|*'?'*|*'['*|*'{'*|*'`'*|'~'*) return 1 ;;
+  esac
+  [ -e "$1" ] || [ -L "$1" ] || return 1
+  # budget 1: at most _SCP_RESCAP existing literals are resolved in one command (each follows up to 64 links); over it the command is
+  # REFUSED (fail-closed), never skipped. The refusal is carried to _scp_reason by _scp_capfire.
+  _scp_nres=$((_scp_nres + 1))
+  if [ "$_scp_nres" -gt "$_SCP_RESCAP" ]; then _scp_capfire="more than $_SCP_RESCAP existing sources to resolve"; return 0; fi
+  _scp_res=$(_resolve_physical "$1") || return 0
+  _scp_rhit=0
+  if _is_secret_path "$_scp_res"; then
+    _scp_rhit=1
+  elif [ -d "$_scp_res" ] && _is_secret_path "$_scp_res/"; then
+    _scp_rhit=1
+  fi
+  if [ "$_scp_rhit" = 1 ]; then
+    if _scp_tpl "${1##*/}" && _scp_tpl "${_scp_res##*/}"; then :; else return 0; fi
+  fi
+  # The hardlink search. A directory has no alias, and a link count of 1 has none; a count above 1 (or one that cannot be read) needs
+  # the engine's repo-wide find (each with its own 10 s watchdog). That find is budgeted (budget 2: at most _SCP_FINDCAP per command,
+  # over it the command is refused, never skipped) and cached by (device, inode), so many names of one inode cost one find.
+  [ -d "$_scp_res" ] && return 1
+  _scp_nl=$(_nlink_of "$_scp_res") || _scp_nl=''
+  case "$_scp_nl" in
+    ''|*[!0-9]*) : ;;
+    *) [ "$_scp_nl" -gt 1 ] || return 1 ;;
+  esac
+  _scp_hl_di=$(_devino_of "$_scp_res") || _scp_hl_di=''
+  case "$_scp_hcache" in
+    *"|$_scp_hl_di=0"*) return 0 ;;
+    *"|$_scp_hl_di=1"*) return 1 ;;
+  esac
+  _scp_nfind=$((_scp_nfind + 1))
+  if [ "$_scp_nfind" -gt "$_SCP_FINDCAP" ]; then _scp_capfire="more than $_SCP_FINDCAP hardlinked sources to search"; return 0; fi
+  _scp_hr=0; _scp_hnm=$(_hardlink_alias_hit_secret "$_scp_res" "${PROTECTED_ROOT:-}") || _scp_hr=$?
+  [ "$_scp_hr" -le 1 ] || exit 2
+  if [ -n "$_scp_hl_di" ]; then _scp_hcache="$_scp_hcache|$_scp_hl_di=$_scp_hr"; fi
+  [ "$_scp_hr" = 0 ] && return 0
+  return 1
+}
+# _scp_src_hit "<token>": 0 iff the source is secret by name or by what it is, for the token and its cut prefix (leaves the hit
+# name in _scp_nm).
+_scp_src_hit() {
+  if _scp_name_hit "$1"; then return 0; fi
+  _scp_alias_hit "$_scp_nm" && return 0
+  if [ "$_scp_nc" != "$_scp_nm" ] && _scp_alias_hit "$_scp_nc"; then _scp_nm=$_scp_nc; return 0; fi
+  return 1
+}
+# _scp_pieces_hit "<word>": 0 iff a piece of the word, cut at $ { and }, is secret-shaped (sets the hit like a source hit). The total
+# work is bounded by ONE per-command cap on the count of those three bytes (_SCP_PIECECAP, checked before the walk), not per word.
+_scp_pieces_hit() {
+  # a word with none of the three bytes is its own single piece, which the caller has judged whole already
+  case "$1" in
+    *'$'*|*'{'*|*'}'*) : ;;
+    *) return 1 ;;
+  esac
+  _scp_rest=$1
+  while [ -n "$_scp_rest" ]; do
+    _scp_pc=$_scp_rest
+    for _scp_pb in '$' '{' '}'; do
+      case "$_scp_pc" in
+        *"$_scp_pb"*) _scp_pc=${_scp_pc%%"$_scp_pb"*} ;;
+      esac
+    done
+    if [ -n "$_scp_pc" ] && _scp_src_hit "$_scp_pc"; then _scp_hn=$_scp_nm; _scp_hl=copy; _scp_hb=1; return 0; fi
+    _scp_rest=${_scp_rest#"$_scp_pc"}
+    _scp_rest=${_scp_rest#?}
+  done
+  return 1
+}
+# _scp_judge_seg "<segment>" "<leg>": find the leg's verb anywhere in the segment and judge its sources. rc 0 = a secret source
+# (sets _scp_hn the name, _scp_hb 1 for variant B, _scp_hl the leg); rc 1 = none. An unreadable copy segment sets _scp_unp and
+# _scp_ulead for the whole-command scan instead.
+_scp_judge_seg() {
+  _scp_segtxt=$1; _scp_leg=$2
+  # shellcheck disable=SC2086  # deliberate word-splitting; globbing is off (set -f at the predicate's head)
+  set -- $1
+  _scp_lead=1; _scp_isv=0
+  while [ $# -gt 0 ]; do
+    _scp_a=$1; shift
+    _scp_norm "$_scp_a"
+    case "$_scp_a" in
+      -*) _scp_lead=0 ;;
+      *=*) : ;;
+      *)
+        if _scp_verb_of "$_scp_leg"; then
+          _scp_isv=1; break
+        fi
+        [ -n "$_scp_n" ] && _scp_lead=0 ;;
+    esac
+  done
+  if [ "$_scp_isv" != 1 ]; then
+    # No readable copy verb. A verb written as a substitution, variable or brace (`$(echo cp)`, `$X`, `{cp,}`) hides in a segment the
+    # guard cannot read; the walk runs only when the command holds a copy word, so judge every token of the segment (disqualification).
+    set -- $_scp_segtxt
+    if [ "$_scp_cwreal" = 1 ] && { _scp_unparse "$_scp_segtxt" || _scp_wild "$_scp_segtxt"; }; then
+      for _scp_a in "$@"; do
+        if _scp_src_hit "$_scp_a"; then
+          _scp_hn=$_scp_nm; _scp_hl=copy; _scp_hb=1
+          return 0
+        fi
+        # a verb glued to its operands by a variable (`cp${IFS}.env${IFS}x`, `cp$IFS.env$IFS x`): judge every piece of the word too
+        if _scp_pieces_hit "$_scp_a"; then return 0; fi
+      done
+    fi
+    return 1
+  fi
+  _scp_vlead=$_scp_lead
+  if _scp_unparse "$_scp_segtxt"; then
+    _scp_unp=1; _scp_ulead=$_scp_vlead
+    return 1
+  fi
+  _scp_ops=''; _scp_nops=0; _scp_all=0; _scp_pl=0
+  case "$_scp_grp" in
+    all|dd) _scp_all=1 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    _scp_a=$1; shift
+    _scp_ad=$_scp_a
+    case "$_scp_a" in
+      *"'"*|*'"'*|*'\'*)
+        _scp_ad=$(printf '%s' "$_scp_a" | sed -e "s/\$'/'/g" -e 's/\$"/"/g' -e "s/'//g" -e 's/"//g' -e 's/\\//g') || exit 2 ;;
+    esac
+    if [ "$_scp_grp" = dd ]; then
+      case "$_scp_ad" in
+        if=*) _scp_ops="$_scp_ops 0$_scp_a" ;;
+      esac
+      continue
+    fi
+    _scp_prevlong=$_scp_pl; _scp_pl=0
+    case "$_scp_ad" in
+      --) : ;;
+      --*)
+        case "$_scp_ad" in
+          --t*) [ "$_scp_grp" = tdir ] && _scp_all=1 ;;
+        esac
+        case "$_scp_ad" in
+          *=*) : ;;
+          *) _scp_pl=1 ;;
+        esac ;;
+      -?*)
+        case "${_scp_ad#-}" in
+          *t*) [ "$_scp_grp" = tdir ] && _scp_all=1 ;;
+        esac ;;
+      -) : ;;
+      *) _scp_ops="$_scp_ops $_scp_prevlong$_scp_a"; _scp_nops=$((_scp_nops + 1)) ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  set -- $_scp_ops
+  _scp_i=0
+  for _scp_o in "$@"; do
+    _scp_i=$((_scp_i + 1))
+    if [ "$_scp_all" = 1 ] || [ "$_scp_nops" -le 1 ] || [ "$_scp_i" -lt "$_scp_nops" ]; then
+      if _scp_src_hit "${_scp_o#?}"; then
+        _scp_hn=$_scp_nm; _scp_hl=$_scp_leg; _scp_hb=0
+        if [ "$_scp_vlead" = 0 ]; then _scp_hb=1; fi
+        if [ "${_scp_o%"${_scp_o#?}"}" = 1 ]; then _scp_hb=2; fi
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+# _scp_scan_all "<cmd>": 0 iff ANY token of the whole command is secret-shaped by name or, for a literal one, by what it resolves to
+# (a `name=value` token is judged by its value, so `F=.env; cp $F x` denies and `cp notes "$D"` resolves `notes`). Used when the
+# copy segment cannot be read.
+_scp_scan_all() {
+  _scp_leg=copy
+  _cp8b_segments_load "$1"
+  while _cp8b_next_seg; do
+    # shellcheck disable=SC2086
+    set -- $_seg
+    for _scp_a in "$@"; do
+      if _scp_src_hit "$_scp_a"; then
+        _scp_hn=$_scp_nm; _scp_hl=copy; _scp_hb=0
+        if [ "$_scp_ulead" = 0 ]; then _scp_hb=1; fi
+        return 0
+      fi
+      # the twin of the no-verb path: a word glued to a variable (`cp .env${IFS}x`, `cp ${A}.env${B}z notes`) is judged piece by piece too
+      if _scp_pieces_hit "$_scp_a"; then
+        if [ "$_scp_ulead" = 1 ]; then _scp_hb=0; fi
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+# _scp_reason "<leg>" "<variant 0|1>" "<name>": the refusal. Both variants end in the secret-read stop pointer (301a's E12
+# spelling). Variant B (a copy word inside other text, or a flag value) names the message and search retries; its row pointer is
+# spelled in prose, because the pointer lock allows exactly one pointer KIND per refusal. Neither variant names the override.
+_scp_reason() {
+  # a budget that ran out inside the source walk (resolutions, hardlink searches) is carried here by _scp_capfire
+  if [ -n "${_scp_capfire:-}" ]; then set -- cap 1 "$_scp_capfire"; fi
+  _scp_rn=$(printf '%s' "$3" | tr -d '\000-\037\177' | cut -c1-80) || exit 2
+  case "$1" in
+    cap)
+      printf '%s' "13: a command with $_scp_rn is more than the guard will judge ($_SCP_TOKCAP tokens, $_SCP_SEGCAP segments, $_SCP_PIECECAP dollar, open-brace and close-brace bytes, $_SCP_RESCAP resolutions, $_SCP_FINDCAP hardlink searches) while it names a copy or archive verb - refused fail-closed, human-gated (trigger=secret-cap)." ;;
+    *)
+      printf '%s' "13: copying secret material ($_scp_rn) to another name is the read half of exfil: the copy holds the content of the secret whatever it is called - human-gated (trigger=secret-copy)." ;;
+  esac
+  _guard_stop_pointer secret-read
+  if [ "$2" != 0 ]; then
+    printf '%s' ' If this is message or search text, not a copy: pass a message with git commit -F <file> or gh --body-file <file> (row R33 message-body of the escape card), and search with the Grep tool.'
+  fi
+  if [ "$2" = 2 ]; then
+    printf '%s' ' If the name is the value of a flag, join them with an equals sign (--exclude=.env): a joined flag value is not a source.'
+  fi
+}
+# _guard_secret_copy_denied "<cmd>" "<cwd>": rc 0 = deny (the reason on stdout), rc 1 = no deny, rc 2 = a fault (the caller faults).
+# A subshell body, so the walk's globals, `set -f` and `cd` never leak. Relative sources resolve against the hook's cwd.
+_guard_secret_copy_denied() (
+  _scp_cmd=$1; _scp_cwd=${2:-}
+  _scp_go=0; _scp_unp=0; _scp_ulead=1
+  _scp_nres=0; _scp_nfind=0; _scp_hcache=''; _scp_capfire=''
+  _scp_view "$_scp_cmd"
+  if _scp_copy_word "$_scp_cmd"; then _scp_go=1; fi
+  # The no-deny sentinel: a no-deny prints `ok`, so the caller can tell it from a substitution that died before it ran.
+  if [ "$_scp_go" = 0 ]; then printf '%s' ok; return 1; fi
+  if [ -n "$_scp_cwd" ] && [ -d "$_scp_cwd" ]; then CDPATH='' cd "$_scp_cwd" >/dev/null 2>&1 || :; fi
+  set -f
+  # The caps, so the walk's cost has a fixed bound. First the separators, counted on the raw text with one `tr` BEFORE the segmenter
+  # runs (`''x;''x;...` is one whitespace token and thousands of segments); then, after segmentation, the tokens across every segment.
+  _scp_sepn=$(printf '%s' "$_scp_cmd" | tr -cd ';&|\n' | wc -c | tr -d ' ') || exit 2
+  [ -n "$_scp_sepn" ] || exit 2
+  # a failed `tr` fork gives an empty stream and a count of 0: when the text holds such a byte (a fork-free case), 0 is a fault
+  case "$_scp_cmd" in
+    *';'*|*'&'*|*'|'*|*"$_cp8b_nl"*) [ "$_scp_sepn" -gt 0 ] || exit 2 ;;
+  esac
+  if [ "$_scp_sepn" -gt "$_SCP_SEGCAP" ]; then _scp_reason cap 1 "$_scp_sepn segments"; return 0; fi
+  # the pieces: every `$`, `{` and `}` byte makes one more piece to judge, so ONE per-command count bounds all the piece work
+  _scp_piecen=$(printf '%s' "$_scp_cmd" | tr -cd '${}' | wc -c | tr -d ' ') || exit 2
+  [ -n "$_scp_piecen" ] || exit 2
+  case "$_scp_cmd" in
+    *'$'*|*'{'*|*'}'*) [ "$_scp_piecen" -gt 0 ] || exit 2 ;;
+  esac
+  if [ "$_scp_piecen" -gt "$_SCP_PIECECAP" ]; then _scp_reason cap 1 "$_scp_piecen dollar, open-brace and close-brace bytes"; return 0; fi
+  _cp8b_segments_load "$_scp_cmd"
+  # shellcheck disable=SC2086  # deliberate word-splitting (the segments are newline-joined); globbing is off above
+  set -- $_walk
+  if [ "$#" -gt "$_SCP_TOKCAP" ]; then _scp_reason cap 1 "$# tokens"; return 0; fi
+  while _cp8b_next_seg; do
+    if _scp_judge_seg "$_seg" copy; then _scp_reason "$_scp_hl" "$_scp_hb" "$_scp_hn"; return 0; fi
+    if [ "$_scp_unp" = 1 ]; then break; fi
+  done
+  if [ "$_scp_unp" = 1 ]; then
+    if _scp_scan_all "$_scp_cmd"; then _scp_reason "$_scp_hl" "$_scp_hb" "$_scp_hn"; return 0; fi
+  fi
+  printf '%s' ok
+  return 1
+)

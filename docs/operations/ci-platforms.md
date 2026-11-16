@@ -1,0 +1,94 @@
+# CI Platforms — Portability Reference
+
+How the kit's CI contract is expressed on **GitHub Actions, GitLab CI, or any other platform**. The contract is the **gate-ids**, not a vendor — `conformance/ci-gates.sh` verifies the ids, so any platform that declares them by id conforms. The executable half of `DEVELOPMENT-STANDARDS.md` §14 (CI/CD Pipeline).
+
+> **Principle — the contract is the interface, the platform is open.** The kit does not require GitHub. It requires that a pipeline declare the standardized gates *by id*, so the same conformance check verifies any platform. Pick your CI; keep the ids.
+
+## The gate-id contract (platform-neutral)
+
+Every project's CI must declare these **8 standardized gate-ids** (implementing the 7 required gates of §14 — supply-chain is two ids). `gate-install` is setup, **not** a gate.
+
+| Gate-id | §14 gate |
+|---------|----------|
+| `gate-lint` | 1 — Lint |
+| `gate-type-check` | 2 — Type-check |
+| `gate-test` | 3 — Test + coverage |
+| `gate-build` | 4 — Build |
+| `gate-secret-scan` | 5 — Secret scan |
+| `gate-dep-scan` | 6 — Dependency scan |
+| `gate-sbom` | 7 — Supply-chain (SBOM) |
+| `gate-provenance` | 7 — Supply-chain (provenance) |
+
+`conformance/ci-gates.sh <workflow>` asserts all 8 are declared. It is **structural, best-effort, zero-dependency** — it recognizes the id, it does not run the pipeline. Pair it with the pipeline actually running (the gate must *do* the work, not merely be named).
+
+`sh conformance/ci-gates.sh --own-tree` is the **non-kitself leg** (a registered `verify.sh` control row): it judges **your tree's own installed pipeline(s)** — `.github/workflows/ci.yml` and/or `.gitlab-ci.yml`, every one present — so deleting a gate id from your live pipeline goes red on your own tree, not only on the kit's reference copies. A raw pre-incept export (no pipeline, no incepted marker) is N/A; a foreign/brownfield pipeline without the kit's origin marker disposes as a **disclosed adopter-owned N/A with the remedies named**, never a silent pass and never a fail for a merge the adoption docs told you to do by hand.
+
+### Per-gate dispositions (`conformance/gate-dispositions.txt`)
+
+A tree **without** this file is held to all 8 ids — the default. A tree MAY carry one to record a **decided, reviewed exemption** per gate: `gate-<id><TAB>apply|na<TAB><reason>`, every one of the 8 ids exactly once, `na` **requires** a non-empty reason (`apply` reasons are optional prose). The own-tree leg validates it first — a malformed, duplicate, missing-id or reasonless-na line **fails loud naming the line**; an invalid file never silently widens or narrows the required set, and an **all-na file is loud, never a bare green** (the leg says the pipeline is judged against nothing). The file is control-plane: your forge review is its ratification surface. The kit's own file records its own exemptions (3 apply · 5 na) and is export-ignored, so no adopter inherits the kit's exemptions. A disposition records an exemption — it cannot make the reason true.
+
+## How each platform expresses the contract
+
+### GitHub Actions — `id:` steps
+A gate is a step whose `id:` is the gate-id:
+```yaml
+jobs:
+  verify:
+    steps:
+      - id: gate-lint
+        run: pnpm run lint
+```
+`ci-gates.sh` matches `id: gate-X` (anchored, ignores comments). Reference: `profiles/<stack>/ci.yml`. Drop in via `incept.sh --ci github` → `.github/workflows/ci.yml`.
+
+### GitLab CI — `gate-X:` job keys
+A gate is a top-level **job named exactly** the gate-id:
+```yaml
+gate-lint:
+  stage: verify
+  script: [pnpm run lint]
+```
+`ci-gates.sh` matches `gate-X:` at column 0 (anchored, ignores comments). Reference: `profiles/<stack>/ci.gitlab-ci.yml`. Drop in via `incept.sh --ci gitlab` → `.gitlab-ci.yml` at the repo root. Where GitLab ships a native control (Secret-Detection, Dependency-Scanning, CycloneDX SBOM templates), the reference names it in a comment — prefer it at scale.
+
+### Azure DevOps — documented mapping (no shipped reference)
+ADO is a **documented mapping**, not a shipped second reference — proportionate: one canonical reference plus the contract is enough, because the contract *is* the ids. Express each gate as a step with the gate-id as its `name`:
+```yaml
+steps:
+  - script: pnpm run lint
+    name: gate_lint        # ADO step 'name' must be a valid identifier — see note
+    displayName: gate-lint
+```
+> **ADO naming caveat.** Azure Pipelines step `name` must match `[A-Za-z_][A-Za-z0-9_]*` — it cannot contain `-`. Use `gate_lint` for the machine `name` and `gate-lint` for `displayName`, and verify conformance against the **gate-ids as the contract** (a `yq`/`jq` check over `displayName`, or simply assert each gate ran). `ci-gates.sh`'s shell matcher targets GitHub `id:` and GitLab job keys; an ADO adopter verifies by the same gate-id convention with a platform-appropriate query. The kit states this rather than pretending the shell check covers ADO.
+
+### Any other platform
+Declare the 8 ids however the platform names units of work (job, stage, step, task), and verify them by id with a platform-appropriate query. The contract holds; only the syntax changes.
+
+## Honest coupling note — what is *not* yet platform-neutral
+
+**10 helper scripts** ship to the adopter and call the **GitHub API** (`gh`) directly in a core path: `branch-protection.sh`, `board-drift.sh`, `mirror-tag-protection.sh`, `security-channel-live.sh`, `agent-trace.sh`, `branch-protection-apply.sh`, `dora.sh`, `preflight.sh`, `promotion-verify.sh`, `release-tag.sh`. They are honest about it and degrade rather than pretend:
+
+| Script | GitHub binding | On GitLab / ADO |
+|--------|----------------|-----------------|
+| `conformance/branch-protection.sh` | Reads `repos/.../branches/main/protection` via `gh api` | The equivalent is **adopter-owned**: GitLab *protected branches* (require MR + pipeline success + approval rule), ADO *branch policies* (require PR + build validation + reviewers). Wire it on your platform; the check returns **UNVERIFIED** (exit 2) off GitHub rather than a false pass. |
+| `scripts/dora.sh` | Derives the DORA subset from GitHub APIs | Re-derive from GitLab (MR/pipeline analytics) or ADO (Pipelines/Boards analytics). It already prints **"unavailable"** per metric on any `gh` failure — it never fabricates a number. |
+| `conformance/board-drift.sh` | `gh pr view --json state` to reconcile board state against a PR | Adopter-owned: re-derive from the platform's own MR/PR state API. |
+| `conformance/mirror-tag-protection.sh` | `gh api repos/.../rulesets` to read tag-protection rulesets | Adopter-owned: GitLab protected tags, ADO tag/branch policies. |
+| `conformance/security-channel-live.sh` | Probes with `gh api` by default (`--probe-cmd` swaps the probe) | Adopter-owned: point `--probe-cmd` at a platform-appropriate live probe. |
+| `scripts/agent-trace.sh` | `gh pr view --json number,url,reviews,state` to trace a PR's review record | Adopter-owned: re-derive from the platform's MR/PR review API. |
+| `scripts/branch-protection-apply.sh` | `gh api` (read + apply) and `gh repo view` against branch protection | Adopter-owned: apply the equivalent protected-branch/MR-approval rule on your platform. |
+| `scripts/preflight.sh` | `gh repo view` and `gh auth status` to check repo class + auth | Adopter-owned: skips this leg off GitHub rather than fabricating a result. |
+| `scripts/promotion-verify.sh` | `gh api` / `gh pr view` for the review-and-actuate flow, `gh pr merge` by default on `actuate` | Adopter-owned: swap the merge command via `--merge-cmd`; the read legs are GitHub-only. |
+| `scripts/release-tag.sh` | `gh run list` / `gh run view` to confirm CI status before tagging | Adopter-owned: re-derive from the platform's own pipeline-status API. |
+
+This is the same honesty discipline as the three-state conformance model (`conformance/verify.sh`): **green ≠ verified** — an unverifiable control reports UNVERIFIED, never a silent pass. Porting these 10 scripts to GitLab/ADO APIs is deliberately out of scope (adopter-owned, named here) rather than faked.
+
+**Trunk-name tags.** Every gate job that reads the trunk (`ceremony-binding`, `loop-state` and `review-lane` in the shipped `adopter-gates.yml`) fails while a tag in its own checkout shadows the trunk, a branch or a remote-tracking ref (`main`, `master`, `HEAD`-style names, a branch name, `origin/…`, `refs/…`); `ceremony-binding` also checks the forge. The local check needs no credential, so no checkout's `persist-credentials` changes. Where your forge offers a tag ruleset (GitHub rulesets, GitLab protected tags, Azure DevOps ref policies), set one that refuses those names too. It stops the push rather than reddening the next PR. Check whether it binds the repository owner's or an admin's account: on GitHub a live test showed it did not, which is why the CI step is the control.
+
+For the full GitLab adopter guide — branch protection wiring, control-plane ratification (the
+keystone gap: the `control-plane-ratification` merge-gate has no kit-shipped GitLab equivalent), and
+DORA derivation — see [`gitlab-adoption.md`](gitlab-adoption.md).
+
+## See also
+- `DEVELOPMENT-STANDARDS.md` §14 — the gate contract and CI security hardening (two-job OIDC split).
+- `conformance/ci-gates.sh` — the verifier; `conformance/README.md` — the conformance index.
+- `profiles/<stack>/ci.yml` (GitHub) · `profiles/<stack>/ci.gitlab-ci.yml` (GitLab) — reference pipelines.
+- `docs/work-tracking/adapters.md` — the analogous "contract, many backends" pattern for work-tracking.
