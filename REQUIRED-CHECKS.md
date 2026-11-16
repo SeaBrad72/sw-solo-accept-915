@@ -54,4 +54,5 @@ control-plane-ratification
 backlog-presence
 ceremony-binding
 loop-state
+solo-go-bound
 ```
